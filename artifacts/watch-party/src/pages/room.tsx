@@ -3082,13 +3082,13 @@ export default function Room() {
     <div className="bg-background flex flex-col overflow-hidden" style={{ height: "100dvh" }}>
       {/* Top bar — 2-row layout */}
       <div className="border-b border-border bg-card/50 backdrop-blur-sm flex-shrink-0" style={{ paddingTop: "env(safe-area-inset-top)" }}>
-        {/* Row 1: room name + lock (left) | mode switcher (right) */}
-        <div className="flex items-center gap-2 px-3 pt-3 pb-1">
+        {/* Row 1: room name + lock (left) | mode switcher (right, desktop only) */}
+        <div className="flex items-center gap-2.5 px-3 pt-3.5 pb-2">
           {/* Left: icon + room name + lock */}
-          <div className="flex items-center gap-2 min-w-0 flex-1">
-            <Film className="w-4 h-4 text-primary flex-shrink-0" />
-            <span className="font-semibold text-foreground text-sm truncate max-w-[90px] sm:max-w-none">{roomData?.name ?? code}</span>
-            {!isConnected && <WifiOff className="w-3.5 h-3.5 text-destructive flex-shrink-0" />}
+          <div className="flex items-center gap-2.5 min-w-0 flex-1">
+            <Film className="w-5 h-5 text-primary flex-shrink-0" />
+            <span className="font-bold text-foreground text-base truncate max-w-[110px] sm:max-w-none">{roomData?.name ?? code}</span>
+            {!isConnected && <WifiOff className="w-4 h-4 text-destructive flex-shrink-0" />}
             {myRole === "host" && (
               <button
                 onClick={() => {
@@ -3096,49 +3096,49 @@ export default function Room() {
                   socketRef.current?.emit("setAccessControl", { enabled: locking });
                   if (locking && hyperbeamEmbed) terminateBrowserSession();
                 }}
-                className={`flex items-center gap-1 px-2.5 py-1 rounded-full border text-xs font-semibold transition-all duration-300 active:scale-95 flex-shrink-0 ${
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-sm font-semibold transition-all duration-300 active:scale-95 flex-shrink-0 ${
                   accessControlEnabled
                     ? "bg-red-500/20 border-red-400/50 text-red-300 shadow-[0_0_8px_rgba(239,68,68,0.3)]"
                     : "bg-green-500/15 border-green-400/40 text-green-300 shadow-[0_0_8px_rgba(34,197,94,0.2)]"
                 }`}
                 title={accessControlEnabled ? "Locked" : "Open"}
               >
-                <Lock className={`w-3 h-3 transition-transform duration-300 ${accessControlEnabled ? "rotate-0" : "-rotate-12"}`} />
+                <Lock className={`w-3.5 h-3.5 transition-transform duration-300 ${accessControlEnabled ? "rotate-0" : "-rotate-12"}`} />
                 <span>{accessControlEnabled ? "Locked" : "Open"}</span>
               </button>
             )}
           </div>
-          {/* Right: mode switcher */}
+          {/* Right: mode switcher — hidden on mobile, shown inline from sm: up */}
           {isPrivileged ? (
-            <div className="flex items-center gap-0.5 bg-muted/70 rounded-lg p-0.5 shadow-inner flex-shrink-0">
+            <div className="hidden sm:flex items-center gap-1 bg-muted/70 rounded-lg p-1 shadow-inner flex-shrink-0">
               <button
                 onClick={() => changeMode("video")}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-semibold transition-all duration-200 ${mode === "video" ? "bg-primary text-white shadow-sm" : "text-muted-foreground"}`}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-semibold transition-all duration-200 ${mode === "video" ? "bg-violet-500 text-white shadow-sm shadow-violet-500/30" : "text-muted-foreground hover:text-foreground"}`}
               >
                 <Film className="w-3.5 h-3.5" />Video
               </button>
               <button
                 onClick={() => changeMode("browser")}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-semibold transition-all duration-200 ${mode === "browser" ? "bg-primary text-white shadow-sm" : "text-muted-foreground"}`}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-semibold transition-all duration-200 ${mode === "browser" ? "bg-sky-500 text-white shadow-sm shadow-sky-500/30" : "text-muted-foreground hover:text-foreground"}`}
               >
                 <Globe className="w-3.5 h-3.5" />Browser
               </button>
               <button
                 onClick={() => changeMode("screenshare")}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-semibold transition-all duration-200 ${mode === "screenshare" ? "bg-primary text-white shadow-sm" : "text-muted-foreground"}`}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-semibold transition-all duration-200 ${mode === "screenshare" ? "bg-emerald-500 text-white shadow-sm shadow-emerald-500/30" : "text-muted-foreground hover:text-foreground"}`}
               >
                 <Monitor className="w-3.5 h-3.5" />Share
               </button>
               <button
                 onClick={() => changeMode("movies")}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-semibold transition-all duration-200 ${mode === "movies" ? "bg-orange-500 text-white shadow-sm" : "text-muted-foreground"}`}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-semibold transition-all duration-200 ${mode === "movies" ? "bg-orange-500 text-white shadow-sm shadow-orange-500/30" : "text-muted-foreground hover:text-foreground"}`}
               >
                 <svg xmlns="http://www.w3.org/2000/svg" className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="17" y1="7" x2="22" y2="7"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="2" y1="17" x2="7" y2="17"/></svg>
                 Movies
               </button>
             </div>
           ) : (
-            <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm text-muted-foreground bg-muted/50 border border-border/50 flex-shrink-0">
+            <div className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-semibold text-white bg-muted/50 border border-border/50 flex-shrink-0">
               {mode === "video" ? <><Film className="w-3.5 h-3.5" /><span>Video</span></>
                 : mode === "browser" ? <><Globe className="w-3.5 h-3.5" /><span>Browser</span></>
                 : mode === "movies" ? <><svg xmlns="http://www.w3.org/2000/svg" className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="17" y1="7" x2="22" y2="7"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="2" y1="17" x2="7" y2="17"/></svg><span>Movies</span></>
@@ -3146,72 +3146,110 @@ export default function Room() {
             </div>
           )}
         </div>
-        {/* Row 2: action buttons — scrollable */}
-        <div className="flex items-center gap-2 px-3 pt-1 pb-3 overflow-x-auto [&::-webkit-scrollbar]:hidden" style={{ scrollbarWidth: "none" }}>
-          <div className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-muted border border-border">
-            <code className="text-sm font-mono font-bold text-foreground">{code}</code>
+
+        {/* Row 1b: mode switcher — own full-width row on mobile only (< sm) */}
+        {isPrivileged ? (
+          <div className="flex sm:hidden items-stretch gap-1 bg-muted/40 rounded-xl p-1 shadow-inner mx-3 mb-3 h-11">
+            <button
+              onClick={() => changeMode("video")}
+              className={`flex-1 flex items-center justify-center gap-1.5 rounded-lg text-sm font-bold transition-all duration-200 ${mode === "video" ? "bg-violet-500 text-white shadow-md shadow-violet-500/40" : "text-muted-foreground active:bg-muted"}`}
+            >
+              <Film className="w-5 h-5 flex-shrink-0" /><span className="truncate">Video</span>
+            </button>
+            <button
+              onClick={() => changeMode("browser")}
+              className={`flex-1 flex items-center justify-center gap-1.5 rounded-lg text-sm font-bold transition-all duration-200 ${mode === "browser" ? "bg-sky-500 text-white shadow-md shadow-sky-500/40" : "text-muted-foreground active:bg-muted"}`}
+            >
+              <Globe className="w-5 h-5 flex-shrink-0" /><span className="truncate">Browser</span>
+            </button>
+            <button
+              onClick={() => changeMode("screenshare")}
+              className={`flex-1 flex items-center justify-center gap-1.5 rounded-lg text-sm font-bold transition-all duration-200 ${mode === "screenshare" ? "bg-emerald-500 text-white shadow-md shadow-emerald-500/40" : "text-muted-foreground active:bg-muted"}`}
+            >
+              <Monitor className="w-5 h-5 flex-shrink-0" /><span className="truncate">Share</span>
+            </button>
+            <button
+              onClick={() => changeMode("movies")}
+              className={`flex-1 flex items-center justify-center gap-1.5 rounded-lg text-sm font-bold transition-all duration-200 ${mode === "movies" ? "bg-orange-500 text-white shadow-md shadow-orange-500/40" : "text-muted-foreground active:bg-muted"}`}
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="17" y1="7" x2="22" y2="7"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="2" y1="17" x2="7" y2="17"/></svg>
+              <span className="truncate">Movies</span>
+            </button>
+          </div>
+        ) : (
+          <div className="flex sm:hidden items-center justify-center gap-1.5 px-3 mx-3 mb-3 h-11 rounded-xl text-base font-bold text-white bg-muted/50 border border-border/50">
+            {mode === "video" ? <><Film className="w-5 h-5" /><span>Video</span></>
+              : mode === "browser" ? <><Globe className="w-5 h-5" /><span>Browser</span></>
+              : mode === "movies" ? <><svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="17" y1="7" x2="22" y2="7"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="2" y1="17" x2="7" y2="17"/></svg><span>Movies</span></>
+              : <><Monitor className="w-5 h-5" /><span>Screen Share</span></>}
+          </div>
+        )}
+        {/* Row 2: action buttons — wraps to fit everything without side-scroll */}
+        <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 px-3 pt-1.5 pb-3">
+          <div className="flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg bg-muted border border-border flex-shrink-0">
+            <code className="text-sm sm:text-base font-mono font-bold text-foreground">{code}</code>
             <button
               onClick={copyCode}
               className="text-muted-foreground hover:text-foreground active:scale-90 transition-all duration-150 ease-out"
             >
-              {copied ? <Check className="w-4 h-4 text-green-400" /> : <Copy className="w-4 h-4" />}
+              {copied ? <Check className="w-4 h-4 sm:w-5 sm:h-5 text-green-400" /> : <Copy className="w-4 h-4 sm:w-5 sm:h-5" />}
             </button>
           </div>
 
           <button
             onClick={copyInviteLink}
-            className={`flex items-center gap-1.5 px-3 py-2 rounded-lg border text-sm font-medium transition-all duration-200 ease-out active:scale-90 select-none ${
+            className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg border text-sm sm:text-base font-medium transition-all duration-200 ease-out active:scale-90 select-none flex-shrink-0 ${
               copiedInvite
                 ? "bg-green-500/15 border-green-400/40 text-green-300 shadow-[0_0_8px_rgba(34,197,94,0.25)]"
                 : "bg-muted border-border text-muted-foreground hover:text-foreground hover:border-primary/30"
             }`}
           >
-            {copiedInvite ? <Check className="w-4 h-4 text-green-400" /> : <Link className="w-4 h-4" />}
+            {copiedInvite ? <Check className="w-4 h-4 sm:w-5 sm:h-5 text-green-400" /> : <Link className="w-4 h-4 sm:w-5 sm:h-5" />}
             <span className="hidden sm:inline">{copiedInvite ? "Copied!" : "Invite"}</span>
           </button>
 
           {isPrivileged && mode === "browser" && hyperbeamEmbed && (
             <button
               onClick={terminateBrowserSession}
-              className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20 text-sm text-red-400 hover:bg-red-500/20 active:scale-90 transition-all duration-200 ease-out select-none"
+              className="flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg bg-red-500/10 border border-red-500/20 text-sm sm:text-base text-red-400 hover:bg-red-500/20 active:scale-90 transition-all duration-200 ease-out select-none flex-shrink-0"
             >
-              <X className="w-4 h-4" /><span className="hidden sm:inline">End Session</span>
+              <X className="w-4 h-4 sm:w-5 sm:h-5" /><span className="hidden sm:inline">End Session</span>
             </button>
           )}
 
           {isPrivileged && mode === "video" && videoHlsPath && (
             <button
               onClick={() => socketRef.current?.emit("clearContent")}
-              className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-orange-500/10 border border-orange-500/20 text-sm text-orange-400 hover:bg-orange-500/20 active:scale-90 transition-all duration-200 ease-out select-none"
+              className="flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg bg-orange-500/10 border border-orange-500/20 text-sm sm:text-base text-orange-400 hover:bg-orange-500/20 active:scale-90 transition-all duration-200 ease-out select-none flex-shrink-0"
             >
-              <X className="w-4 h-4" /><span className="hidden sm:inline">End Video</span>
+              <X className="w-4 h-4 sm:w-5 sm:h-5" /><span className="hidden sm:inline">End Video</span>
             </button>
           )}
 
           {isPrivileged && isScreenSharing && (
             <button
               onClick={stopScreenShare}
-              className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-orange-500/10 border border-orange-500/20 text-sm text-orange-400 hover:bg-orange-500/20 active:scale-90 transition-all duration-200 ease-out select-none"
+              className="flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg bg-orange-500/10 border border-orange-500/20 text-sm sm:text-base text-orange-400 hover:bg-orange-500/20 active:scale-90 transition-all duration-200 ease-out select-none flex-shrink-0"
             >
-              <MonitorOff className="w-4 h-4" /><span className="hidden sm:inline">Stop Sharing</span>
+              <MonitorOff className="w-4 h-4 sm:w-5 sm:h-5" /><span className="hidden sm:inline">Stop Sharing</span>
             </button>
           )}
 
           {myRole === "host" && (
             <button
               onClick={() => { if (confirm("Close the room for everyone?")) socketRef.current?.emit("closeRoom"); }}
-              className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-destructive/10 border border-destructive/20 text-sm text-destructive hover:bg-destructive/20 active:scale-90 transition-all duration-200 ease-out select-none"
+              className="flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg bg-destructive/10 border border-destructive/20 text-sm sm:text-base text-destructive hover:bg-destructive/20 active:scale-90 transition-all duration-200 ease-out select-none flex-shrink-0"
               title="Close room"
             >
-              <Trash2 className="w-4 h-4" /><span className="hidden sm:inline">Close Room</span>
+              <Trash2 className="w-4 h-4 sm:w-5 sm:h-5" /><span className="hidden sm:inline">Close Room</span>
             </button>
           )}
 
           <button
             onClick={() => { disconnectSocket(); setLocation("/"); }}
-            className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-destructive/10 border border-destructive/20 text-sm text-destructive hover:bg-destructive/20 active:scale-90 transition-all duration-200 ease-out select-none"
+            className="flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg bg-destructive/10 border border-destructive/20 text-sm sm:text-base text-destructive hover:bg-destructive/20 active:scale-90 transition-all duration-200 ease-out select-none flex-shrink-0"
           >
-            <LogOut className="w-4 h-4" /><span className="hidden sm:inline">Leave</span>
+            <LogOut className="w-4 h-4 sm:w-5 sm:h-5" /><span className="hidden sm:inline">Leave</span>
           </button>
 
           {(() => {
@@ -3220,7 +3258,7 @@ export default function Room() {
               <button
                 onClick={toggleMic}
                 disabled={isMutedByHost && !micEnabled}
-                className={`flex items-center gap-1.5 px-3 py-2 rounded-lg border text-sm font-medium transition-all duration-200 ease-out select-none ${
+                className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg border text-sm sm:text-base font-medium transition-all duration-200 ease-out select-none flex-shrink-0 ${
                   isMutedByHost && !micEnabled
                     ? "bg-muted/40 border-destructive/30 text-destructive/50 cursor-not-allowed opacity-60"
                     : micEnabled
@@ -3229,7 +3267,7 @@ export default function Room() {
                 }`}
                 title={isMutedByHost && !micEnabled ? "Muted by host" : micEnabled ? "Mic On" : "Mic Off"}
               >
-                {micEnabled ? <Mic className="w-4 h-4" /> : <MicOff className="w-4 h-4" />}
+                {micEnabled ? <Mic className="w-4 h-4 sm:w-5 sm:h-5" /> : <MicOff className="w-4 h-4 sm:w-5 sm:h-5" />}
                 {micEnabled && (
                   <div className="flex items-end gap-0.5 h-4 ml-0.5">
                     {[0.4, 0.7, 1, 0.7, 0.4].map((mult, i) => {
@@ -3262,7 +3300,7 @@ export default function Room() {
                 }
               }
             }}
-            className={`relative flex items-center gap-1.5 px-3 py-2 rounded-lg border text-sm font-medium transition-all duration-200 ease-out active:scale-90 select-none ${
+            className={`relative flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg border text-sm sm:text-base font-medium transition-all duration-200 ease-out active:scale-90 select-none flex-shrink-0 ${
               bellPulse
                 ? "bg-primary/20 border-primary/50 text-primary scale-110 shadow-[0_0_14px_rgba(139,92,246,0.5)]"
                 : notifSoundEnabled
@@ -3272,8 +3310,8 @@ export default function Room() {
             title={notifSoundEnabled ? "Mute notifications" : "Unmute notifications"}
           >
             {notifSoundEnabled
-              ? <Bell className={`w-4 h-4 transition-transform duration-150 ${bellPulse ? "animate-bounce" : ""}`} />
-              : <BellOff className="w-4 h-4" />}
+              ? <Bell className={`w-4 h-4 sm:w-5 sm:h-5 transition-transform duration-150 ${bellPulse ? "animate-bounce" : ""}`} />
+              : <BellOff className="w-4 h-4 sm:w-5 sm:h-5" />}
             {bellPulse && notifSoundEnabled && (
               <span className="absolute inset-0 rounded-lg ring-2 ring-primary/60 animate-ping pointer-events-none" />
             )}
@@ -3286,13 +3324,13 @@ export default function Room() {
                 return !o;
               });
             }}
-            className={`relative flex items-center gap-1.5 px-3 py-2 rounded-lg border text-sm font-semibold transition-all duration-200 ease-out active:scale-90 select-none ${
+            className={`relative flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg border text-sm sm:text-base font-semibold transition-all duration-200 ease-out active:scale-90 select-none flex-shrink-0 ml-auto ${
               panelOpen
                 ? "bg-primary text-white border-primary shadow-[0_0_12px_rgba(var(--primary),0.35)]"
                 : "bg-muted border-border text-muted-foreground hover:text-foreground hover:border-primary/30"
             }`}
           >
-            <Users className="w-4 h-4" />
+            <Users className="w-4 h-4 sm:w-5 sm:h-5" />
             <span className="tabular-nums">{onlineCount}</span>
             {panelBadge > 0 && (
               <span className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-amber-500 text-white text-[10px] flex items-center justify-center font-bold animate-pulse">{panelBadge}</span>
@@ -3509,9 +3547,9 @@ export default function Room() {
                         ) : (
                           <button
                             onClick={startScreenShare}
-                            className="flex items-center gap-2 px-6 py-3 rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 active:scale-95 transition-all mx-auto shadow-[0_0_20px_rgba(139,92,246,0.4)]"
+                            className="flex items-center gap-2.5 px-7 py-3.5 rounded-xl bg-emerald-500 text-white text-base font-bold hover:bg-emerald-600 active:scale-95 transition-all mx-auto shadow-lg shadow-emerald-500/30"
                           >
-                            <Monitor className="w-4 h-4" />مشاركة شاشة
+                            <Monitor className="w-5 h-5" />مشاركة شاشة
                           </button>
                         )}
                       </div>
@@ -3574,8 +3612,8 @@ export default function Room() {
                   <div>
                     <p className="text-muted-foreground/60 text-sm mb-4">{isPrivileged ? "Upload a video to start watching" : "Waiting for host to upload a video"}</p>
                     {isPrivileged && (
-                      <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-2 px-5 py-2.5 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-all mx-auto">
-                        <Upload className="w-4 h-4" />Upload Video
+                      <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-2.5 px-7 py-3.5 rounded-xl bg-violet-500 text-white text-base font-bold hover:bg-violet-600 active:scale-95 transition-all shadow-lg shadow-violet-500/30 mx-auto">
+                        <Upload className="w-5 h-5" />Upload Video
                       </button>
                     )}
                   </div>
@@ -3631,8 +3669,8 @@ export default function Room() {
                     <div className="text-center p-8">
                       <Globe className="w-16 h-16 text-muted-foreground/30 mx-auto mb-4" />
                       <p className="text-muted-foreground text-sm mb-4">Start a shared browser session for everyone to browse together</p>
-                      <button onClick={startBrowserSession} disabled={startingBrowser} className="flex items-center gap-2 px-5 py-2.5 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-all mx-auto disabled:opacity-50">
-                        {startingBrowser ? <Loader2 className="w-4 h-4 animate-spin" /> : <Globe className="w-4 h-4" />}
+                      <button onClick={startBrowserSession} disabled={startingBrowser} className="flex items-center gap-2.5 px-7 py-3.5 rounded-xl bg-sky-500 text-white text-base font-bold hover:bg-sky-600 active:scale-95 transition-all shadow-lg shadow-sky-500/30 mx-auto disabled:opacity-50">
+                        {startingBrowser ? <Loader2 className="w-5 h-5 animate-spin" /> : <Globe className="w-5 h-5" />}
                         {startingBrowser ? "Starting..." : "Start Browser Session"}
                       </button>
                     </div>
@@ -3675,41 +3713,44 @@ export default function Room() {
         )}
         {panelOpen && (
           <div
-            className="absolute right-0 top-0 w-72 bg-card border-l border-border z-[60] flex flex-col shadow-2xl"
+            className="absolute right-0 top-0 w-80 bg-card border-l border-border z-[60] flex flex-col shadow-2xl"
             style={{ bottom: isIOSDevice ? Math.max(0, window.innerHeight - iosViewport.h) : 0 }}
           >
-            <div className="flex items-center justify-between px-4 py-2.5 border-b border-border flex-shrink-0">
-              <span className="text-sm font-semibold">Room Panel</span>
-              <button onClick={() => setPanelOpen(false)} className="p-1 rounded hover:bg-muted transition-colors">
-                <X className="w-4 h-4 text-muted-foreground" />
+            <div className="flex items-center justify-between px-4 py-3.5 border-b border-border flex-shrink-0">
+              <span className="text-base font-bold">Room Panel</span>
+              <button onClick={() => setPanelOpen(false)} className="p-1.5 rounded-lg hover:bg-muted transition-colors">
+                <X className="w-5 h-5 text-muted-foreground" />
               </button>
             </div>
 
             <div className="flex border-b border-border flex-shrink-0">
               <button
                 onClick={() => setActiveTab("members")}
-                className={`relative flex-1 py-2 text-xs font-medium transition-colors ${activeTab === "members" ? "text-primary border-b-2 border-primary" : "text-muted-foreground hover:text-foreground"}`}
+                className={`relative flex-1 py-3 text-sm font-semibold transition-colors ${activeTab === "members" ? "text-primary border-b-2 border-primary" : "text-muted-foreground hover:text-foreground"}`}
               >
                 Members
                 {joinRequests.length > 0 && isPrivileged && (
-                  <span className="absolute top-0.5 right-1 w-4 h-4 rounded-full bg-amber-500 text-white text-[10px] flex items-center justify-center">{joinRequests.length}</span>
+                  <span className="absolute top-1.5 right-2 min-w-[18px] h-[18px] px-1 rounded-full bg-amber-500 text-white text-[11px] font-bold flex items-center justify-center shadow-sm shadow-amber-500/50">{joinRequests.length}</span>
                 )}
               </button>
               {isPrivileged && (
                 <button
                   onClick={() => { setActiveTab("bans"); refetchBans(); }}
-                  className={`flex-1 py-2 text-xs font-medium transition-colors ${activeTab === "bans" ? "text-primary border-b-2 border-primary" : "text-muted-foreground hover:text-foreground"}`}
+                  className={`relative flex-1 py-3 text-sm font-semibold transition-colors ${activeTab === "bans" ? "text-primary border-b-2 border-primary" : "text-muted-foreground hover:text-foreground"}`}
                 >
                   Bans
+                  {(bans?.length ?? 0) > 0 && (
+                    <span className="absolute top-1.5 right-2 min-w-[18px] h-[18px] px-1 rounded-full bg-red-500 text-white text-[11px] font-bold flex items-center justify-center shadow-sm shadow-red-500/50 animate-pulse">{bans?.length}</span>
+                  )}
                 </button>
               )}
               <button
                 onClick={() => { setActiveTab("chat"); setUnreadCount(0); }}
-                className={`relative flex-1 py-2 text-xs font-medium transition-colors ${activeTab === "chat" ? "text-primary border-b-2 border-primary" : "text-muted-foreground hover:text-foreground"}`}
+                className={`relative flex-1 py-3 text-sm font-semibold transition-colors ${activeTab === "chat" ? "text-primary border-b-2 border-primary" : "text-muted-foreground hover:text-foreground"}`}
               >
                 Chat
                 {unreadCount > 0 && activeTab !== "chat" && (
-                  <span className="absolute top-0.5 right-1 w-4 h-4 rounded-full bg-primary text-white text-[10px] flex items-center justify-center">{unreadCount}</span>
+                  <span className="absolute top-1.5 right-2 min-w-[18px] h-[18px] px-1 rounded-full bg-primary text-white text-[11px] font-bold flex items-center justify-center shadow-sm">{unreadCount}</span>
                 )}
               </button>
             </div>
@@ -3717,26 +3758,26 @@ export default function Room() {
             {/* Members tab */}
             {activeTab === "members" && (
               <div className="flex-1 overflow-y-auto flex flex-col">
-                <div className="px-3 py-2 border-b border-border/50 flex-shrink-0">
-                  <span className="text-xs text-muted-foreground">{onlineCount} online</span>
+                <div className="px-4 py-2.5 border-b border-border/50 flex-shrink-0">
+                  <span className="text-sm font-medium text-muted-foreground">{onlineCount} online</span>
                 </div>
 
                 {/* Join requests */}
                 {isPrivileged && joinRequests.length > 0 && (
-                  <div className="px-3 py-2 border-b border-border/50 space-y-2 flex-shrink-0">
-                    <p className="text-xs font-medium text-amber-400">Waiting for approval</p>
+                  <div className="px-3.5 py-2.5 border-b border-border/50 space-y-2 flex-shrink-0">
+                    <p className="text-sm font-semibold text-amber-400">Waiting for approval</p>
                     {joinRequests.map(req => (
-                      <div key={req.memberId} className="flex items-center gap-2 p-2 rounded-lg bg-amber-500/10 border border-amber-500/20">
-                        <UserCheck className="w-4 h-4 text-amber-400 flex-shrink-0" />
-                        <span className="text-xs font-medium flex-1 truncate">{req.name}</span>
-                        <button onClick={() => approveJoin(req.memberId)} className="px-2 py-0.5 rounded bg-green-500/20 text-green-400 text-xs hover:bg-green-500/30 transition-colors">✓</button>
-                        <button onClick={() => rejectJoin(req.memberId)} className="px-2 py-0.5 rounded bg-red-500/20 text-red-400 text-xs hover:bg-red-500/30 transition-colors">✗</button>
+                      <div key={req.memberId} className="flex items-center gap-2.5 p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/20">
+                        <UserCheck className="w-5 h-5 text-amber-400 flex-shrink-0" />
+                        <span className="text-sm font-medium flex-1 truncate">{req.name}</span>
+                        <button onClick={() => approveJoin(req.memberId)} className="px-2.5 py-1 rounded bg-green-500/20 text-green-400 text-sm hover:bg-green-500/30 transition-colors">✓</button>
+                        <button onClick={() => rejectJoin(req.memberId)} className="px-2.5 py-1 rounded bg-red-500/20 text-red-400 text-sm hover:bg-red-500/30 transition-colors">✗</button>
                       </div>
                     ))}
                   </div>
                 )}
 
-                <div className="flex-1 overflow-y-auto px-3 py-2 space-y-1">
+                <div className="flex-1 overflow-y-auto px-3.5 py-2.5 space-y-1.5">
                   {onlineMembers.map(member => {
                     const isMe = member.id === myMemberId;
                     const vol = speakingState[member.id] ?? 0;
@@ -3765,54 +3806,54 @@ export default function Room() {
                             animation: "spin 3s linear infinite",
                           }}
                         />
-                      <div className={`relative flex items-center gap-2 p-2 rounded-[6px] z-10 m-[1.5px] transition-all ${isMe ? "bg-muted" : "bg-card hover:bg-muted/60"}`}>
-                        <div className={`relative w-8 h-8 rounded-full bg-muted flex items-center justify-center flex-shrink-0 transition-all ${getRoleRing(member.role)} ${isSpeaking ? "shadow-[0_0_0_3px_rgba(139,92,246,0.5)]" : ""}`}>
+                      <div className={`relative flex items-center gap-2.5 p-2.5 rounded-[6px] z-10 m-[1.5px] transition-all ${isMe ? "bg-muted" : "bg-card hover:bg-muted/60"}`}>
+                        <div className={`relative w-10 h-10 rounded-full bg-muted flex items-center justify-center flex-shrink-0 transition-all ${getRoleRing(member.role)} ${isSpeaking ? "shadow-[0_0_0_3px_rgba(139,92,246,0.5)]" : ""}`}>
                           {member.role === "host"
-                            ? <Crown className="w-4 h-4 text-yellow-500" />
+                            ? <Crown className="w-5 h-5 text-yellow-500" />
                             : member.role === "admin"
-                              ? <Shield className="w-4 h-4 text-purple-400" />
-                              : <User className="w-4 h-4 text-muted-foreground" />}
+                              ? <Shield className="w-5 h-5 text-purple-400" />
+                              : <User className="w-5 h-5 text-muted-foreground" />}
                         </div>
                         <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-1 min-w-0">
-                            <span className="text-xs font-medium truncate">{member.name}{isMe ? " (you)" : ""}</span>
-                            {member.isMuted && <MicOff className="w-2.5 h-2.5 text-destructive flex-shrink-0" />}
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            <span className="text-sm font-semibold truncate">{member.name}{isMe ? " (you)" : ""}</span>
+                            {member.isMuted && <MicOff className="w-3 h-3 text-destructive flex-shrink-0" />}
                           </div>
-                          <div className="mt-0.5">{getRoleBadge(member.role)}</div>
+                          <div className="mt-1">{getRoleBadge(member.role)}</div>
                         </div>
                         {isPrivileged && !isMe && (
-                          <div className="flex items-center gap-0.5 flex-shrink-0">
+                          <div className="flex items-center gap-1 flex-shrink-0">
                             <button
                               onClick={() => muteMember(member.id, !member.isMuted)}
-                              className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
+                              className="p-1.5 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
                               title={member.isMuted ? "Unmute" : "Mute"}
                             >
-                              {member.isMuted ? <Mic className="w-3 h-3" /> : <MicOff className="w-3 h-3" />}
+                              {member.isMuted ? <Mic className="w-4 h-4" /> : <MicOff className="w-4 h-4" />}
                             </button>
                             {myRole === "host" && member.role !== "host" && (
                               <button
                                 onClick={() => promoteMember(member.id, member.role === "admin" ? "guest" : "admin")}
-                                className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-purple-400 transition-colors"
+                                className="p-1.5 rounded-md hover:bg-muted text-muted-foreground hover:text-purple-400 transition-colors"
                                 title={member.role === "admin" ? "Demote to Guest" : "Make Admin"}
                               >
-                                <Shield className="w-3 h-3" />
+                                <Shield className="w-4 h-4" />
                               </button>
                             )}
                             {(myRole === "host" || (myRole === "admin" && member.role === "guest")) && (
                               <>
                                 <button
                                   onClick={() => kickMember(member.id)}
-                                  className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-orange-400 transition-colors"
+                                  className="p-1.5 rounded-md hover:bg-muted text-muted-foreground hover:text-orange-400 transition-colors"
                                   title="Kick"
                                 >
-                                  <LogOut className="w-3 h-3" />
+                                  <LogOut className="w-4 h-4" />
                                 </button>
                                 <button
                                   onClick={() => banMember(member.id)}
-                                  className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-destructive transition-colors"
+                                  className="p-1.5 rounded-md hover:bg-muted text-muted-foreground hover:text-destructive transition-colors"
                                   title="Ban"
                                 >
-                                  <Ban className="w-3 h-3" />
+                                  <Ban className="w-4 h-4" />
                                 </button>
                               </>
                             )}
@@ -3830,25 +3871,25 @@ export default function Room() {
             {activeTab === "bans" && isPrivileged && (
               <div className="flex-1 overflow-y-auto flex flex-col">
                 {bansLoading ? (
-                  <div className="flex items-center justify-center py-8"><Loader2 className="w-5 h-5 animate-spin text-muted-foreground" /></div>
+                  <div className="flex items-center justify-center py-8"><Loader2 className="w-6 h-6 animate-spin text-muted-foreground" /></div>
                 ) : !bans || bans.length === 0 ? (
                   <div className="flex flex-col items-center justify-center py-8 text-center px-4">
                     <ShieldOff className="w-10 h-10 text-muted-foreground/30 mb-3" />
-                    <p className="text-xs text-muted-foreground">No banned members</p>
+                    <p className="text-sm text-muted-foreground">No banned members</p>
                   </div>
                 ) : (
-                  <div className="px-3 py-2 space-y-1">
+                  <div className="px-3.5 py-2.5 space-y-1.5">
                     {bans.map(ban => (
-                      <div key={ban.id} className="flex items-center gap-2 p-2 rounded-lg bg-muted/30 border border-border/50">
-                        <Ban className="w-4 h-4 text-destructive flex-shrink-0" />
-                        <span className="text-xs flex-1 truncate font-medium">{(ban as unknown as { name?: string }).name ?? "Unknown"}</span>
+                      <div key={ban.id} className="flex items-center gap-2.5 p-2.5 rounded-lg bg-muted/30 border border-border/50">
+                        <Ban className="w-5 h-5 text-destructive flex-shrink-0" />
+                        <span className="text-sm flex-1 truncate font-semibold">{(ban as unknown as { name?: string }).name ?? "Unknown"}</span>
                         {myRole === "host" && (
                           <button
                             onClick={() => unban.mutate({ code, banId: ban.id })}
-                            className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-green-400 transition-colors"
+                            className="p-1.5 rounded-md hover:bg-muted text-muted-foreground hover:text-green-400 transition-colors"
                             title="Unban"
                           >
-                            <UserCheck className="w-3 h-3" />
+                            <UserCheck className="w-4 h-4" />
                           </button>
                         )}
                       </div>

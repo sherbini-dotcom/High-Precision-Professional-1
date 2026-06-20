@@ -17,5 +17,6 @@ export * from './room';
 export * from './roomInput';
 export * from './roomJoinInput';
 export * from './roomJoinResult';
+export * from './setRoomPrivacyBody';
 export * from './videoStatus';
 export * from './videoStatusStatus';

@@ -42,6 +42,8 @@ export interface Room {
   code: string;
   name: string;
   hasPassword: boolean;
+  /** When true, only existing members may (re)join — new joiners are blocked even with the correct code/password. */
+  isPrivate: boolean;
   /** @nullable */
   videoStatus?: string | null;
   /** @nullable */
@@ -87,6 +89,10 @@ export interface MemberRoleUpdate {
 
 export interface MuteMemberInput {
   isMuted: boolean;
+}
+
+export interface SetRoomPrivacyBody {
+  isPrivate: boolean;
 }
 
 export interface Ban {

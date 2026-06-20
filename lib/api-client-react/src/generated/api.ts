@@ -29,6 +29,7 @@ import type {
   RoomInput,
   RoomJoinInput,
   RoomJoinResult,
+  SetRoomPrivacyBody,
   VideoStatus
 } from './api.schemas';
 
@@ -339,6 +340,78 @@ export function useGetRoom<TData = Awaited<ReturnType<typeof getRoom>>, TError =
 
 
 
+
+export const getSetRoomPrivacyUrl = (code: string,) => {
+
+
+
+
+  return `/api/rooms/${code}/privacy`
+}
+
+/**
+ * @summary Set room privacy (host only) — when private, new joiners are blocked even with the correct code/password
+ */
+export const setRoomPrivacy = async (code: string,
+    setRoomPrivacyBody: SetRoomPrivacyBody, options?: RequestInit): Promise<void> => {
+
+  return customFetch<void>(getSetRoomPrivacyUrl(code),
+  {
+    ...options,
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    body: JSON.stringify(
+      setRoomPrivacyBody,)
+  }
+);}
+
+
+
+
+export const getSetRoomPrivacyMutationOptions = <TError = ErrorType<void>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof setRoomPrivacy>>, TError,{code: string;data: BodyType<SetRoomPrivacyBody>}, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof setRoomPrivacy>>, TError,{code: string;data: BodyType<SetRoomPrivacyBody>}, TContext> => {
+
+const mutationKey = ['setRoomPrivacy'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof setRoomPrivacy>>, {code: string;data: BodyType<SetRoomPrivacyBody>}> = (props) => {
+          const {code,data} = props ?? {};
+
+          return  setRoomPrivacy(code,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type SetRoomPrivacyMutationResult = NonNullable<Awaited<ReturnType<typeof setRoomPrivacy>>>
+    export type SetRoomPrivacyMutationBody = BodyType<SetRoomPrivacyBody>
+    export type SetRoomPrivacyMutationError = ErrorType<void>
+
+    /**
+ * @summary Set room privacy (host only) — when private, new joiners are blocked even with the correct code/password
+ */
+export const useSetRoomPrivacy = <TError = ErrorType<void>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof setRoomPrivacy>>, TError,{code: string;data: BodyType<SetRoomPrivacyBody>}, TContext>, request?: SecondParameter<typeof customFetch>}
+ ): UseMutationResult<
+        Awaited<ReturnType<typeof setRoomPrivacy>>,
+        TError,
+        {code: string;data: BodyType<SetRoomPrivacyBody>},
+        TContext
+      > => {
+      return useMutation(getSetRoomPrivacyMutationOptions(options));
+    }
 
 export const getListMembersUrl = (code: string,) => {
 

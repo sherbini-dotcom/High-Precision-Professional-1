@@ -52,6 +52,7 @@ export const JoinRoomResponse = zod.object({
   "code": zod.string(),
   "name": zod.string(),
   "hasPassword": zod.boolean(),
+  "isPrivate": zod.boolean().describe('When true, only existing members may (re)join — new joiners are blocked even with the correct code\/password.'),
   "videoStatus": zod.string().nullish(),
   "videoName": zod.string().nullish(),
   "createdAt": zod.coerce.date()
@@ -80,9 +81,26 @@ export const GetRoomResponse = zod.object({
   "code": zod.string(),
   "name": zod.string(),
   "hasPassword": zod.boolean(),
+  "isPrivate": zod.boolean().describe('When true, only existing members may (re)join — new joiners are blocked even with the correct code\/password.'),
   "videoStatus": zod.string().nullish(),
   "videoName": zod.string().nullish(),
   "createdAt": zod.coerce.date()
+})
+
+
+/**
+ * @summary Set room privacy (host only) — when private, new joiners are blocked even with the correct code/password
+ */
+export const SetRoomPrivacyParams = zod.object({
+  "code": zod.coerce.string()
+})
+
+export const SetRoomPrivacyHeader = zod.object({
+  "x-session-token": zod.string()
+})
+
+export const SetRoomPrivacyBody = zod.object({
+  "isPrivate": zod.boolean()
 })
 
 

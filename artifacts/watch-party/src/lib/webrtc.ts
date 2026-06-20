@@ -22,38 +22,21 @@ interface PeerEntry {
 }
 
 // ─── ICE Servers ─────────────────────────────────────────────────────────────
-// ICE server list — ordered so Android devices (which often sit behind strict NAT/firewalls)
-// prefer TCP on port 443 first (most likely to penetrate corporate/mobile firewalls),
-// then fall back to UDP. Multiple independent TURN providers are listed so a single
-// provider outage does not take down all connections.
-const ICE_SERVERS: RTCIceServer[] = [
+// SEC-FIX: Metered TURN credentials must NEVER live in frontend code — this
+// bundle ships to every visitor's browser, so any hardcoded key here is
+// effectively public and can be scraped to drain our Metered quota.
+// Real (paid) TURN credentials are now fetched from the backend at
+// `/api/ice-servers`, which reads METERED_API_KEY/METERED_APP_NAME from
+// server-side env vars (see artifacts/api-server/src/routes/ice.ts).
+//
+// Only well-known, intentionally-public demo servers are kept here as a
+// last-resort fallback if that fetch fails — these credentials are meant
+// to be shared publicly by their providers, so hardcoding them is safe.
+const PUBLIC_FALLBACK_ICE_SERVERS: RTCIceServer[] = [
   // ── STUN (no relay, used for direct peer connections) ──────────────────────
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
   { urls: "stun:stun.cloudflare.com:3478" },
-
-  // ── Metered free TURN — reliable, global edge network ──────────────────────
-  // TCP/443 first: punches through most Android mobile firewalls
-  {
-    urls: "turns:global.relay.metered.ca:443?transport=tcp",
-    username: "e499b2a4d1c3dda31be30f2a",
-    credential: "uqBpJFSFuKvKfGtj",
-  },
-  {
-    urls: "turn:global.relay.metered.ca:443",
-    username: "e499b2a4d1c3dda31be30f2a",
-    credential: "uqBpJFSFuKvKfGtj",
-  },
-  {
-    urls: "turn:global.relay.metered.ca:80?transport=tcp",
-    username: "e499b2a4d1c3dda31be30f2a",
-    credential: "uqBpJFSFuKvKfGtj",
-  },
-  {
-    urls: "turn:global.relay.metered.ca:80",
-    username: "e499b2a4d1c3dda31be30f2a",
-    credential: "uqBpJFSFuKvKfGtj",
-  },
 
   // ── Numb (Citrix) — long-running public TURN fallback ──────────────────────
   {
@@ -79,6 +62,38 @@ const ICE_SERVERS: RTCIceServer[] = [
     credential: "free",
   },
 ];
+
+// In-memory cache so we only hit the backend once per page session, with a
+// short TTL matching the backend's own Metered credential cache (4 min).
+let cachedIceServers: RTCIceServer[] | null = null;
+let iceServersCacheExpiry = 0;
+const ICE_SERVERS_CACHE_TTL_MS = 4 * 60 * 1000;
+
+/**
+ * Fetches the real TURN/STUN server list from our backend (which holds the
+ * actual Metered API key server-side). Falls back to public demo servers
+ * only if the request fails — this should be rare in production.
+ */
+async function getIceServers(): Promise<RTCIceServer[]> {
+  if (cachedIceServers && Date.now() < iceServersCacheExpiry) {
+    return cachedIceServers;
+  }
+  try {
+    const res = await fetch("/api/ice-servers");
+    if (!res.ok) throw new Error(`ice-servers fetch failed: ${res.status}`);
+    const data = (await res.json()) as { iceServers: RTCIceServer[] };
+    if (Array.isArray(data.iceServers) && data.iceServers.length > 0) {
+      cachedIceServers = data.iceServers;
+      iceServersCacheExpiry = Date.now() + ICE_SERVERS_CACHE_TTL_MS;
+      return cachedIceServers;
+    }
+    throw new Error("ice-servers response had no servers");
+  } catch {
+    // Backend unreachable or misconfigured — degrade to public fallbacks
+    // rather than failing the call entirely.
+    return PUBLIC_FALLBACK_ICE_SERVERS;
+  }
+}
 
 // ─── Optimal Mic Capture ──────────────────────────────────────────────────────
 export async function getMicStream(): Promise<MediaStream> {
@@ -262,9 +277,10 @@ export class WebRTCManager {
     return audio;
   }
 
-  private createPeer(memberId: number, polite: boolean): PeerEntry {
+  private async createPeer(memberId: number, polite: boolean): Promise<PeerEntry> {
+    const iceServers = await getIceServers();
     const pc = new RTCPeerConnection({
-      iceServers: ICE_SERVERS,
+      iceServers,
       bundlePolicy: "max-bundle",
       rtcpMuxPolicy: "require",
       iceTransportPolicy: "all",
@@ -488,7 +504,7 @@ export class WebRTCManager {
       this.removePeer(targetMemberId);
     }
 
-    const entry = this.createPeer(targetMemberId, false);
+    const entry = await this.createPeer(targetMemberId, false);
 
     try {
       entry.makingOffer = true;
@@ -518,7 +534,7 @@ export class WebRTCManager {
     let entry = this.peers.get(fromMemberId);
 
     if (signal.type === "offer") {
-      if (!entry) entry = this.createPeer(fromMemberId, true);
+      if (!entry) entry = await this.createPeer(fromMemberId, true);
 
       const offerCollision =
         entry.makingOffer || entry.pc.signalingState !== "stable";
