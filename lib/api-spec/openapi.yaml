@@ -1,0 +1,417 @@
+openapi: 3.1.0
+info:
+  title: Api
+  version: 0.1.0
+  description: Watch Party API
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: rooms
+    description: Room management
+  - name: members
+    description: Member management
+  - name: bans
+    description: Ban management
+  - name: video
+    description: Video management
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /rooms:
+    post:
+      operationId: createRoom
+      tags: [rooms]
+      summary: Create a new watch party room
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RoomInput"
+      responses:
+        "201":
+          description: Room created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoomJoinResult"
+        "400":
+          description: Bad request
+
+  /rooms/join:
+    post:
+      operationId: joinRoom
+      tags: [rooms]
+      summary: Join an existing room
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RoomJoinInput"
+      responses:
+        "200":
+          description: Joined successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoomJoinResult"
+        "400":
+          description: Bad request (wrong password or banned)
+        "404":
+          description: Room not found
+
+  /rooms/{code}:
+    get:
+      operationId: getRoom
+      tags: [rooms]
+      summary: Get room info
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Room info
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Room"
+        "404":
+          description: Room not found
+
+  /rooms/{code}/members:
+    get:
+      operationId: listMembers
+      tags: [members]
+      summary: List all members in a room
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Member list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Member"
+
+  /rooms/{code}/members/{memberId}/role:
+    put:
+      operationId: setMemberRole
+      tags: [members]
+      summary: Promote or demote a member (host only)
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: memberId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MemberRoleUpdate"
+      responses:
+        "200":
+          description: Role updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Member"
+        "403":
+          description: Forbidden
+        "404":
+          description: Member not found
+
+  /rooms/{code}/members/{memberId}/mute:
+    post:
+      operationId: toggleMuteMember
+      tags: [members]
+      summary: Mute or unmute a member (admin/host only)
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: memberId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MuteMemberInput"
+      responses:
+        "200":
+          description: Mute state updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Member"
+
+  /rooms/{code}/members/{memberId}:
+    delete:
+      operationId: kickMember
+      tags: [members]
+      summary: Kick a member from the room (admin/host only)
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: memberId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: x-session-token
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Member kicked
+        "403":
+          description: Forbidden
+
+  /rooms/{code}/bans:
+    get:
+      operationId: listBans
+      tags: [bans]
+      summary: List banned IPs in a room
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: x-session-token
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ban list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Ban"
+
+  /rooms/{code}/bans/{banId}:
+    delete:
+      operationId: unbanMember
+      tags: [bans]
+      summary: Unban a member by ban ID (host only)
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: banId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: x-session-token
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Unbanned
+        "403":
+          description: Forbidden
+        "404":
+          description: Ban not found
+
+  /rooms/{code}/video/status:
+    get:
+      operationId: getVideoStatus
+      tags: [video]
+      summary: Get current video processing status
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Video status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VideoStatus"
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+
+    RoomInput:
+      type: object
+      required: [roomName, hostName]
+      properties:
+        roomName:
+          type: string
+          minLength: 1
+          maxLength: 50
+        hostName:
+          type: string
+          minLength: 1
+          maxLength: 30
+        password:
+          type: ["string", "null"]
+
+    RoomJoinInput:
+      type: object
+      required: [code, name]
+      properties:
+        code:
+          type: string
+        name:
+          type: string
+          minLength: 1
+          maxLength: 30
+        password:
+          type: ["string", "null"]
+        sessionToken:
+          type: ["string", "null"]
+
+    RoomJoinResult:
+      type: object
+      required: [room, member, sessionToken]
+      properties:
+        room:
+          $ref: "#/components/schemas/Room"
+        member:
+          $ref: "#/components/schemas/Member"
+        sessionToken:
+          type: string
+
+    Room:
+      type: object
+      required: [id, code, name, hasPassword, createdAt]
+      properties:
+        id:
+          type: integer
+        code:
+          type: string
+        name:
+          type: string
+        hasPassword:
+          type: boolean
+        videoStatus:
+          type: ["string", "null"]
+        videoName:
+          type: ["string", "null"]
+        createdAt:
+          type: string
+          format: date-time
+
+    Member:
+      type: object
+      required: [id, roomId, name, role, isMuted, joinedAt]
+      properties:
+        id:
+          type: integer
+        roomId:
+          type: integer
+        name:
+          type: string
+        role:
+          type: string
+          enum: [host, admin, guest]
+        isMuted:
+          type: boolean
+        joinedAt:
+          type: string
+          format: date-time
+
+    MemberRoleUpdate:
+      type: object
+      required: [role]
+      properties:
+        role:
+          type: string
+          enum: [admin, guest]
+
+    MuteMemberInput:
+      type: object
+      required: [isMuted]
+      properties:
+        isMuted:
+          type: boolean
+
+    Ban:
+      type: object
+      required: [id, roomId, ip, bannedAt]
+      properties:
+        id:
+          type: integer
+        roomId:
+          type: integer
+        ip:
+          type: string
+        bannedBy:
+          type: ["string", "null"]
+        bannedAt:
+          type: string
+          format: date-time
+
+    VideoStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [none, uploading, processing, ready, error]
+        filename:
+          type: ["string", "null"]
+        hlsPath:
+          type: ["string", "null"]
+        progress:
+          type: ["integer", "null"]

@@ -1,0 +1,3 @@
+- [Socket.IO kick/ban fix](socket-kick-ban.md) — fetchSockets() can't read closure vars; must use socket.data for cross-socket member tracking
+- [iOS fullscreen](ios-fullscreen.md) — use webkitEnterFullscreen() on video element, wrap all fullscreen calls in try/catch, remove runtimeErrorOverlay plugin
+- [Role update after promote](role-update-promote.md) — must emit roleUpdated to target socket after promoteMember; client keeps myRole in useState
