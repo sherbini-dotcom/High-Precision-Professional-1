@@ -544,6 +544,12 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
             return;
           }
 
+          // Block guests from joining when room is private
+          if (room.isPrivate && member.role === "guest") {
+            socket.emit("error", { message: "This room is private. No new members can join." });
+            return;
+          }
+
           currentRoomCode = roomCode;
           currentMemberId = member.id;
           currentRole = member.role;

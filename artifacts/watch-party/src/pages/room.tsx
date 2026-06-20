@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useRoute, useLocation } from "wouter";
-import { useGetRoom, useGetVideoStatus, useListBans, useUnbanMember, getListBansQueryKey } from "@workspace/api-client-react";
+import { useGetRoom, useGetVideoStatus, useListBans, useUnbanMember, getListBansQueryKey, useSetRoomPrivacy } from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { getSession, saveSession, clearSession } from "@/lib/storage";
 import { connectSocket, disconnectSocket } from "@/lib/socket";
@@ -130,6 +130,7 @@ export default function Room() {
 
   // MOD #10: access control state
   const [accessControlEnabled, setAccessControlEnabled] = useState(false);
+  const [isPrivateLocal, setIsPrivateLocal] = useState<boolean | null>(null);
 
   const [panelOpen, setPanelOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<"members" | "bans" | "chat">("members");
@@ -162,6 +163,15 @@ export default function Room() {
   useEffect(() => { notifSoundEnabledRef.current = notifSoundEnabled; }, [notifSoundEnabled]);
   useEffect(() => { panelOpenRef.current = panelOpen; }, [panelOpen]);
   useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
+
+  useEffect(() => {
+    const el = headerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setHeaderH(el.offsetHeight));
+    ro.observe(el);
+    setHeaderH(el.offsetHeight);
+    return () => ro.disconnect();
+  }, []);
   // Clear draft when panel closes so the input is always fresh on reopen
   useEffect(() => { if (!panelOpen) setChatInput(""); }, [panelOpen]);
 
@@ -324,6 +334,8 @@ export default function Room() {
   const isUploadingRef = useRef(false);
 
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
+  const headerRef = useRef<HTMLDivElement>(null);
+  const [headerH, setHeaderH] = useState(0);
   const socketRef = useRef<Socket | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const videoContainerRef = useRef<HTMLDivElement>(null);
@@ -393,6 +405,10 @@ export default function Room() {
   });
 
   const { data: roomData } = useGetRoom(code, { query: { enabled: !!code, queryKey: [code, "room"] } });
+  const setPrivacyMutation = useSetRoomPrivacy({
+    request: { headers: { "x-session-token": sessionToken } },
+    mutation: { onSuccess: () => queryClient.invalidateQueries({ queryKey: [code, "room"] }) },
+  });
   const { data: videoStatus, refetch: refetchVideoStatus } = useGetVideoStatus(code, {
     query: { enabled: !!code, queryKey: [code, "videoStatus"], refetchInterval: videoHlsPath ? false : 5000 }
   });
@@ -2965,9 +2981,9 @@ export default function Room() {
          arrives while the panel is closed. Tap to open the relevant tab.   */}
     {chatToast && (
       <div
-        className="fixed z-[100000] flex items-start gap-3 max-w-[320px] w-[calc(100vw-32px)] sm:w-auto bg-background/98 border border-border rounded-2xl px-4 py-4 shadow-2xl cursor-pointer select-none"
+        className="fixed z-[100000] flex items-start gap-3 w-[260px] sm:w-[300px] bg-background/98 border border-border rounded-2xl px-3 py-3 shadow-2xl cursor-pointer select-none"
         style={{
-          top: "calc(env(safe-area-inset-top) + 116px)", right: 16,
+          top: headerH, right: 12,
           backdropFilter: "blur(16px)",
           animation: toastSwipe.x === 0 && toastSwipe.y === 0 ? "toast-slide-in 0.25s cubic-bezier(0.34,1.56,0.64,1)" : undefined,
           transform: `translate(${toastSwipe.x}px, ${toastSwipe.y}px)`,
@@ -3081,7 +3097,7 @@ export default function Room() {
     )}
     <div className="bg-background flex flex-col overflow-hidden" style={{ height: "100dvh" }}>
       {/* Top bar — 2-row layout */}
-      <div className="border-b border-border bg-card/50 backdrop-blur-sm flex-shrink-0" style={{ paddingTop: "env(safe-area-inset-top)" }}>
+      <div ref={headerRef} className="border-b border-border bg-card/50 backdrop-blur-sm flex-shrink-0" style={{ paddingTop: "env(safe-area-inset-top)" }}>
         {/* Row 1: room name + lock (left) | mode switcher (right, desktop only) */}
         <div className="flex items-center gap-2.5 px-3 pt-3.5 pb-2">
           {/* Left: icon + room name + lock */}
@@ -3090,22 +3106,53 @@ export default function Room() {
             <span className="font-bold text-foreground text-base truncate max-w-[110px] sm:max-w-none">{roomData?.name ?? code}</span>
             {!isConnected && <WifiOff className="w-4 h-4 text-destructive flex-shrink-0" />}
             {myRole === "host" && (
-              <button
-                onClick={() => {
-                  const locking = !accessControlEnabled;
-                  socketRef.current?.emit("setAccessControl", { enabled: locking });
-                  if (locking && hyperbeamEmbed) terminateBrowserSession();
-                }}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-sm font-semibold transition-all duration-300 active:scale-95 flex-shrink-0 ${
-                  accessControlEnabled
-                    ? "bg-red-500/20 border-red-400/50 text-red-300 shadow-[0_0_8px_rgba(239,68,68,0.3)]"
-                    : "bg-green-500/15 border-green-400/40 text-green-300 shadow-[0_0_8px_rgba(34,197,94,0.2)]"
-                }`}
-                title={accessControlEnabled ? "Locked" : "Open"}
-              >
-                <Lock className={`w-3.5 h-3.5 transition-transform duration-300 ${accessControlEnabled ? "rotate-0" : "-rotate-12"}`} />
-                <span>{accessControlEnabled ? "Locked" : "Open"}</span>
-              </button>
+              <div className="flex items-center gap-1.5 flex-shrink-0">
+                {/* Close Room — slightly bigger */}
+                <button
+                  onClick={() => { if (confirm("Close the room for everyone?")) socketRef.current?.emit("closeRoom"); }}
+                  className="flex items-center gap-1.5 px-3.5 py-2 rounded-full border text-sm font-semibold transition-all duration-200 active:scale-95 bg-destructive/15 border-destructive/40 text-destructive hover:bg-destructive/25"
+                  title="Close room"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Close</span>
+                </button>
+                {/* Private / Public toggle — optimistic update */}
+                <button
+                  onClick={() => {
+                    const newVal = !(isPrivateLocal ?? roomData?.isPrivate ?? false);
+                    setIsPrivateLocal(newVal);
+                    setPrivacyMutation.mutate({ code, data: { isPrivate: newVal } }, {
+                      onError: () => setIsPrivateLocal(null),
+                    });
+                  }}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-sm font-semibold transition-all duration-300 active:scale-95 flex-shrink-0 ${
+                    (isPrivateLocal ?? roomData?.isPrivate)
+                      ? "bg-red-500/20 border-red-400/50 text-red-300 shadow-[0_0_8px_rgba(239,68,68,0.3)]"
+                      : "bg-sky-500/15 border-sky-400/40 text-sky-300 shadow-[0_0_8px_rgba(56,189,248,0.2)]"
+                  }`}
+                  title={(isPrivateLocal ?? roomData?.isPrivate) ? "Private — click to make Public" : "Public — click to make Private"}
+                >
+                  {(isPrivateLocal ?? roomData?.isPrivate) ? <Lock className="w-3.5 h-3.5" /> : <Globe className="w-3.5 h-3.5" />}
+                  <span>{(isPrivateLocal ?? roomData?.isPrivate) ? "Private" : "Public"}</span>
+                </button>
+                {/* Open / Locked (access control) — unchanged */}
+                <button
+                  onClick={() => {
+                    const locking = !accessControlEnabled;
+                    socketRef.current?.emit("setAccessControl", { enabled: locking });
+                    if (locking && hyperbeamEmbed) terminateBrowserSession();
+                  }}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-sm font-semibold transition-all duration-300 active:scale-95 flex-shrink-0 ${
+                    accessControlEnabled
+                      ? "bg-red-500/20 border-red-400/50 text-red-300 shadow-[0_0_8px_rgba(239,68,68,0.3)]"
+                      : "bg-green-500/15 border-green-400/40 text-green-300 shadow-[0_0_8px_rgba(34,197,94,0.2)]"
+                  }`}
+                  title={accessControlEnabled ? "Locked" : "Open"}
+                >
+                  <Lock className={`w-3.5 h-3.5 transition-transform duration-300 ${accessControlEnabled ? "rotate-0" : "-rotate-12"}`} />
+                  <span>{accessControlEnabled ? "Locked" : "Open"}</span>
+                </button>
+              </div>
             )}
           </div>
           {/* Right: mode switcher — hidden on mobile, shown inline from sm: up */}
@@ -3138,7 +3185,12 @@ export default function Room() {
               </button>
             </div>
           ) : (
-            <div className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-semibold text-white bg-muted/50 border border-border/50 flex-shrink-0">
+            <div className={`hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-semibold border flex-shrink-0 ${
+                mode === "video" ? "bg-violet-500/20 border-violet-500/40 text-violet-300 shadow-sm shadow-violet-500/20"
+                : mode === "browser" ? "bg-sky-500/20 border-sky-500/40 text-sky-300 shadow-sm shadow-sky-500/20"
+                : mode === "movies" ? "bg-orange-500/20 border-orange-500/40 text-orange-300 shadow-sm shadow-orange-500/20"
+                : "bg-emerald-500/20 border-emerald-500/40 text-emerald-300 shadow-sm shadow-emerald-500/20"
+              }`}>
               {mode === "video" ? <><Film className="w-3.5 h-3.5" /><span>Video</span></>
                 : mode === "browser" ? <><Globe className="w-3.5 h-3.5" /><span>Browser</span></>
                 : mode === "movies" ? <><svg xmlns="http://www.w3.org/2000/svg" className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="17" y1="7" x2="22" y2="7"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="2" y1="17" x2="7" y2="17"/></svg><span>Movies</span></>
@@ -3177,7 +3229,12 @@ export default function Room() {
             </button>
           </div>
         ) : (
-          <div className="flex sm:hidden items-center justify-center gap-1.5 px-3 mx-3 mb-3 h-11 rounded-xl text-base font-bold text-white bg-muted/50 border border-border/50">
+          <div className={`flex sm:hidden items-center justify-center gap-1.5 px-3 mx-3 mb-3 h-11 rounded-xl text-base font-bold border ${
+            mode === "video" ? "bg-violet-500/25 border-violet-500/50 text-violet-200 shadow-md shadow-violet-500/20"
+            : mode === "browser" ? "bg-sky-500/25 border-sky-500/50 text-sky-200 shadow-md shadow-sky-500/20"
+            : mode === "movies" ? "bg-orange-500/25 border-orange-500/50 text-orange-200 shadow-md shadow-orange-500/20"
+            : "bg-emerald-500/25 border-emerald-500/50 text-emerald-200 shadow-md shadow-emerald-500/20"
+          }`}>
             {mode === "video" ? <><Film className="w-5 h-5" /><span>Video</span></>
               : mode === "browser" ? <><Globe className="w-5 h-5" /><span>Browser</span></>
               : mode === "movies" ? <><svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="17" y1="7" x2="22" y2="7"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="2" y1="17" x2="7" y2="17"/></svg><span>Movies</span></>
@@ -3232,16 +3289,6 @@ export default function Room() {
               className="flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg bg-orange-500/10 border border-orange-500/20 text-sm sm:text-base text-orange-400 hover:bg-orange-500/20 active:scale-90 transition-all duration-200 ease-out select-none flex-shrink-0"
             >
               <MonitorOff className="w-4 h-4 sm:w-5 sm:h-5" /><span className="hidden sm:inline">Stop Sharing</span>
-            </button>
-          )}
-
-          {myRole === "host" && (
-            <button
-              onClick={() => { if (confirm("Close the room for everyone?")) socketRef.current?.emit("closeRoom"); }}
-              className="flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg bg-destructive/10 border border-destructive/20 text-sm sm:text-base text-destructive hover:bg-destructive/20 active:scale-90 transition-all duration-200 ease-out select-none flex-shrink-0"
-              title="Close room"
-            >
-              <Trash2 className="w-4 h-4 sm:w-5 sm:h-5" /><span className="hidden sm:inline">Close Room</span>
             </button>
           )}
 

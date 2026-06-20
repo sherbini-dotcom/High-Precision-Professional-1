@@ -54,7 +54,7 @@ const getRoomLimiter = rateLimit({
 });
 
 // ─── Room & Video in-memory cache ─────────────────────────────────────────────
-type RoomRow = { id: number; code: string; name: string; passwordHash: string | null; createdAt: Date };
+type RoomRow = { id: number; code: string; name: string; passwordHash: string | null; isPrivate: boolean; createdAt: Date };
 type VideoRow = { status: string; originalName: string } | null;
 
 interface CacheEntry<T> { value: T; expiresAt: number }
@@ -227,6 +227,11 @@ router.post("/rooms/join", joinLimiter, async (req, res): Promise<void> => {
     return;
   }
 
+  if (room.isPrivate) {
+    res.status(403).json({ error: "This room is private. No new members can join." });
+    return;
+  }
+
   if (room.passwordHash && !password) {
     res.status(400).json({ error: "Password required" });
     return;
@@ -289,7 +294,33 @@ router.get("/rooms/:code", getRoomLimiter, async (req, res): Promise<void> => {
   const room = await getRoom(params.data.code.toUpperCase());
   if (!room) { res.status(404).json({ error: "Room not found" }); return; }
 
-  res.json({ id: room.id, code: room.code, name: room.name, hasPassword: !!room.passwordHash, createdAt: room.createdAt });
+  res.json({ id: room.id, code: room.code, name: room.name, hasPassword: !!room.passwordHash, isPrivate: room.isPrivate ?? false, createdAt: room.createdAt });
+});
+
+router.put("/rooms/:code/privacy", async (req, res): Promise<void> => {
+  const code = (req.params.code as string).toUpperCase();
+  const sessionToken = req.headers["x-session-token"] as string | undefined;
+  const { isPrivate } = req.body as { isPrivate?: unknown };
+
+  if (!sessionToken) { res.status(401).json({ error: "Missing session token" }); return; }
+  if (typeof isPrivate !== "boolean") { res.status(400).json({ error: "isPrivate must be a boolean" }); return; }
+
+  const room = await getRoom(code);
+  if (!room) { res.status(404).json({ error: "Room not found" }); return; }
+
+  const [member] = await db
+    .select()
+    .from(membersTable)
+    .where(and(eq(membersTable.roomId, room.id), eq(membersTable.sessionToken, sessionToken)));
+
+  if (!member || member.role !== "host") {
+    res.status(403).json({ error: "Only the host can change room privacy" });
+    return;
+  }
+
+  await db.update(roomsTable).set({ isPrivate }).where(eq(roomsTable.id, room.id));
+  invalidateRoomCache(code);
+  res.status(204).end();
 });
 
 export default router;
