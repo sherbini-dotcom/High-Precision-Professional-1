@@ -3044,7 +3044,7 @@ export default function Room() {
         position: "fixed", inset: 0, zIndex: 99998,
         display: "flex", alignItems: "flex-end", justifyContent: "center",
         paddingBottom: 48,
-        pointerEvents: welcomeLeaving ? "none" : "auto",
+        pointerEvents: "none",
       }}>
         <style>{`
           @keyframes wlc-up   { from { opacity:0; transform:translateY(24px) scale(0.95); } to { opacity:1; transform:translateY(0) scale(1); } }
@@ -3238,7 +3238,7 @@ export default function Room() {
         </div>
       </div>
     )}
-    <div className="bg-background flex flex-col overflow-hidden" style={{ height: "100%" }}>
+    <div className="bg-background flex flex-col overflow-hidden" style={{ height: "100dvh" }}>
       {/* Top bar — 2-row layout */}
       <div ref={headerRef} className="border-b border-border bg-card/50 backdrop-blur-sm flex-shrink-0" style={{ paddingTop: "env(safe-area-inset-top)" }}>
         {/* Row 1: room name + lock (left) | mode switcher (right, desktop only) */}
@@ -3569,7 +3569,7 @@ export default function Room() {
 
       {/* Main area */}
       <div className="flex flex-1 overflow-hidden relative">
-        <div className="flex-1 flex flex-col overflow-hidden">
+        <div className="flex-1 flex flex-col overflow-hidden" style={{ paddingBottom: isMobileDevice ? "env(safe-area-inset-bottom, 0px)" : 0 }}>
 
           {/* VIDEO MODE */}
           <div
@@ -4302,6 +4302,7 @@ export default function Room() {
           </div>
         )}
       </div>
+
 
       {/* Speaking notification */}
       {(() => {
