@@ -73,7 +73,7 @@ channel = "stable-25_05"
 [userenv]
 
 [userenv.shared]
-HYPERBEAM_API_KEY = "sk_test_a-j9_lPuPL-6K6DAO0CWVbo2AbYMg41rCP7Xtj6gNsk"
+HYPERBEAM_API_KEY = "sk_test_8nrqr1QrtjabGKJbTZ-EgSPlqaKfgAZhnhEqO1oTAcM"
 
 [userenv.development]
 

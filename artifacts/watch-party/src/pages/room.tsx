@@ -93,6 +93,10 @@ export default function Room() {
   const isIOSDevice = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
     (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
   const isMobileDevice = isIOSDevice || /Android/i.test(navigator.userAgent) || navigator.maxTouchPoints > 1;
+  // FIX-DESKTOP-FULLSCREEN: على iOS نحتاج تبديل الـ container لما isBrowserFullscreen يتغير،
+  // لذلك نمرره كـ dep. على desktop، native fullscreen يكفي بدون إعادة mount للـ SDK،
+  // فنمرر null (ثابت) عشان useEffect ميشتغلش تاني لما يدخل/يخرج من fullscreen.
+  const iosBrowserFullscreen = isIOSDevice ? isBrowserFullscreen : null;
   const [isLandscape, setIsLandscape] = useState(() => window.matchMedia("(orientation: landscape)").matches);
   const [browserWidened, setBrowserWidened] = useState(false);
   const [iosViewport, setIosViewport] = useState({ w: window.innerWidth, h: window.innerHeight, t: 0 });
@@ -115,6 +119,8 @@ export default function Room() {
   const hbContainerRef    = useRef<HTMLDivElement>(null);
   const hbIOSContainerRef = useRef<HTMLDivElement>(null);
   const hbInstanceRef     = useRef<{ destroy?: () => void } | null>(null);
+  // FIX-FULLSCREEN: ref يتابع isBrowserFullscreen عشان socket handlers تقدر تقراه بدون stale closure
+  const isBrowserFullscreenRef = useRef(false);
 
   // Screen Share state
   const [isScreenSharing, setIsScreenSharing] = useState(false);
@@ -622,7 +628,6 @@ export default function Room() {
       });
     };
 
-    // Re-join room on connect/reconnect
     const handleConnect = () => {
       setIsConnected(true);
       // Reset stale sync lock that may have been left from an in-flight sync
@@ -1235,6 +1240,16 @@ export default function Room() {
       setHyperbeamEmbed(embedUrl);
     });
     socket.on("hyperbeamEnded", () => {
+      // FIX-FULLSCREEN: اخرج من fullscreen دايماً لما الـ session تنتهي —
+      // سواء كان الـ host قفلها من الكمبيوتر والـ guest على الهاتف في fullscreen،
+      // أو أي حالة تانية. مش هيضر لو مش في fullscreen.
+      if (document.fullscreenElement) {
+        // non-iOS: fullscreen حقيقي عبر Browser API
+        document.exitFullscreen().catch(() => {});
+      }
+      // iOS + أي حالة: reset الـ state الوهمي دايماً
+      setIsBrowserFullscreen(false);
+      setBrowserWidened(false);
       setHyperbeamEmbed(null);
       setHyperbeamAdminToken(null);
     });
@@ -1256,6 +1271,13 @@ export default function Room() {
     });
     socket.on("chatHistory", (history: ChatMessage[]) => {
       setChatMessages(history);
+      // chatHistory is the last event the server sends after a SUCCESSFUL joinRoom.
+      // Resetting the error-retry counter here (not on connect) ensures transient
+      // "Invalid session" errors from one reconnect cycle don't accumulate and
+      // cause a premature room exit on a later cycle, while still allowing
+      // legitimate kicks (room deleted → joinRoom keeps failing → no chatHistory
+      // → counter reaches max → exit) to work correctly.
+      sessionErrorRetries = 0;
       // Show welcome only on first real entry (chatHistory is sent only after successful join, not during pendingApproval)
       if (!welcomeShownRef.current) {
         welcomeShownRef.current = true;
@@ -1498,6 +1520,13 @@ export default function Room() {
   }, [hyperbeamEmbed]);
 
   // Hyperbeam JS SDK — mount/destroy session when embed URL changes
+  // FIX: أضفنا `mode` للـ deps عشان لما المستخدم يرجع لتاب Browser بعد ما كان
+  // في تاب تاني (video مثلاً)، الـ container بيفضل في الـ DOM (مش بيتحذف) لكن
+  // الـ SDK لازم يتعمله re-mount على الـ node الجديدة.
+  // FIX-DESKTOP-FULLSCREEN: بنستخدم iosBrowserFullscreen بدل isBrowserFullscreen في الـ deps:
+  //   - على iOS:     iosBrowserFullscreen === isBrowserFullscreen → يتعمل re-mount لتبديل الـ container
+  //   - على desktop: iosBrowserFullscreen === null دايماً → الـ effect مش بيشتغل لما fullscreen يتغير
+  //                  فالـ SDK يفضل موجود والـ native fullscreen يملا الشاشة بدون انقطاع.
   useEffect(() => {
     if (!hyperbeamEmbed) {
       hbInstanceRef.current?.destroy?.();
@@ -1507,6 +1536,8 @@ export default function Room() {
       if (hbIOSContainerRef.current) hbIOSContainerRef.current.innerHTML = "";
       return;
     }
+    // لو مش في browser mode، متعملش mount — الـ container موجود في DOM بس مخبي بـ CSS
+    if (mode !== "browser") return;
     const container = (isBrowserFullscreen && isIOSDevice)
       ? hbIOSContainerRef.current
       : hbContainerRef.current;
@@ -1520,13 +1551,15 @@ export default function Room() {
       hbInstanceRef.current?.destroy?.();
       hbInstanceRef.current = null;
     };
-  }, [hyperbeamEmbed, isBrowserFullscreen, isIOSDevice]);
+  }, [hyperbeamEmbed, iosBrowserFullscreen, isIOSDevice, mode]);
 
   useEffect(() => {
     const onFsChange = () => {
       const fsEl = document.fullscreenElement || (document as unknown as { webkitFullscreenElement: Element | null }).webkitFullscreenElement;
-      setIsBrowserFullscreen(!!fsEl);
-      if (!fsEl) setBrowserWidened(false);
+      const active = !!fsEl;
+      setIsBrowserFullscreen(active);
+      isBrowserFullscreenRef.current = active;
+      if (!active) setBrowserWidened(false);
     };
     document.addEventListener("fullscreenchange", onFsChange);
     document.addEventListener("webkitfullscreenchange", onFsChange);
@@ -1535,6 +1568,13 @@ export default function Room() {
       document.removeEventListener("webkitfullscreenchange", onFsChange);
     };
   }, []);
+
+  // FIX-FULLSCREEN: sync الـ ref مع الـ state دايماً —
+  // iOS بيعمل fullscreen وهمي بدون document.fullscreenElement فـ onFsChange مش بتشتغل.
+  // الـ useEffect ده بيضمن إن الـ ref دايماً صح حتى لو الـ state اتغير بطريقة تانية.
+  useEffect(() => {
+    isBrowserFullscreenRef.current = isBrowserFullscreen;
+  }, [isBrowserFullscreen]);
 
   useEffect(() => {
     const mq = window.matchMedia("(orientation: landscape)");
@@ -2596,6 +2636,20 @@ export default function Room() {
   };
 
   const terminateBrowserSession = () => {
+    // FIX-FULLSCREEN: اخرج من fullscreen الأول لو كنا فيه قبل ما تصفّر الـ state
+    if (isBrowserFullscreenRef.current) {
+      if (isIOSDevice) {
+        setIsBrowserFullscreen(false);
+        isBrowserFullscreenRef.current = false;
+        if (iosFullscreenTimerRef.current) clearTimeout(iosFullscreenTimerRef.current);
+      } else if (document.fullscreenElement) {
+        document.exitFullscreen().catch(() => {});
+      } else {
+        setIsBrowserFullscreen(false);
+        isBrowserFullscreenRef.current = false;
+      }
+      setBrowserWidened(false);
+    }
     // Clear UI state immediately — don't wait for API response
     setHyperbeamEmbed(null);
     setHyperbeamAdminToken(null);
@@ -3793,16 +3847,19 @@ export default function Room() {
           </div>
 
           {/* BROWSER MODE */}
-          {mode === "browser" && (
-            <div
-              ref={browserContainerRef}
-              className={`relative bg-[#050508] overflow-hidden ${isBrowserFullscreen && !isIOSDevice ? "fixed inset-0 z-[9999]" : !isBrowserFullscreen ? "flex-1" : ""}`}
-              style={{
-                ...(isBrowserFullscreen && isIOSDevice ? { position: "fixed", top: 0, left: 0, width: iosViewport.w, height: iosViewport.h, zIndex: 9999 } : undefined),
-                touchAction: "pan-x pan-y",
-              }}
-              onTouchStart={hyperbeamEmbed ? showBrowserControls : undefined}
-            >
+          {/* FIX: بدل {mode === "browser" && ...} استخدمنا display:none عشان الـ container
+              يفضل في الـ DOM دايماً ومش بيتحذف لما نبدّل تاب. لو بيتحذف، الـ Hyperbeam SDK
+              بيفقد connection بتاعه وبييجي شاشة سودا لما ترجع. */}
+          <div
+            ref={browserContainerRef}
+            className={`relative bg-[#050508] overflow-hidden ${isBrowserFullscreen && !isIOSDevice ? "fixed inset-0 z-[9999]" : !isBrowserFullscreen ? "flex-1" : ""}`}
+            style={{
+              display: mode === "browser" ? undefined : "none",
+              ...(isBrowserFullscreen && isIOSDevice ? { position: "fixed", top: 0, left: 0, width: iosViewport.w, height: iosViewport.h, zIndex: 9999 } : undefined),
+              touchAction: "pan-x pan-y",
+            }}
+            onTouchStart={hyperbeamEmbed ? showBrowserControls : undefined}
+          >
               {hyperbeamEmbed ? (
                 <>
                   <div
@@ -3864,8 +3921,7 @@ export default function Room() {
                   )}
                 </div>
               )}
-            </div>
-          )}
+          </div>
 
           {/* MOVIES MODE */}
           {mode === "movies" && (
