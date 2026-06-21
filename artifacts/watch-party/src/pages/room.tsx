@@ -544,19 +544,22 @@ export default function Room() {
   useEffect(() => {
     if (!isIOSDevice) return;
     const vv = window.visualViewport;
-    const update = () => setIosViewport({
-      w: vv ? Math.round(vv.width) : window.innerWidth,
-      h: vv ? Math.round(vv.height) : window.innerHeight,
-      t: vv ? Math.round(vv.offsetTop) : 0,
-    });
+    const update = () => {
+      setIosViewport({
+        w: vv ? Math.round(vv.width) : window.innerWidth,
+        h: vv ? Math.round(vv.height) : window.innerHeight,
+        t: vv ? Math.round(vv.offsetTop) : 0,
+      });
+    };
     update();
     vv?.addEventListener("resize", update);
     vv?.addEventListener("scroll", update);
-    window.addEventListener("orientationchange", update);
+    const onOrientationChange = () => setTimeout(update, 50);
+    window.addEventListener("orientationchange", onOrientationChange);
     return () => {
       vv?.removeEventListener("resize", update);
       vv?.removeEventListener("scroll", update);
-      window.removeEventListener("orientationchange", update);
+      window.removeEventListener("orientationchange", onOrientationChange);
     };
   }, [isIOSDevice]);
 
@@ -3238,7 +3241,7 @@ export default function Room() {
         </div>
       </div>
     )}
-    <div className="bg-background flex flex-col overflow-hidden" style={{ height: "100%" }}>
+    <div className="bg-background flex flex-col overflow-hidden" style={{ height: "100%", paddingBottom: "env(safe-area-inset-bottom)" }}>
       {/* Top bar — 2-row layout */}
       <div ref={headerRef} className="border-b border-border bg-card/50 backdrop-blur-sm flex-shrink-0" style={{ paddingTop: "env(safe-area-inset-top)" }}>
         {/* Row 1: room name + lock (left) | mode switcher (right, desktop only) */}
@@ -3958,7 +3961,7 @@ export default function Room() {
         {panelOpen && (
           <div
             className="absolute right-0 top-0 w-80 bg-card border-l border-border z-[60] flex flex-col shadow-2xl"
-            style={{ bottom: isIOSDevice ? Math.max(0, window.innerHeight - iosViewport.h) : 0 }}
+            style={{ bottom: isIOSDevice ? (() => { const diff = window.innerHeight - iosViewport.h; return diff > 100 ? diff : 0; })() : 0 }}
           >
             <div className="flex items-center justify-between px-4 py-3.5 border-b border-border flex-shrink-0">
               <span className="text-base font-bold">Room Panel</span>
@@ -4301,14 +4304,6 @@ export default function Room() {
           </div>
         )}
       </div>
-
-      {/* Bottom safe-area bar — mobile only, mirrors the top bar */}
-      {isMobileDevice && (
-        <div
-          className="sm:hidden flex-shrink-0 bg-card/50 backdrop-blur-sm border-t border-border"
-          style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
-        />
-      )}
 
       {/* Speaking notification */}
       {(() => {
