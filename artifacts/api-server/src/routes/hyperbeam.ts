@@ -71,6 +71,18 @@ router.post("/rooms/:code/hyperbeam", async (req, res): Promise<void> => {
     return;
   }
 
+  // If a session already exists for this room, terminate it first before starting a new one
+  const existingSession = roomSessions.get(code.toUpperCase());
+  if (existingSession) {
+    try {
+      await fetch(`https://engine.hyperbeam.com/v0/vm/${existingSession.sessionId}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${existingSession.apiKey}` },
+      });
+    } catch { /* ignore */ }
+    roomSessions.delete(code.toUpperCase());
+  }
+
   // Try each key starting from the current index (round-robin across sessions)
   let lastError = "";
   for (let i = 0; i < keys.length; i++) {

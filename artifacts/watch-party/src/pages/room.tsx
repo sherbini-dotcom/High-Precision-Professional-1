@@ -1499,6 +1499,9 @@ export default function Room() {
     if (!hyperbeamEmbed) {
       hbInstanceRef.current?.destroy?.();
       hbInstanceRef.current = null;
+      // Clear any leftover iframe/canvas injected by the SDK so no black screen remains
+      if (hbContainerRef.current) hbContainerRef.current.innerHTML = "";
+      if (hbIOSContainerRef.current) hbIOSContainerRef.current.innerHTML = "";
       return;
     }
     const container = (isBrowserFullscreen && isIOSDevice)
@@ -2518,11 +2521,11 @@ export default function Room() {
         headers: { "x-session-token": sessionToken },
       });
       const data = await res.json() as { embedUrl?: string; adminToken?: string; error?: string };
-      if (!res.ok) { alert(data.error ?? "Failed to start browser session"); return; }
+      if (!res.ok) { console.error("Failed to start browser session:", data.error); return; }
       setHyperbeamEmbed(data.embedUrl ?? null);
       setHyperbeamAdminToken(data.adminToken ?? null);
       socketRef.current?.emit("hyperbeamReady", { embedUrl: data.embedUrl });
-    } catch { alert("Failed to start browser session"); }
+    } catch (e) { console.error("Failed to start browser session", e); }
     finally { setStartingBrowser(false); }
   };
 
@@ -2590,10 +2593,6 @@ export default function Room() {
   }, [isPrivileged, cineDirectUrl]);
 
   const changeMode = (newMode: "video" | "browser" | "screenshare" | "movies") => {
-    if (newMode === "video" && mode === "browser" && hyperbeamEmbed) {
-      terminateBrowserSession();
-      return;
-    }
     if (newMode !== "screenshare" && screenStreamRef.current) {
       screenStreamRef.current.getTracks().forEach(t => t.stop());
       screenStreamRef.current = null;
@@ -3111,10 +3110,10 @@ export default function Room() {
                 <button
                   onClick={() => { if (confirm("Close the room for everyone?")) socketRef.current?.emit("closeRoom"); }}
                   className="flex items-center gap-1.5 px-3.5 py-2 rounded-full border text-sm font-semibold transition-all duration-200 active:scale-95 bg-destructive/15 border-destructive/40 text-destructive hover:bg-destructive/25"
-                  title="Close room"
+                  title="End room for everyone"
                 >
                   <Trash2 className="w-3.5 h-3.5" />
-                  <span>Close</span>
+                  <span>End Room</span>
                 </button>
                 {/* Private / Public toggle — optimistic update */}
                 <button
@@ -3140,7 +3139,6 @@ export default function Room() {
                   onClick={() => {
                     const locking = !accessControlEnabled;
                     socketRef.current?.emit("setAccessControl", { enabled: locking });
-                    if (locking && hyperbeamEmbed) terminateBrowserSession();
                   }}
                   className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-sm font-semibold transition-all duration-300 active:scale-95 flex-shrink-0 ${
                     accessControlEnabled
@@ -3715,38 +3713,38 @@ export default function Room() {
                 ...(isBrowserFullscreen && isIOSDevice ? { position: "fixed", top: 0, left: 0, width: iosViewport.w, height: iosViewport.h, zIndex: 9999 } : undefined),
                 touchAction: "pan-x pan-y",
               }}
+              onTouchStart={hyperbeamEmbed ? showBrowserControls : undefined}
             >
               {hyperbeamEmbed ? (
                 <>
                   <div
+                    key={hyperbeamEmbed}
                     ref={hbContainerRef}
                     className="w-full h-full"
                     style={{
                       border: "none",
                       display: "block",
-                      // Only host/admin can interact with the browser.
-                      // Guests get pointer-events:none on all platforms so they can
-                      // view but never control the shared session.
                       pointerEvents: isPrivileged ? "auto" : "none",
                       touchAction: "pan-x pan-y",
                     }}
                   />
-                  {!isIOSDevice && (
-                    <div
-                      className="absolute inset-0"
-                      style={{ zIndex: 5, pointerEvents: browserControlsVisible ? "none" : "auto" }}
-                      onMouseMove={showBrowserControls}
-                      onTouchStart={showBrowserControls}
-                    />
-                  )}
-                  <div className="absolute bottom-4 right-4 flex items-center gap-2" style={{ zIndex: 10 }}>
+                  <div
+                    className="absolute inset-0"
+                    style={{ zIndex: 5, pointerEvents: browserControlsVisible ? "none" : "auto" }}
+                    onMouseMove={showBrowserControls}
+                    onTouchStart={showBrowserControls}
+                  />
+                  <div
+                    className="absolute bottom-4 right-4 flex items-center gap-2 transition-opacity duration-300"
+                    style={{ zIndex: 10, opacity: browserControlsVisible ? 1 : 0, pointerEvents: browserControlsVisible ? "auto" : "none" }}
+                  >
                     <button onClick={handleBrowserFullscreen} className="w-9 h-9 rounded-full bg-black/50 hover:bg-black/70 flex items-center justify-center transition-all active:scale-95 backdrop-blur-sm">
                       {isBrowserFullscreen ? <Minimize className="w-4 h-4 text-white" /> : <Maximize className="w-4 h-4 text-white" />}
                     </button>
                   </div>
                 </>
               ) : (
-                <div className="flex-1 h-full flex items-center justify-center">
+                <div className="absolute inset-0 flex items-center justify-center">
                   {isPrivileged ? (
                     <div className="text-center p-8">
                       <Globe className="w-16 h-16 text-muted-foreground/30 mx-auto mb-4" />
