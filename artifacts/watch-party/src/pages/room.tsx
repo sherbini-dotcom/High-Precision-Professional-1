@@ -2636,7 +2636,18 @@ export default function Room() {
   };
 
   const terminateBrowserSession = () => {
-    // FIX-FULLSCREEN: اخرج من fullscreen الأول لو كنا فيه قبل ما تصفّر الـ state
+    // FIX-RECONNECT: أبعت الـ socket event أولاً قبل أي state changes —
+    // تدمير الـ Hyperbeam component بيسبب re-render ثقيل قد يقاطع الـ socket،
+    // فلازم الـ server يعرف بالإنهاء قبل ما يحصل أي disconnect.
+    socketRef.current?.emit("hyperbeamEnded");
+
+    // Fire-and-forget: tell server to clean up Hyperbeam session in background
+    fetch(`/api/rooms/${code}/hyperbeam`, {
+      method: "DELETE",
+      headers: { "x-session-token": sessionToken },
+    }).catch(() => {});
+
+    // FIX-FULLSCREEN: اخرج من fullscreen بعد ما بعثنا الـ socket event
     if (isBrowserFullscreenRef.current) {
       if (isIOSDevice) {
         setIsBrowserFullscreen(false);
@@ -2650,15 +2661,10 @@ export default function Room() {
       }
       setBrowserWidened(false);
     }
-    // Clear UI state immediately — don't wait for API response
+
+    // Clear UI state آخر حاجة — بعد Socket و API
     setHyperbeamEmbed(null);
     setHyperbeamAdminToken(null);
-    socketRef.current?.emit("hyperbeamEnded");
-    // Fire-and-forget: tell server to clean up Hyperbeam session in background
-    fetch(`/api/rooms/${code}/hyperbeam`, {
-      method: "DELETE",
-      headers: { "x-session-token": sessionToken },
-    }).catch(() => {});
   };
 
   const copyCode = () => {
@@ -4333,4 +4339,3 @@ export default function Room() {
     </>
   );
 }
-

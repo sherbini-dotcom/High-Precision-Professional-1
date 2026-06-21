@@ -57,6 +57,7 @@ const roomTimelines = new Map<string, VideoTimeline>();
 const roomSyncIntervals = new Map<string, ReturnType<typeof setInterval>>();
 const roomModes = new Map<string, "video" | "browser" | "screenshare" | "movies">();
 const roomHyperbeamUrls = new Map<string, string>();
+const recentHyperbeamEndTimes = new Map<string, number>(); // roomCode → timestamp ms
 const kickedIPs = new Map<string, Set<string>>();
 const pendingApprovals = new Map<
   string,
@@ -261,7 +262,9 @@ function scheduleDisconnectBatch(roomCode: string, memberId: number): void {
         (m) => m.role === "host" || m.role === "admin",
       );
       if (!hasPrivileged && !noPrivilegedTimers.has(roomCode)) {
-        logger.info({ roomCode }, `No host/admin — scheduling deletion in ${NO_PRIVILEGED_GRACE_MS / 1000}s`);
+        const hyperbeamJustEnded = recentHyperbeamEndTimes.has(roomCode);
+        const graceMs = hyperbeamJustEnded ? 15_000 : NO_PRIVILEGED_GRACE_MS;
+        logger.info({ roomCode }, `No host/admin — scheduling deletion in ${graceMs / 1000}s${hyperbeamJustEnded ? " (short grace: hyperbeam just ended)" : ""}`);
         const timer = setTimeout(async () => {
           noPrivilegedTimers.delete(roomCode);
           try {
@@ -281,7 +284,7 @@ function scheduleDisconnectBatch(roomCode: string, memberId: number): void {
           } catch (err) {
             logger.error({ err, roomCode }, "Error in no-privileged grace-period delete");
           }
-        }, NO_PRIVILEGED_GRACE_MS);
+        }, graceMs);
         noPrivilegedTimers.set(roomCode, timer);
       } else if (hasPrivileged) {
         cancelNoPrivilegedTimer(roomCode);
@@ -318,9 +321,11 @@ function scheduleRoomMembersUpdate(roomCode: string): void {
                (m as unknown as { role: string }).role === "admin",
       );
       if (!hasPrivileged && !noPrivilegedTimers.has(roomCode)) {
+        const hyperbeamJustEnded2 = recentHyperbeamEndTimes.has(roomCode);
+        const graceMs2 = hyperbeamJustEnded2 ? 15_000 : NO_PRIVILEGED_GRACE_MS;
         logger.info(
           { roomCode },
-          `No host/admin online — scheduling room deletion in ${NO_PRIVILEGED_GRACE_MS / 1000}s`,
+          `No host/admin online — scheduling room deletion in ${graceMs2 / 1000}s${hyperbeamJustEnded2 ? " (short grace: hyperbeam just ended)" : ""}`,
         );
         const timer = setTimeout(async () => {
           noPrivilegedTimers.delete(roomCode);
@@ -351,7 +356,7 @@ function scheduleRoomMembersUpdate(roomCode: string): void {
           } catch (err) {
             logger.error({ err, roomCode }, "Error in no-privileged grace-period delete");
           }
-        }, NO_PRIVILEGED_GRACE_MS);
+        }, graceMs2);
         noPrivilegedTimers.set(roomCode, timer);
       } else if (hasPrivileged) {
         cancelNoPrivilegedTimer(roomCode);
@@ -1341,6 +1346,9 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
       )
         return;
       roomHyperbeamUrls.delete(currentRoomCode);
+      // سجّل وقت إنهاء الجلسة — يحمي من noPrivilegedTimer يشتغل خلال reconnect قصير
+      recentHyperbeamEndTimes.set(currentRoomCode, Date.now());
+      setTimeout(() => recentHyperbeamEndTimes.delete(currentRoomCode), 15_000);
       socket.to(currentRoomCode).emit("hyperbeamEnded");
     });
 
