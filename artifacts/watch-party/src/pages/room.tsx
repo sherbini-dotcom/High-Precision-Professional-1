@@ -3095,7 +3095,7 @@ export default function Room() {
         </div>
       </div>
     )}
-    <div className="bg-background flex flex-col overflow-hidden" style={{ height: "100dvh" }}>
+    <div className="bg-background flex flex-col overflow-hidden" style={{ height: "100%" }}>
       {/* Top bar — 2-row layout */}
       <div ref={headerRef} className="border-b border-border bg-card/50 backdrop-blur-sm flex-shrink-0" style={{ paddingTop: "env(safe-area-inset-top)" }}>
         {/* Row 1: room name + lock (left) | mode switcher (right, desktop only) */}
@@ -3241,13 +3241,46 @@ export default function Room() {
               : <><Monitor className="w-5 h-5" /><span>Screen Share</span></>}
           </div>
         )}
-        {/* Row 2: action buttons — wraps to fit everything without side-scroll */}
-        <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 px-3 pt-1.5 pb-3">
-          <div className="flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg bg-muted border border-border flex-shrink-0">
-            <code className="text-sm sm:text-base font-mono font-bold text-foreground">{code}</code>
+        {/* Row 2b: contextual session-ending actions — own row on mobile, only when present, so they never crowd Row 2 */}
+        {((isPrivileged && mode === "browser" && hyperbeamEmbed) ||
+          (isPrivileged && mode === "video" && videoHlsPath) ||
+          (isPrivileged && isScreenSharing)) && (
+          <div className="flex sm:hidden items-center gap-1.5 px-3 pb-1.5 flex-wrap">
+            {isPrivileged && mode === "browser" && hyperbeamEmbed && (
+              <button
+                onClick={terminateBrowserSession}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20 text-sm font-semibold text-red-400 hover:bg-red-500/20 active:scale-90 transition-all duration-200 ease-out select-none"
+              >
+                <X className="w-4 h-4" /><span>End Session</span>
+              </button>
+            )}
+            {isPrivileged && mode === "video" && videoHlsPath && (
+              <button
+                onClick={() => socketRef.current?.emit("clearContent")}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-orange-500/10 border border-orange-500/20 text-sm font-semibold text-orange-400 hover:bg-orange-500/20 active:scale-90 transition-all duration-200 ease-out select-none"
+              >
+                <X className="w-4 h-4" /><span>End Video</span>
+              </button>
+            )}
+            {isPrivileged && isScreenSharing && (
+              <button
+                onClick={stopScreenShare}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-orange-500/10 border border-orange-500/20 text-sm font-semibold text-orange-400 hover:bg-orange-500/20 active:scale-90 transition-all duration-200 ease-out select-none"
+              >
+                <MonitorOff className="w-4 h-4" /><span>Stop Sharing</span>
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Row 2: action buttons — fixed single row, no wrap/no scroll, same height as the mode switcher above (h-11) */}
+        <div className="px-3 pt-1.5 pb-3">
+        <div className="flex items-stretch gap-1.5 sm:gap-2 h-11 sm:h-auto">
+          <div className="flex items-center justify-center gap-1.5 px-2 sm:px-3 sm:py-2.5 rounded-lg bg-muted border border-border flex-1 sm:flex-initial min-w-0">
+            <code className="text-sm sm:text-base font-mono font-bold text-foreground truncate">{code}</code>
             <button
               onClick={copyCode}
-              className="text-muted-foreground hover:text-foreground active:scale-90 transition-all duration-150 ease-out"
+              className="text-muted-foreground hover:text-foreground active:scale-90 transition-all duration-150 ease-out flex-shrink-0"
             >
               {copied ? <Check className="w-4 h-4 sm:w-5 sm:h-5 text-green-400" /> : <Copy className="w-4 h-4 sm:w-5 sm:h-5" />}
             </button>
@@ -3255,20 +3288,21 @@ export default function Room() {
 
           <button
             onClick={copyInviteLink}
-            className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg border text-sm sm:text-base font-medium transition-all duration-200 ease-out active:scale-90 select-none flex-shrink-0 ${
+            className={`flex items-center justify-center gap-1.5 px-2 sm:px-3 sm:py-2.5 rounded-lg border text-sm sm:text-base font-semibold transition-all duration-200 ease-out active:scale-90 select-none flex-1 sm:flex-initial min-w-0 ${
               copiedInvite
                 ? "bg-green-500/15 border-green-400/40 text-green-300 shadow-[0_0_8px_rgba(34,197,94,0.25)]"
                 : "bg-muted border-border text-muted-foreground hover:text-foreground hover:border-primary/30"
             }`}
           >
-            {copiedInvite ? <Check className="w-4 h-4 sm:w-5 sm:h-5 text-green-400" /> : <Link className="w-4 h-4 sm:w-5 sm:h-5" />}
+            {copiedInvite ? <Check className="w-4 h-4 sm:w-5 sm:h-5 text-green-400 flex-shrink-0" /> : <Link className="w-4 h-4 sm:w-5 sm:h-5 flex-shrink-0" />}
             <span className="hidden sm:inline">{copiedInvite ? "Copied!" : "Invite"}</span>
           </button>
 
+          {/* Contextual session-ending actions: shown inline only from sm: up — on mobile they live in Row 2b above */}
           {isPrivileged && mode === "browser" && hyperbeamEmbed && (
             <button
               onClick={terminateBrowserSession}
-              className="flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg bg-red-500/10 border border-red-500/20 text-sm sm:text-base text-red-400 hover:bg-red-500/20 active:scale-90 transition-all duration-200 ease-out select-none flex-shrink-0"
+              className="hidden sm:flex items-center justify-center gap-1.5 px-2 sm:px-3 sm:py-2.5 rounded-lg bg-red-500/10 border border-red-500/20 text-sm sm:text-base text-red-400 hover:bg-red-500/20 active:scale-90 transition-all duration-200 ease-out select-none flex-shrink-0"
             >
               <X className="w-4 h-4 sm:w-5 sm:h-5" /><span className="hidden sm:inline">End Session</span>
             </button>
@@ -3277,7 +3311,7 @@ export default function Room() {
           {isPrivileged && mode === "video" && videoHlsPath && (
             <button
               onClick={() => socketRef.current?.emit("clearContent")}
-              className="flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg bg-orange-500/10 border border-orange-500/20 text-sm sm:text-base text-orange-400 hover:bg-orange-500/20 active:scale-90 transition-all duration-200 ease-out select-none flex-shrink-0"
+              className="hidden sm:flex items-center justify-center gap-1.5 px-2 sm:px-3 sm:py-2.5 rounded-lg bg-orange-500/10 border border-orange-500/20 text-sm sm:text-base text-orange-400 hover:bg-orange-500/20 active:scale-90 transition-all duration-200 ease-out select-none flex-shrink-0"
             >
               <X className="w-4 h-4 sm:w-5 sm:h-5" /><span className="hidden sm:inline">End Video</span>
             </button>
@@ -3286,7 +3320,7 @@ export default function Room() {
           {isPrivileged && isScreenSharing && (
             <button
               onClick={stopScreenShare}
-              className="flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg bg-orange-500/10 border border-orange-500/20 text-sm sm:text-base text-orange-400 hover:bg-orange-500/20 active:scale-90 transition-all duration-200 ease-out select-none flex-shrink-0"
+              className="hidden sm:flex items-center justify-center gap-1.5 px-2 sm:px-3 sm:py-2.5 rounded-lg bg-orange-500/10 border border-orange-500/20 text-sm sm:text-base text-orange-400 hover:bg-orange-500/20 active:scale-90 transition-all duration-200 ease-out select-none flex-shrink-0"
             >
               <MonitorOff className="w-4 h-4 sm:w-5 sm:h-5" /><span className="hidden sm:inline">Stop Sharing</span>
             </button>
@@ -3294,9 +3328,9 @@ export default function Room() {
 
           <button
             onClick={() => { disconnectSocket(); setLocation("/"); }}
-            className="flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg bg-destructive/10 border border-destructive/20 text-sm sm:text-base text-destructive hover:bg-destructive/20 active:scale-90 transition-all duration-200 ease-out select-none flex-shrink-0"
+            className="flex items-center justify-center gap-1.5 px-2 sm:px-3 sm:py-2.5 rounded-lg bg-destructive/10 border border-destructive/20 text-sm sm:text-base text-destructive hover:bg-destructive/20 active:scale-90 transition-all duration-200 ease-out select-none flex-1 sm:flex-initial min-w-0"
           >
-            <LogOut className="w-4 h-4 sm:w-5 sm:h-5" /><span className="hidden sm:inline">Leave</span>
+            <LogOut className="w-4 h-4 sm:w-5 sm:h-5 flex-shrink-0" /><span className="hidden sm:inline">Leave</span>
           </button>
 
           {(() => {
@@ -3305,7 +3339,7 @@ export default function Room() {
               <button
                 onClick={toggleMic}
                 disabled={isMutedByHost && !micEnabled}
-                className={`flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg border text-sm sm:text-base font-medium transition-all duration-200 ease-out select-none flex-shrink-0 ${
+                className={`flex items-center justify-center gap-1.5 px-2 sm:px-3 sm:py-2.5 rounded-lg border text-sm sm:text-base font-medium transition-all duration-200 ease-out select-none flex-1 sm:flex-initial min-w-0 ${
                   isMutedByHost && !micEnabled
                     ? "bg-muted/40 border-destructive/30 text-destructive/50 cursor-not-allowed opacity-60"
                     : micEnabled
@@ -3314,9 +3348,9 @@ export default function Room() {
                 }`}
                 title={isMutedByHost && !micEnabled ? "Muted by host" : micEnabled ? "Mic On" : "Mic Off"}
               >
-                {micEnabled ? <Mic className="w-4 h-4 sm:w-5 sm:h-5" /> : <MicOff className="w-4 h-4 sm:w-5 sm:h-5" />}
+                {micEnabled ? <Mic className="w-4 h-4 sm:w-5 sm:h-5 flex-shrink-0" /> : <MicOff className="w-4 h-4 sm:w-5 sm:h-5 flex-shrink-0" />}
                 {micEnabled && (
-                  <div className="flex items-end gap-0.5 h-4 ml-0.5">
+                  <div className="flex items-end gap-0.5 h-4 ml-0.5 flex-shrink-0">
                     {[0.4, 0.7, 1, 0.7, 0.4].map((mult, i) => {
                       const vol = speakingState[myMemberId] ?? 0;
                       return <div key={i} className="w-0.5 bg-green-400 rounded-full transition-all duration-100" style={{ height: `${Math.max(2, Math.min(16, vol * mult * 0.16))}px` }} />;
@@ -3347,7 +3381,7 @@ export default function Room() {
                 }
               }
             }}
-            className={`relative flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg border text-sm sm:text-base font-medium transition-all duration-200 ease-out active:scale-90 select-none flex-shrink-0 ${
+            className={`relative flex items-center justify-center gap-1.5 px-2 sm:px-3 sm:py-2.5 rounded-lg border text-sm sm:text-base font-medium transition-all duration-200 ease-out active:scale-90 select-none flex-1 sm:flex-initial min-w-0 ${
               bellPulse
                 ? "bg-primary/20 border-primary/50 text-primary scale-110 shadow-[0_0_14px_rgba(139,92,246,0.5)]"
                 : notifSoundEnabled
@@ -3357,8 +3391,8 @@ export default function Room() {
             title={notifSoundEnabled ? "Mute notifications" : "Unmute notifications"}
           >
             {notifSoundEnabled
-              ? <Bell className={`w-4 h-4 sm:w-5 sm:h-5 transition-transform duration-150 ${bellPulse ? "animate-bounce" : ""}`} />
-              : <BellOff className="w-4 h-4 sm:w-5 sm:h-5" />}
+              ? <Bell className={`w-4 h-4 sm:w-5 sm:h-5 transition-transform duration-150 flex-shrink-0 ${bellPulse ? "animate-bounce" : ""}`} />
+              : <BellOff className="w-4 h-4 sm:w-5 sm:h-5 flex-shrink-0" />}
             {bellPulse && notifSoundEnabled && (
               <span className="absolute inset-0 rounded-lg ring-2 ring-primary/60 animate-ping pointer-events-none" />
             )}
@@ -3371,18 +3405,19 @@ export default function Room() {
                 return !o;
               });
             }}
-            className={`relative flex items-center gap-1.5 px-2.5 sm:px-3 py-2 sm:py-2.5 rounded-lg border text-sm sm:text-base font-semibold transition-all duration-200 ease-out active:scale-90 select-none flex-shrink-0 ml-auto ${
+            className={`relative flex items-center justify-center gap-1.5 px-2 sm:px-3 sm:py-2.5 rounded-lg border text-sm sm:text-base font-semibold transition-all duration-200 ease-out active:scale-90 select-none flex-1 sm:flex-initial min-w-0 sm:ml-auto ${
               panelOpen
                 ? "bg-primary text-white border-primary shadow-[0_0_12px_rgba(var(--primary),0.35)]"
                 : "bg-muted border-border text-muted-foreground hover:text-foreground hover:border-primary/30"
             }`}
           >
-            <Users className="w-4 h-4 sm:w-5 sm:h-5" />
+            <Users className="w-4 h-4 sm:w-5 sm:h-5 flex-shrink-0" />
             <span className="tabular-nums">{onlineCount}</span>
             {panelBadge > 0 && (
               <span className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-amber-500 text-white text-[10px] flex items-center justify-center font-bold animate-pulse">{panelBadge}</span>
             )}
           </button>
+        </div>
         </div>
       </div>
 
