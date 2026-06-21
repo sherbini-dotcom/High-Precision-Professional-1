@@ -12,7 +12,7 @@ import {
   Crown, User, Volume2, Ban, Trash2, LogOut, Link, Loader2,
   Lock, Play, Pause, AlertCircle, WifiOff, Maximize, Minimize,
   SkipForward, SkipBack, Globe, X, UserCheck, MessageSquare, Send,
-  ShieldOff, RefreshCw, Bell, BellOff, Monitor, MonitorOff, ChevronLeft
+  ShieldOff, RefreshCw, Bell, BellOff, Monitor, MonitorOff, ChevronLeft, ArrowLeft, ArrowRight
 } from "lucide-react";
 import CineStream, { type CineState, DEFAULT_CINE_STATE } from "@/components/CineStream";
 import Hyperbeam from "@hyperbeam/web";
@@ -92,6 +92,9 @@ export default function Room() {
   const iosFullscreenTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isIOSDevice = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
     (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const isMobileDevice = isIOSDevice || /Android/i.test(navigator.userAgent) || navigator.maxTouchPoints > 1;
+  const [isLandscape, setIsLandscape] = useState(() => window.matchMedia("(orientation: landscape)").matches);
+  const [browserWidened, setBrowserWidened] = useState(false);
   const [iosViewport, setIosViewport] = useState({ w: window.innerWidth, h: window.innerHeight, t: 0 });
   const browserContainerRef = useRef<HTMLDivElement>(null);
   const [controlsVisible, setControlsVisible] = useState(true);
@@ -1523,6 +1526,7 @@ export default function Room() {
     const onFsChange = () => {
       const fsEl = document.fullscreenElement || (document as unknown as { webkitFullscreenElement: Element | null }).webkitFullscreenElement;
       setIsBrowserFullscreen(!!fsEl);
+      if (!fsEl) setBrowserWidened(false);
     };
     document.addEventListener("fullscreenchange", onFsChange);
     document.addEventListener("webkitfullscreenchange", onFsChange);
@@ -1531,6 +1535,68 @@ export default function Room() {
       document.removeEventListener("webkitfullscreenchange", onFsChange);
     };
   }, []);
+
+  useEffect(() => {
+    const mq = window.matchMedia("(orientation: landscape)");
+    const handler = (e: MediaQueryListEvent) => {
+      setIsLandscape(e.matches);
+      if (!e.matches) setBrowserWidened(false);
+    };
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, []);
+
+  // Widen: Hyperbeam uses Shadow DOM — access shadowRoot to measure canvas visual width,
+  // then apply scaleX to the container (outside shadow) to fill screen width, height unchanged.
+  useEffect(() => {
+    const container = (isBrowserFullscreen && isIOSDevice)
+      ? hbIOSContainerRef.current
+      : hbContainerRef.current;
+
+    if (!container) return;
+
+    if (!browserWidened) {
+      container.style.removeProperty("transform");
+      container.style.removeProperty("transform-origin");
+      return;
+    }
+
+    let timer: ReturnType<typeof setTimeout>;
+
+    const tryApply = () => {
+      // Hyperbeam attaches a Shadow DOM — must use shadowRoot to reach its canvas
+      const shadow = container.shadowRoot;
+      const el = shadow?.querySelector<HTMLElement>("canvas, iframe, video");
+
+      if (!el) {
+        // Not ready yet — retry
+        timer = setTimeout(tryApply, 100);
+        return;
+      }
+
+      const containerW = container.offsetWidth;
+      // getBoundingClientRect reflects visual size after Hyperbeam's own scale transform
+      const visualW = el.getBoundingClientRect().width;
+
+      if (visualW > 0 && visualW < containerW - 1) {
+        // Stretch container so Hyperbeam content fills full width; height stays the same
+        const sx = containerW / visualW;
+        container.style.setProperty("transform", `scaleX(${sx})`);
+        container.style.setProperty("transform-origin", "center center");
+      }
+      // If visualW >= containerW, already fills width — nothing to do
+    };
+
+    // Give Hyperbeam ~400ms to mount and apply its initial scale inside the shadow DOM
+    timer = setTimeout(tryApply, 400);
+
+    return () => {
+      clearTimeout(timer);
+      container.style.removeProperty("transform");
+      container.style.removeProperty("transform-origin");
+    };
+  }, [browserWidened, isBrowserFullscreen, isIOSDevice, hyperbeamEmbed]);
+
 
   const showControls = useCallback(() => {
     setControlsVisible(true);
@@ -3073,18 +3139,36 @@ export default function Room() {
     {/* iOS full browser fullscreen overlay */}
     {isBrowserFullscreen && isIOSDevice && mode === "browser" && hyperbeamEmbed && (
       <div
-        className="fixed inset-0 z-[99999] bg-black"
+        className="fixed inset-0 z-[99999] bg-black overflow-hidden"
         onTouchStart={showIOSFullscreenControls}
         onMouseMove={showIOSFullscreenControls}
       >
         <div
           ref={hbIOSContainerRef}
-          className="w-full h-full"
-          style={{ border: "none", display: "block", pointerEvents: isPrivileged ? "auto" : "none" }}
+          style={{
+            border: "none",
+            display: "block",
+            pointerEvents: isPrivileged ? "auto" : "none",
+            width: "100%",
+            height: "100%",
+          }}
         />
         <div
           className={`absolute inset-0 pointer-events-none transition-opacity duration-300 ${iosFullscreenControlsVisible ? "opacity-100" : "opacity-0"}`}
         >
+          {/* Widen button — mobile landscape fullscreen only */}
+          {isMobileDevice && isLandscape && (
+            <button
+              onClick={() => setBrowserWidened(w => !w)}
+              className="absolute bottom-10 right-20 w-12 h-12 rounded-full bg-black/60 backdrop-blur-md border border-white/20 flex items-center justify-center pointer-events-auto active:scale-90 transition-all"
+              title={browserWidened ? "Reset width" : "Widen to full screen"}
+            >
+              <span className="flex items-center gap-0.5">
+                <ArrowLeft className="w-4 h-4 text-white" />
+                <ArrowRight className="w-4 h-4 text-white" />
+              </span>
+            </button>
+          )}
           <button
             onClick={handleBrowserFullscreen}
             className="absolute bottom-10 right-5 w-12 h-12 rounded-full bg-black/60 backdrop-blur-md border border-white/20 flex items-center justify-center pointer-events-auto active:scale-90 transition-all"
@@ -3239,37 +3323,6 @@ export default function Room() {
               : <><Monitor className="w-5 h-5" /><span>Screen Share</span></>}
           </div>
         )}
-        {/* Row 2b: contextual session-ending actions — own row on mobile, only when present, so they never crowd Row 2 */}
-        {((isPrivileged && mode === "browser" && hyperbeamEmbed) ||
-          (isPrivileged && mode === "video" && videoHlsPath) ||
-          (isPrivileged && isScreenSharing)) && (
-          <div className="flex sm:hidden items-center gap-1.5 px-3 pb-1.5 flex-wrap">
-            {isPrivileged && mode === "browser" && hyperbeamEmbed && (
-              <button
-                onClick={terminateBrowserSession}
-                className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20 text-sm font-semibold text-red-400 hover:bg-red-500/20 active:scale-90 transition-all duration-200 ease-out select-none"
-              >
-                <X className="w-4 h-4" /><span>End Session</span>
-              </button>
-            )}
-            {isPrivileged && mode === "video" && videoHlsPath && (
-              <button
-                onClick={() => socketRef.current?.emit("clearContent")}
-                className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-orange-500/10 border border-orange-500/20 text-sm font-semibold text-orange-400 hover:bg-orange-500/20 active:scale-90 transition-all duration-200 ease-out select-none"
-              >
-                <X className="w-4 h-4" /><span>End Video</span>
-              </button>
-            )}
-            {isPrivileged && isScreenSharing && (
-              <button
-                onClick={stopScreenShare}
-                className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-orange-500/10 border border-orange-500/20 text-sm font-semibold text-orange-400 hover:bg-orange-500/20 active:scale-90 transition-all duration-200 ease-out select-none"
-              >
-                <MonitorOff className="w-4 h-4" /><span>Stop Sharing</span>
-              </button>
-            )}
-          </div>
-        )}
 
         {/* Row 2: action buttons — fixed single row, no wrap/no scroll, same height as the mode switcher above (h-11) */}
         <div className="px-3 pt-1.5 pb-3">
@@ -3417,6 +3470,41 @@ export default function Room() {
           </button>
         </div>
         </div>
+
+        {/* Row 2b: End Session / End Video / Stop Sharing — full-width prominent button below the action bar, mobile only */}
+        {((isPrivileged && mode === "browser" && hyperbeamEmbed) ||
+          (isPrivileged && mode === "video" && videoHlsPath) ||
+          (isPrivileged && isScreenSharing)) && (
+          <div className="flex sm:hidden flex-col gap-2 px-3 pb-3">
+            {isPrivileged && mode === "browser" && hyperbeamEmbed && (
+              <button
+                onClick={terminateBrowserSession}
+                className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-red-500/10 border border-red-500/20 text-base font-semibold text-red-400 hover:bg-red-500/20 active:scale-95 transition-all duration-200 ease-out select-none"
+              >
+                <X className="w-5 h-5 flex-shrink-0" />
+                <span>End Session</span>
+              </button>
+            )}
+            {isPrivileged && mode === "video" && videoHlsPath && (
+              <button
+                onClick={() => socketRef.current?.emit("clearContent")}
+                className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-orange-500/10 border border-orange-500/20 text-base font-semibold text-orange-400 hover:bg-orange-500/20 active:scale-95 transition-all duration-200 ease-out select-none"
+              >
+                <X className="w-5 h-5 flex-shrink-0" />
+                <span>End Video</span>
+              </button>
+            )}
+            {isPrivileged && isScreenSharing && (
+              <button
+                onClick={stopScreenShare}
+                className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl bg-orange-500/10 border border-orange-500/20 text-base font-semibold text-orange-400 hover:bg-orange-500/20 active:scale-95 transition-all duration-200 ease-out select-none"
+              >
+                <MonitorOff className="w-5 h-5 flex-shrink-0" />
+                <span>Stop Sharing</span>
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Main area */}
@@ -3720,12 +3808,13 @@ export default function Room() {
                   <div
                     key={hyperbeamEmbed}
                     ref={hbContainerRef}
-                    className="w-full h-full"
                     style={{
                       border: "none",
                       display: "block",
                       pointerEvents: isPrivileged ? "auto" : "none",
                       touchAction: "pan-x pan-y",
+                      width: "100%",
+                      height: "100%",
                     }}
                   />
                   <div
@@ -3738,6 +3827,19 @@ export default function Room() {
                     className="absolute bottom-4 right-4 flex items-center gap-2 transition-opacity duration-300"
                     style={{ zIndex: 10, opacity: browserControlsVisible ? 1 : 0, pointerEvents: browserControlsVisible ? "auto" : "none" }}
                   >
+                    {/* Widen button — mobile, landscape, fullscreen only */}
+                    {isMobileDevice && isLandscape && isBrowserFullscreen && (
+                      <button
+                        onClick={() => setBrowserWidened(w => !w)}
+                        className="w-9 h-9 rounded-full bg-black/50 hover:bg-black/70 flex items-center justify-center transition-all active:scale-95 backdrop-blur-sm"
+                        title={browserWidened ? "Reset width" : "Widen to full screen"}
+                      >
+                        <span className="flex items-center gap-0.5">
+                          <ArrowLeft className="w-3 h-3 text-white" />
+                          <ArrowRight className="w-3 h-3 text-white" />
+                        </span>
+                      </button>
+                    )}
                     <button onClick={handleBrowserFullscreen} className="w-9 h-9 rounded-full bg-black/50 hover:bg-black/70 flex items-center justify-center transition-all active:scale-95 backdrop-blur-sm">
                       {isBrowserFullscreen ? <Minimize className="w-4 h-4 text-white" /> : <Maximize className="w-4 h-4 text-white" />}
                     </button>
