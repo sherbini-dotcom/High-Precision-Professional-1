@@ -3238,7 +3238,7 @@ export default function Room() {
         </div>
       </div>
     )}
-    <div className="bg-background flex flex-col overflow-hidden" style={{ height: "100dvh" }}>
+    <div className="bg-background flex flex-col overflow-hidden" style={{ height: "100%" }}>
       {/* Top bar — 2-row layout */}
       <div ref={headerRef} className="border-b border-border bg-card/50 backdrop-blur-sm flex-shrink-0" style={{ paddingTop: "env(safe-area-inset-top)" }}>
         {/* Row 1: room name + lock (left) | mode switcher (right, desktop only) */}
@@ -3569,7 +3569,7 @@ export default function Room() {
 
       {/* Main area */}
       <div className="flex flex-1 overflow-hidden relative">
-        <div className="flex-1 flex flex-col overflow-hidden" style={{ paddingBottom: isMobileDevice ? "env(safe-area-inset-bottom, 0px)" : 0 }}>
+        <div className="flex-1 flex flex-col overflow-hidden">
 
           {/* VIDEO MODE */}
           <div
@@ -4237,8 +4237,7 @@ export default function Room() {
                   </div>
                 )}
                 <div
-                  className="px-3 pt-3 border-t border-border flex-shrink-0 relative"
-                  style={{ paddingBottom: `calc(12px + env(safe-area-inset-bottom, 0px))` }}
+                  className="px-3 pt-3 pb-3 border-t border-border flex-shrink-0 relative"
                 >
                   {/* Sticker panel — floats above the input bar */}
                   {showStickerPanel && (
@@ -4303,6 +4302,13 @@ export default function Room() {
         )}
       </div>
 
+      {/* Bottom safe-area bar — mobile only, mirrors the top bar */}
+      {isMobileDevice && (
+        <div
+          className="sm:hidden flex-shrink-0 bg-card/50 backdrop-blur-sm border-t border-border"
+          style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+        />
+      )}
 
       {/* Speaking notification */}
       {(() => {
