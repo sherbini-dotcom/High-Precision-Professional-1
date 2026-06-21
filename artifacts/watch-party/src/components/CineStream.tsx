@@ -64,6 +64,17 @@ interface CineStreamProps {
   isPrivileged: boolean;
   currentState: CineState;
   onNavigate: (state: CineState) => void;
+  // ── Server sync (FIX: كانت هذه الـ props مُمررة من room.tsx لكن غير مستخدمة هنا،
+  // فاختيار السيرفر كان يتغير محلياً عند الهوست فقط ولا يصل للضيوف أبداً) ──
+  directUrl?: string;
+  subtitleUrl?: string;
+  onDirectUrlChange?: (url: string) => void;
+  onSubtitleChange?: (url: string) => void;
+  // غير مستخدمة حالياً داخل هذا الكومبوننت — مقبولة فقط لتفادي أخطاء TypeScript
+  // لأن room.tsx يمررها بالفعل (مُعدّة لاستخدام مستقبلي عبر embed-proxy)
+  socket?: unknown;
+  roomCode?: string;
+  sessionToken?: string;
 }
 
 export const DEFAULT_CINE_STATE: CineState = {
@@ -252,6 +263,8 @@ export default function CineStream({
   isPrivileged,
   currentState,
   onNavigate,
+  directUrl,
+  onDirectUrlChange,
 }: CineStreamProps) {
   const [items, setItems] = useState<TmdbItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -265,9 +278,30 @@ export default function CineStream({
   const [imdbId, setImdbId] = useState<string | null>(null);
   const [loadingImdb, setLoadingImdb] = useState(false);
   const [fetchingServerId, setFetchingServerId] = useState<string | null>(null);
-  const [activeServerId, setActiveServerId] = useState<string | null>(null);
-  const [activeEmbedUrl, setActiveEmbedUrl] = useState<string | null>(null);
   const [customUrl, setCustomUrl] = useState("");
+
+  // FIX: الرابط النشط بقى مشتق من الـ prop المُزامَنة (directUrl) بدل state محلي —
+  // ده اللي بيخلي كل أعضاء الغرفة يشوفوا نفس السيرفر اللي اختاره الهوست
+  const activeEmbedUrl = directUrl && directUrl.length > 0 ? directUrl : null;
+
+  // تحديد أي سيرفر نشط بناءً على الـ domain الموجود في الرابط الحالي —
+  // يشتغل صح سواء عند الهوست (اللي اختار) أو عند الضيف (اللي استقبل المزامنة)
+  const activeServerId = (() => {
+    if (!activeEmbedUrl) return null;
+    try {
+      const host = new URL(activeEmbedUrl).hostname.replace(/^www\./, "");
+      const known = VIDEO_SERVERS.find((s) => {
+        const sampleHost = (() => {
+          try { return new URL(s.buildUrl(0, "movie", 1, 1, "tt0000000")).hostname.replace(/^www\./, ""); }
+          catch { return ""; }
+        })();
+        return sampleHost && host === sampleHost;
+      });
+      return known?.id ?? "custom";
+    } catch {
+      return "custom";
+    }
+  })();
 
   const gridRef = useRef<HTMLDivElement>(null);
 
@@ -278,11 +312,11 @@ export default function CineStream({
   useEffect(() => { setLocalSearch(searchQuery); }, [searchQuery]);
   useEffect(() => { setPage(1); }, [contentType, category, searchQuery]);
 
-  // Reset server state when item or episode changes
+  // Reset local imdbId cache when item/season/episode changes.
+  // (activeEmbedUrl/activeServerId اتشالوا من هنا لأنهم بقوا مشتقين من directUrl
+  // المُزامَن — مش محتاجين useEffect يصفّرهم يدوياً)
   useEffect(() => {
     setImdbId(null);
-    setActiveServerId(null);
-    setActiveEmbedUrl(null);
   }, [selectedItem?.id, season, episode]);
 
   const fetchBrowse = useCallback(async () => {
@@ -386,8 +420,9 @@ export default function CineStream({
       } else {
         url = server.buildUrl(selectedItem.id, contentType, season, episode);
       }
-      setActiveServerId(server.id);
-      setActiveEmbedUrl(url);
+      // FIX: بث اختيار السيرفر لباقي أعضاء الغرفة عبر الـ socket (موجود فعلاً
+      // في room.tsx وموصّل بحدث moviesDirectUrl) بدل حفظه محلياً فقط
+      onDirectUrlChange?.(url);
     } finally {
       setFetchingServerId(null);
     }
@@ -529,7 +564,7 @@ export default function CineStream({
                       جرب التالي
                     </button>
                     <button
-                      onClick={() => { setActiveEmbedUrl(null); setActiveServerId(null); }}
+                      onClick={() => onDirectUrlChange?.("")}
                       className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-zinc-800 border border-zinc-700/80 text-zinc-400 text-xs hover:bg-zinc-700 hover:text-white transition-all active:scale-95"
                     >
                       <X className="w-3 h-3" />
@@ -627,8 +662,7 @@ export default function CineStream({
                   onClick={() => {
                     const url = customUrl.trim();
                     if (!url) return;
-                    setActiveServerId("custom");
-                    setActiveEmbedUrl(url);
+                    onDirectUrlChange?.(url);
                     setCustomUrl("");
                   }}
                   disabled={!customUrl.trim()}
