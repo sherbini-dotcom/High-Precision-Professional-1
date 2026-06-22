@@ -439,11 +439,11 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
       credentials: true,
     },
     transports: ["websocket", "polling"],
-    // FIX AUDIO-01: رفع timeout لتحمل النت الضعيف
-    // pingTimeout 5000 كان بيقطع الاتصال لو النت بطأ لثانية واحدة بس
-    // 25000ms → الاتصال يصمد حتى لو النت اختفى لـ 25 ثانية
-    pingInterval: 25000,
-    pingTimeout: 20000,
+    // FIX IOS-BG: رفع timeout عشان iOS بيوقف JS في الخلفية
+    // pingInterval 25s + pingTimeout 20s = 45s كانت قصيرة جداً لـ iOS
+    // الحل: 60s + 90s = يصمد لـ 2.5 دقيقة في الخلفية قبل ما ينقطع
+    pingInterval: 60000,
+    pingTimeout: 90000,
     // FIX AUDIO-02: رفع حجم الـ buffer للصوت عالـ weak connections
     maxHttpBufferSize: 2e6,
   });
@@ -583,8 +583,19 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
 
           const roomKickedIPs = kickedIPs.get(roomCode);
           const accessControlOn = roomAccessControl.get(roomCode) ?? false;
-          const alreadyApproved =
+          let alreadyApproved =
             approvedMembers.get(roomCode)?.has(member.id) ?? false;
+
+          // FIX IOS-BG: العضو اللي بيعمل reconnect (موجود في الـ DB بـ session token صالح)
+          // سبق وتم قبوله — نعيد إضافته للـ approvedMembers تلقائياً
+          // عشان iOS بيقطع الـ socket بعد 2-3 دقيقة في الخلفية فيُفقد من الذاكرة
+          if (accessControlOn && member.role === "guest" && !alreadyApproved) {
+            const roomApproved = approvedMembers.get(roomCode) ?? new Set<number>();
+            roomApproved.add(member.id);
+            approvedMembers.set(roomCode, roomApproved);
+            alreadyApproved = true;
+          }
+
           const needsApproval =
             roomKickedIPs?.has(member.ip) ||
             (accessControlOn && member.role === "guest" && !alreadyApproved);

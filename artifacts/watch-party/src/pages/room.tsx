@@ -155,7 +155,7 @@ export default function Room() {
   const [unreadCount, setUnreadCount] = useState(0);
   const chatBottomRef = useRef<HTMLDivElement>(null);
   // Floating notification toast (chat message or member join)
-  const [chatToast, setChatToast] = useState<{ name: string; text: string; tab: "chat" | "members" | "joinApproved" | "joinRejected" | "joinRequest" } | null>(null);
+  const [chatToast, setChatToast] = useState<{ name: string; text: string; tab: "chat" | "members" | "joinApproved" | "joinRejected" | "joinRequest"; memberId?: number } | null>(null);
   const chatToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Refs so socket callbacks (captured at mount) always see the latest panel state
   const panelOpenRef = useRef(false);
@@ -483,16 +483,28 @@ export default function Room() {
   // mechanism that keeps iOS from aggressively suspending the tab when the screen
   // locks: iOS shows lock screen controls and keeps the audio session alive only
   // when mediaSession is set up. Also provides Android notification controls.
+  // FIX IOS-BG: MediaSession دايماً شغال بغض النظر عن الفيديو
+  // iOS بيوقف الـ tab في الخلفية لو مفيش media session نشط
+  // الحل: نضبط الـ metadata فوراً لما المستخدم يدخل الغرفة
   useEffect(() => {
-    if (!videoHlsPath || !("mediaSession" in navigator)) return;
-
-    // Metadata shown on the lock screen / notification shade
+    if (!("mediaSession" in navigator)) return;
     try {
       navigator.mediaSession.metadata = new MediaMetadata({
         title: "Watch Party",
         artist: `Room ${code}`,
       });
-    } catch { /* MediaMetadata not available on this browser */ }
+      // يقول لـ iOS "في ميديا شغالة" عشان يحافظ على الـ tab حي
+      navigator.mediaSession.playbackState = "playing";
+    } catch { /* ignore */ }
+    return () => {
+      try { navigator.mediaSession.metadata = null; } catch { /* ignore */ }
+      try { navigator.mediaSession.playbackState = "none"; } catch { /* ignore */ }
+    };
+  }, [code]);
+
+  // Video-specific MediaSession action handlers (play/pause/seek من شاشة القفل)
+  useEffect(() => {
+    if (!videoHlsPath || !("mediaSession" in navigator)) return;
 
     // Lock screen play/pause — privileged only. Guests are completely blocked so the
     // lock screen controls cannot bypass the in-app guest restrictions.
@@ -540,7 +552,6 @@ export default function Room() {
     try { navigator.mediaSession.setActionHandler("seekforward",  msSeekFwd);  } catch { /* ignore */ }
 
     return () => {
-      try { navigator.mediaSession.metadata = null; }                          catch { /* ignore */ }
       try { navigator.mediaSession.setActionHandler("play",         null); }   catch { /* ignore */ }
       try { navigator.mediaSession.setActionHandler("pause",        null); }   catch { /* ignore */ }
       try { navigator.mediaSession.setActionHandler("seekbackward", null); }   catch { /* ignore */ }
@@ -610,6 +621,46 @@ export default function Room() {
       window.removeEventListener("orientationchange", onOrientationChange);
     };
   }, [isIOSDevice]);
+
+  // ── Service Worker Keep-alive (iOS Background) ──────────────────────────────
+  // بيسجّل service worker بيبعت HTTP request كل 25 ثانية.
+  // ده بيساعد iOS يحافظ على الـ tab حي في الخلفية عن طريق:
+  // 1. إثبات للـ browser إن في network activity مستمر
+  // 2. إبقاء الـ SW process نشط حتى لو الـ main thread اتوقف لحظياً
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+    let swRegistration: ServiceWorkerRegistration | null = null;
+
+    const registerAndStart = async () => {
+      try {
+        swRegistration = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+        // انتظر إن الـ SW يبقى active
+        const sw = swRegistration.active ?? swRegistration.waiting ?? swRegistration.installing;
+        const sendStart = (worker: ServiceWorker) =>
+          worker.postMessage({ type: "START_KEEPALIVE" });
+
+        if (swRegistration.active) {
+          sendStart(swRegistration.active);
+        } else if (sw) {
+          sw.addEventListener("statechange", function onState() {
+            if ((this as ServiceWorker).state === "activated") {
+              sendStart(this as ServiceWorker);
+              sw.removeEventListener("statechange", onState);
+            }
+          });
+        }
+      } catch { /* بيفشل في بعض المتصفحات - مش مشكلة */ }
+    };
+
+    registerAndStart();
+
+    return () => {
+      // Stop keepalive لما المستخدم يخرج من الغرفة
+      if (swRegistration?.active) {
+        swRegistration.active.postMessage({ type: "STOP_KEEPALIVE" });
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!sessionToken || !code) return;
@@ -1203,12 +1254,13 @@ export default function Room() {
       setPendingApproval(false);
       setTapToPlay(false);
       refetchVideoStatus();
-      // إشعار OS لما يتوافق الطلب — بيظهر حتى لو الـ tab في الخلفية
-      showBrowserNotif("✅ تم القبول", "تم قبول طلب دخولك للروم، تفضل!");
-      // Floating toast زي chat notifications
-      if (chatToastTimerRef.current) clearTimeout(chatToastTimerRef.current);
-      setChatToast({ name: "تم قبول طلبك ✅", text: "أهلاً بيك في الروم!", tab: "joinApproved" });
-      chatToastTimerRef.current = setTimeout(() => setChatToast(null), 5000);
+      // Floating toast + OS notification — بس لو الجرس مش مكتوم
+      if (notifSoundEnabledRef.current) {
+        if (chatToastTimerRef.current) clearTimeout(chatToastTimerRef.current);
+        setChatToast({ name: "تم قبول طلبك ✅", text: "أهلاً بيك في الروم!", tab: "joinApproved" });
+        chatToastTimerRef.current = setTimeout(() => setChatToast(null), 5000);
+        if (document.hidden) showBrowserNotif("✅ تم القبول", "تم قبول طلب دخولك للروم، تفضل!");
+      }
       // Show welcome toast after approval — only once per session
       if (!welcomeShownRef.current) {
         welcomeShownRef.current = true;
@@ -1229,23 +1281,25 @@ export default function Room() {
     });
     socket.on("joinRejected", () => {
       setPendingApproval(false);
-      // Floating toast قبل ما تظهر شاشة الرفض
-      if (chatToastTimerRef.current) clearTimeout(chatToastTimerRef.current);
-      setChatToast({ name: "تم رفض طلبك ❌", text: "للأسف لم يتم قبولك في الروم", tab: "joinRejected" });
-      chatToastTimerRef.current = setTimeout(() => setChatToast(null), 5000);
-      // إشعار OS لما يترفض الطلب
-      showBrowserNotif("❌ تم الرفض", "للأسف تم رفض طلب دخولك للروم");
+      // Floating toast + OS notification — بس لو الجرس مش مكتوم
+      if (notifSoundEnabledRef.current) {
+        if (chatToastTimerRef.current) clearTimeout(chatToastTimerRef.current);
+        setChatToast({ name: "تم رفض طلبك ❌", text: "للأسف لم يتم قبولك في الروم", tab: "joinRejected" });
+        chatToastTimerRef.current = setTimeout(() => setChatToast(null), 5000);
+        if (document.hidden) showBrowserNotif("❌ تم الرفض", "للأسف تم رفض طلب دخولك للروم");
+      }
       setJoinRejected(true);
     });
     socket.on("joinRequest", (req: JoinRequest) => {
       setJoinRequests(prev => [...prev.filter(r => r.memberId !== req.memberId), req]);
       playNotifSound("request");
-      // إشعار OS لما يجي طلب دخول جديد — بيظهر للهوست حتى لو الـ tab في الخلفية
-      showBrowserNotif("🔔 طلب دخول", `${req.name} يطلب الدخول للروم`);
-      // Floating toast زي chat notifications — يظهر حتى لو الـ panel مسكّر
-      if (chatToastTimerRef.current) clearTimeout(chatToastTimerRef.current);
-      setChatToast({ name: req.name, text: "يطلب الدخول للروم 🔔", tab: "joinRequest" });
-      chatToastTimerRef.current = setTimeout(() => setChatToast(null), 6000);
+      // Floating toast + OS notification — بس لو الجرس مش مكتوم
+      if (notifSoundEnabledRef.current) {
+        if (chatToastTimerRef.current) clearTimeout(chatToastTimerRef.current);
+        setChatToast({ name: req.name, text: "يطلب الدخول للروم 🔔", tab: "joinRequest", memberId: req.memberId });
+        chatToastTimerRef.current = setTimeout(() => setChatToast(null), 6000);
+        if (document.hidden) showBrowserNotif("🔔 طلب دخول", `${req.name} يطلب الدخول للروم`);
+      }
     });
     socket.on("joinRequestHandled", ({ memberId }: { memberId: number }) => {
       setJoinRequests(prev => prev.filter(r => r.memberId !== memberId));
@@ -1426,12 +1480,14 @@ export default function Room() {
           setUnreadCount(prev => prev + 1);
         }
         playNotifSound("message");
-        // Show floating toast only when not muted AND panel is closed or not on the chat tab
+        // Show floating toast + OS notification when panel is closed or not on chat tab
         if (notifSoundEnabledRef.current && (!panelOpenRef.current || activeTabRef.current !== "chat")) {
           if (chatToastTimerRef.current) clearTimeout(chatToastTimerRef.current);
           const preview = entry.imageData ? "📷 صورة" : (entry.message ?? "").slice(0, 60);
           setChatToast({ name: entry.name, text: preview, tab: "chat" });
           chatToastTimerRef.current = setTimeout(() => setChatToast(null), 4500);
+          // إشعار OS — بس لو الـ tab مخفي فعلاً (التطبيق في الخلفية أو الشاشة مقفولة)
+          if (document.hidden) showBrowserNotif(`💬 ${entry.name}`, preview);
         }
       }
     });
@@ -3276,8 +3332,11 @@ export default function Room() {
           if (chatToastTimerRef.current) clearTimeout(chatToastTimerRef.current);
           setChatToast(null);
           setToastSwipe({ x: 0, y: 0 });
+          // joinApproved / joinRejected هما إشعارات معلوماتية فقط — مش بيفتحوا بانيل
+          if (chatToast.tab === "joinApproved" || chatToast.tab === "joinRejected") return;
+          // joinRequest بيفتح تاب الأعضاء عشان الهوست يقبل الطلب
           setPanelOpen(true);
-          setActiveTab(chatToast.tab);
+          setActiveTab(chatToast.tab === "joinRequest" ? "members" : chatToast.tab as "chat" | "members" | "bans");
         }}
         onTouchStart={e => {
           toastTouchRef.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
@@ -3313,6 +3372,33 @@ export default function Room() {
         <div className="flex-1 min-w-0">
           <p className="text-base font-bold text-foreground truncate leading-tight">{chatToast.name}</p>
           <p className="text-base text-muted-foreground truncate mt-0.5 leading-snug">{chatToast.text}</p>
+          {/* أزرار قبول/رفض مباشرة على الإشعار لطلبات الدخول */}
+          {chatToast.tab === "joinRequest" && chatToast.memberId != null && isPrivileged && (
+            <div className="flex gap-2 mt-2" onClick={e => e.stopPropagation()}>
+              <button
+                className="flex-1 flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 text-sm font-semibold hover:bg-emerald-500/35 active:scale-95 transition-all"
+                onClick={e => {
+                  e.stopPropagation();
+                  approveJoin(chatToast.memberId!);
+                  if (chatToastTimerRef.current) clearTimeout(chatToastTimerRef.current);
+                  setChatToast(null);
+                }}
+              >
+                <Check className="w-3.5 h-3.5" /> قبول
+              </button>
+              <button
+                className="flex-1 flex items-center justify-center gap-1 px-2 py-1.5 rounded-lg bg-red-500/20 border border-red-500/40 text-red-400 text-sm font-semibold hover:bg-red-500/35 active:scale-95 transition-all"
+                onClick={e => {
+                  e.stopPropagation();
+                  rejectJoin(chatToast.memberId!);
+                  if (chatToastTimerRef.current) clearTimeout(chatToastTimerRef.current);
+                  setChatToast(null);
+                }}
+              >
+                <X className="w-3.5 h-3.5" /> رفض
+              </button>
+            </div>
+          )}
         </div>
         <button
           className="shrink-0 text-muted-foreground hover:text-foreground -mt-0.5 ml-1 p-1 rounded-full hover:bg-muted transition-colors"

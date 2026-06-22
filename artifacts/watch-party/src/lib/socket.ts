@@ -2,10 +2,19 @@ import { io, Socket } from "socket.io-client";
 
 let socket: Socket | null = null;
 
+// iOS بيوقف WebSocket connections في الخلفية بسرعة أكتر من HTTP polling.
+// HTTP polling: iOS بيسمح للـ pending request يكمل لما الـ tab يصحى لحظياً.
+// WebSocket: TCP connection بيتوقف فوراً لما iOS يسكّت الـ tab.
+const isIOS =
+  /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
 export function getSocket(): Socket {
   if (!socket) {
     socket = io("/", {
-      transports: ["websocket", "polling"],
+      // iOS: polling أولاً (أصمد في الخلفية)، بعدين upgrade لـ websocket لو أمكن
+      // Android/Desktop: websocket أولاً (أسرع وأحسن latency)
+      transports: isIOS ? ["polling", "websocket"] : ["websocket", "polling"],
       autoConnect: false,
       reconnection: true,
       reconnectionAttempts: Infinity,
