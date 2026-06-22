@@ -1202,11 +1202,17 @@ export default function Room() {
         playGain.connect(ctx.destination);
         const now = ctx.currentTime;
         const prev = nextAudioTimeRef.current.get(fromMemberId) ?? 0;
-        // Cap max drift to 300ms — gives more room for jitter without resetting queue
-        const maxDrift = 0.3;
+        // FIX-JITTER: maxDrift 0.3s → 0.6s — على النت الضعيف، الـ packets بتتأخر
+        // أكتر من 300ms فكانت القائمة تتصفر وبيحصل تقطع. 600ms يتحمل جيتر أعلى
+        // بدون ما يزيد التأخير المسموع بشكل ملحوظ.
+        // لو prev بعيد جداً (أكتر من 600ms قُدّام) = reset مع buffer أولي 80ms
+        // لو prev قديم (وراء now) = اتصفر، ابدأ من now + 80ms (jitter cushion)
+        // لو prev طبيعي = استمر من آخر نقطة بدون فجوة
+        const maxDrift = 0.6;
+        const jitterCushion = 0.08; // 80ms initial buffer — يمتص burst jitter
         const startAt = (prev > now + maxDrift)
-          ? now + 0.02
-          : Math.max(now + 0.02, prev);
+          ? now + jitterCushion
+          : Math.max(now + jitterCushion, prev);
         src.start(startAt);
         nextAudioTimeRef.current.set(fromMemberId, startAt + audioBuf.duration);
       } catch { /* ignore decode errors */ }
@@ -2529,24 +2535,43 @@ export default function Room() {
       compressor.connect(analyser);
       analyserRef.current = analyser;
 
-      // ── PCM capture via ScriptProcessor (larger buffer = less CPU glitching) ─
-      const processor = ctx.createScriptProcessor(4096, 1, 1);
+      // ── PCM capture via ScriptProcessor ────────────────────────────────────
+      // FIX-BUFFER: 4096 → 8192 samples (~170ms على 48kHz).
+      // Buffer أكبر = استدعاءات أقل لـ onaudioprocess = CPU أقل = تقطع أقل
+      // على الأجهزة الضعيفة والنت البطيء.
+      // eslint-disable-next-line @typescript-eslint/no-deprecated
+      const processor = ctx.createScriptProcessor(8192, 1, 1);
       compressor.connect(processor);
       const silentGain = ctx.createGain();
       silentGain.gain.value = 0;
       processor.connect(silentGain);
       silentGain.connect(ctx.destination);
 
+      // FIX-VAD: Voice Activity Detection — لا نبعت صوت إذا المستخدم صامت.
+      // بيوفّر bandwidth ويمنع إشغال النت الضعيف بـ packets فاضية.
+      // threshold = 0.008 RMS ≈ -42 dBFS — صوت كلام حقيقي دايماً فوق هذا.
+      const VAD_THRESHOLD = 0.008;
+
       // eslint-disable-next-line @typescript-eslint/no-deprecated
       processor.onaudioprocess = (e: AudioProcessingEvent) => {
         if (!micEnabledRef.current) return;
         // eslint-disable-next-line @typescript-eslint/no-deprecated
         const input = e.inputBuffer.getChannelData(0);
+
+        // FIX-VAD: احسب RMS، لو الصوت صمت تجاهل الـ chunk
+        let sumSq = 0;
+        for (let i = 0; i < input.length; i++) sumSq += input[i] * input[i];
+        const rms = Math.sqrt(sumSq / input.length);
+        if (rms < VAD_THRESHOLD) return; // صمت — لا ترسل
+
         const int16 = new Int16Array(input.length);
         for (let i = 0; i < input.length; i++) {
           int16[i] = Math.round(Math.max(-1, Math.min(1, input[i])) * 32767);
         }
-        socketRef.current?.volatile.emit("audioChunk", { sr: ctx.sampleRate, buf: int16.buffer });
+        // FIX-VOLATILE: بدّلنا volatile.emit بـ emit عادي.
+        // volatile كان يضيّع الـ packets لو الـ socket مشغول (شائع على النت الضعيف).
+        // الـ chunks صغيرة (~16KB) فمافيش مشكلة في الإرسال الموثوق.
+        socketRef.current?.emit("audioChunk", { sr: ctx.sampleRate, buf: int16.buffer });
       };
       scriptProcessorRef.current = processor;
 
@@ -2569,12 +2594,18 @@ export default function Room() {
     }
   };
 
+  // FIX-RESTART: استخدام ref بدل الـ function مباشرة عشان نتجنب stale closure.
+  // كان الكود القديم بيمسك نسخة قديمة من toggleMic (من أول render) فكان restart
+  // بيشغّل الميك حتى لو كان شغّال بالفعل، أو بيفشل بصمت.
+  const toggleMicRef = useRef(toggleMic);
+  useEffect(() => { toggleMicRef.current = toggleMic; });
+
   // Auto-restart mic after returning from iOS background
   useEffect(() => {
-    const handler = () => { toggleMic(); };
+    const handler = () => { toggleMicRef.current(); };
     document.addEventListener("wp:restartMic", handler);
     return () => document.removeEventListener("wp:restartMic", handler);
-  }, [micEnabled]);
+  }, []);
 
   const cancelUpload = () => {
     if (uploadXhrRef.current) { uploadXhrRef.current.abort(); uploadXhrRef.current = null; }
