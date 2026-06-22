@@ -1221,10 +1221,16 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
 
     socket.on("audioChunk", (payload: { sr: number; buf: ArrayBuffer; seq?: number }) => {
       if (!currentRoomCode || !currentMemberId) return;
-      if (isSocketRateLimited(socket.id, "audio", 50)) return;
+      // [FIX-RATELIMIT] Old limit was 50 events/second (a bare counter).
+      // Each audio chunk covers ~170ms → theoretical max is ~6 chunks/second.
+      // 50/s is so high it passes everything through anyway, including retransmit
+      // bursts that can flood the room. Lowered to 10/s: still 1.7× the nominal
+      // rate so brief network catch-ups pass, but blocks real abuse / runaway loops.
+      if (isSocketRateLimited(socket.id, "audio", 10)) return;
       // FIX AUDIO-03: إزالة socket.volatile
       // volatile كان يعني "لو الـ socket مشغول، اتجاهل الـ chunk" → أكبر سبب للتقطع
       // الآن كل chunk يُرسل بموثوقية كاملة
+      // [FIX-SEQ] Forward the sequence number so receivers can detect out-of-order delivery.
       socket.to(currentRoomCode).emit("audioChunk", {
         fromMemberId: currentMemberId,
         sr: payload.sr,

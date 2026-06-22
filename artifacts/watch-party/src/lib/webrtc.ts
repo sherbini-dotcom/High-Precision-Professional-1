@@ -88,33 +88,43 @@ async function getIceServers(): Promise<RTCIceServer[]> {
 }
 
 // ─── Optimal Mic Capture ──────────────────────────────────────────────────────
+// [FIX-MIC-FALLBACK] Three-tier fallback chain — all tiers disable browser AGC
+// so our own gain + compressor chain is always the sole dynamic controller.
+// Previously, tier 2 re-enabled autoGainControl: true which caused double-AGC
+// on Android (browser AGC fighting our compressor → unstable volume / distortion).
+// Tier 3 still passes audio: true as a last resort for unsupported browsers.
 export async function getMicStream(): Promise<MediaStream> {
+  // Tier 1: full high-quality constraints
   try {
     return await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
         noiseSuppression: true,
-        autoGainControl: false,
+        autoGainControl: false, // we handle gain ourselves
         sampleRate: 48000,
         sampleSize: 16,
         channelCount: 1,
       },
       video: false,
     });
-  } catch {
-    try {
-      return await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-        video: false,
-      });
-    } catch {
-      return navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-    }
-  }
+  } catch { /* fall through */ }
+
+  // Tier 2: relaxed constraints — drop sampleRate/sampleSize (some Android WebViews reject them)
+  // Still keep autoGainControl: false to avoid double-AGC with our compressor chain.
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: false,
+        channelCount: 1,
+      },
+      video: false,
+    });
+  } catch { /* fall through */ }
+
+  // Tier 3: absolute minimum — let the browser decide everything
+  return navigator.mediaDevices.getUserMedia({ audio: true, video: false });
 }
 
 // ─── Voice Activity Detector ──────────────────────────────────────────────────
@@ -161,12 +171,23 @@ export function createVoiceActivityDetector(
 }
 
 // ─── SDP: Force Opus with Optimal Parameters ──────────────────────────────────
+// [FIX-OPUS] maxaveragebitrate reduced from 510000 → 64000 bps (Opus spec maximum
+// for mono speech is ~128 kbps; 510 kbps was nonsensical and ignored by most
+// browsers). 64 kbps is transparent for voice with useinbandfec=1.
+// usedtx=1 (discontinuous transmission) silences the stream during pauses,
+// saving bandwidth on weak connections — pairs well with our Worklet-side VAD.
+// cbr=0 (variable bitrate) lets Opus use fewer bits for silence/simple audio.
 function applyOpusParams(sdp: string): string {
   const match = sdp.match(/a=rtpmap:(\d+) opus\/48000/i);
   if (!match) return sdp;
   const pt = match[1];
   let out = sdp.replace(new RegExp(`a=fmtp:${pt}[^\r\n]*\r\n`, "g"), "");
-  const fmtp = `a=fmtp:${pt} maxaveragebitrate=510000;useinbandfec=1;usedtx=1;cbr=0;minptime=10;ptime=10\r\n`;
+  // maxaveragebitrate=64000: transparent mono voice; browsers cap higher values anyway
+  // useinbandfec=1: packet-loss concealment built into the bitstream
+  // usedtx=1: sends ~0 bps during silence (complements our Worklet VAD)
+  // cbr=0: variable bitrate — fewer bits for silence/simple audio
+  // minptime=10,ptime=10: 10 ms packetisation — balances latency vs packet overhead
+  const fmtp = `a=fmtp:${pt} maxaveragebitrate=64000;useinbandfec=1;usedtx=1;cbr=0;minptime=10;ptime=10\r\n`;
   out = out.replace(
     new RegExp(`(a=rtpmap:${pt} opus/48000[^\r\n]*\r\n)`, "i"),
     `$1${fmtp}`,
@@ -464,7 +485,10 @@ export class WebRTCManager {
       const params = sender.getParameters();
       if (!params.encodings?.length) params.encodings = [{}];
       for (const enc of params.encodings) {
-        enc.maxBitrate = 510000;
+        // [FIX-BITRATE] 510000 bps was mis-specified (510 kbps for mono voice is absurd).
+        // Aligned with Opus SDP param: 64 kbps is transparent for voice calls.
+        // On weak connections the browser will go lower automatically (VBR).
+        enc.maxBitrate = 64_000;
         enc.priority = "high";
         enc.networkPriority = "high";
       }

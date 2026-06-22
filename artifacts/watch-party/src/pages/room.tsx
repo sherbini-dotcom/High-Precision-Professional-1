@@ -414,10 +414,18 @@ export default function Room() {
   // AudioWorkletNode runs in a dedicated audio thread — never blocked by React
   // renders or network I/O — giving glitch-free capture on weak connections.
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
+  // [FIX-CLEANUP] Keep refs to all mic graph nodes so stopMic() can disconnect
+  // them explicitly before closing the context — prevents memory leaks on Android.
+  const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const micCompressorRef = useRef<DynamicsCompressorNode | null>(null);
+  const micGainRef = useRef<GainNode | null>(null);
   const audioPlayerRef = useRef<AudioContext | null>(null);
   const silentKeepAliveRef = useRef<AudioBufferSourceNode | null>(null);
   const wasPlayingBeforeHiddenRef = useRef(false);
   const nextAudioTimeRef = useRef<Map<number, number>>(new Map());
+  // [FIX-SEQ] Per-speaker last-received sequence number — used to detect and
+  // discard out-of-order audio packets on lossy connections.
+  const lastAudioSeqRef = useRef<Map<number, number>>(new Map());
   // [FIX-CLICK] One persistent DynamicsCompressor per speaker.
   // Creating a new compressor for every 170ms chunk made it start from zero each
   // time → abrupt gain-reduction jumps → audible clicking. A persistent node
@@ -1317,22 +1325,30 @@ export default function Room() {
     });
     socket.on("peerMicDisabled", ({ memberId }: { memberId: number }) => {
       nextAudioTimeRef.current.delete(memberId);
+      lastAudioSeqRef.current.delete(memberId);
       // [FIX-CLICK] Disconnect and discard persistent compressor when mic is disabled.
       // Next time the speaker enables mic a fresh compressor is created.
       speakerCompressorsRef.current.get(memberId)?.disconnect();
       speakerCompressorsRef.current.delete(memberId);
       setSpeakingState(prev => ({ ...prev, [memberId]: 0 }));
     });
-    socket.on("audioChunk", ({ fromMemberId, sr, buf }: { fromMemberId: number; sr: number; buf: ArrayBuffer }) => {
+    socket.on("audioChunk", ({ fromMemberId, sr, buf, seq }: { fromMemberId: number; sr: number; buf: ArrayBuffer; seq?: number }) => {
       const ctx = audioPlayerRef.current;
       if (!ctx) return;
       if (fromMemberId === myMemberId) return;
       if (ctx.state === "suspended") ctx.resume().catch(() => {});
+
+      // [FIX-SEQ] Discard out-of-order packets on lossy/weak connections.
+      // seq is optional (undefined for older server versions) — only check when present.
+      if (seq !== undefined) {
+        const lastSeq = lastAudioSeqRef.current.get(fromMemberId) ?? -1;
+        if (seq <= lastSeq) return; // stale / reordered — drop silently
+        lastAudioSeqRef.current.set(fromMemberId, seq);
+      }
+
       try {
         // ── Per-speaker persistent compressor ─────────────────────────────────
         // [FIX-CLICK] Create the DynamicsCompressor ONCE per speaker and reuse it.
-        // The old code created a new compressor every 170ms chunk — each one started
-        // with zero gain-reduction history, causing an abrupt jump → audible click.
         // A persistent compressor keeps its internal state between chunks →
         // smooth, continuous gain reduction → no clicks between buffers.
         let compressor = speakerCompressorsRef.current.get(fromMemberId);
@@ -1356,17 +1372,19 @@ export default function Room() {
         src.buffer = audioBuf;
 
         // ── Per-chunk fade gain — eliminates click at buffer boundaries ────────
-        // [FIX-CLICK] A sudden amplitude change at the start/end of each buffer
-        // sounds like a click (like turning a speaker on/off). A 5ms linear
-        // fade-in and fade-out makes the transition inaudible to human hearing.
+        // [FIX-CLICK] A 5ms linear fade-in and fade-out makes transitions inaudible.
         const fadeGain = ctx.createGain();
         src.connect(fadeGain);
         fadeGain.connect(compressor);
 
         const now = ctx.currentTime;
         const prev = nextAudioTimeRef.current.get(fromMemberId) ?? 0;
-        const maxDrift = 0.6;
-        const jitterCushion = 0.15;
+        // [FIX-DRIFT] maxDrift reduced from 0.6s → 0.3s.
+        // 600ms allowed 3-4 chunks to stack up before re-syncing, causing
+        // noticeable audio lag on weak connections before the reset kicked in.
+        // 300ms (≈ 1.5 chunks) re-syncs faster while still absorbing brief jitter.
+        const maxDrift = 0.3;
+        const jitterCushion = 0.12;
         const startAt = (prev > now + maxDrift)
           ? now + jitterCushion
           : Math.max(now + jitterCushion, prev);
@@ -1539,6 +1557,7 @@ export default function Room() {
       if (audioPlayerRef.current?.state !== "closed") audioPlayerRef.current?.close().catch(() => {});
       audioPlayerRef.current = null;
       nextAudioTimeRef.current.clear();
+      lastAudioSeqRef.current.clear();
       // [FIX-CLICK] Discard all persistent speaker compressors on room exit.
       speakerCompressorsRef.current.forEach(c => { try { c.disconnect(); } catch { /* already closed */ } });
       speakerCompressorsRef.current.clear();
@@ -2648,12 +2667,27 @@ export default function Room() {
     if (micIntervalRef.current) { clearInterval(micIntervalRef.current); micIntervalRef.current = null; }
     micStreamRef.current?.getTracks().forEach(t => t.stop());
     micStreamRef.current = null;
-    workletNodeRef.current?.port.close();
-    workletNodeRef.current?.disconnect();
+    // [FIX-FLUSH] Ask the worklet to flush any partial buffer before we shut down,
+    // so the last syllable of speech isn't silently dropped.
+    if (workletNodeRef.current) {
+      try { workletNodeRef.current.port.postMessage({ type: "flush" }); } catch { /* ignore */ }
+    }
+    // [FIX-CLEANUP] Explicitly disconnect all mic graph nodes before closing the
+    // AudioContext. Skipping this step causes memory leaks on some Android browsers
+    // because the nodes hold references to the (now-closed) context's internals.
+    try { workletNodeRef.current?.port.close(); } catch { /* ignore */ }
+    try { workletNodeRef.current?.disconnect(); } catch { /* ignore */ }
     workletNodeRef.current = null;
-    if (audioContextRef.current?.state !== "closed") audioContextRef.current?.close();
-    audioContextRef.current = null;
+    try { analyserRef.current?.disconnect(); } catch { /* ignore */ }
     analyserRef.current = null;
+    try { micGainRef.current?.disconnect(); } catch { /* ignore */ }
+    micGainRef.current = null;
+    try { micCompressorRef.current?.disconnect(); } catch { /* ignore */ }
+    micCompressorRef.current = null;
+    try { micSourceRef.current?.disconnect(); } catch { /* ignore */ }
+    micSourceRef.current = null;
+    if (audioContextRef.current?.state !== "closed") audioContextRef.current?.close().catch(() => {});
+    audioContextRef.current = null;
     setMicEnabled(false);
     setSpeakingState(prev => ({ ...prev, [myMemberId]: 0 }));
     socketRef.current?.emit("micDisabled");
@@ -2668,7 +2702,8 @@ export default function Room() {
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
-          // Disable browser AGC — we apply our own gain + compressor for consistent loudness
+          // [FIX-AGC] Disable browser AGC — we apply our own compressor + makeup gain.
+          // Consistent with getMicStream() in webrtc.ts (all tiers now use false).
           autoGainControl: false,
           channelCount: 1,
           sampleRate: 48000,
@@ -2684,57 +2719,64 @@ export default function Room() {
       if (ctx.state === "suspended") { try { await ctx.resume(); } catch { /* ignore */ } }
       audioContextRef.current = ctx;
       const source = ctx.createMediaStreamSource(stream);
+      micSourceRef.current = source;
 
-      // ── Gain boost: 1.5× amplification — compressor handles the rest ─────────
-      // [FIX-CLICK] 3.0 was too aggressive: transients louder than -20dBFS
-      // passed through before the 3ms compressor attack, causing pre-compression
-      // clipping that sounded like distortion/clicking on the receiver side.
-      // 1.5 gives a comfortable boost without feeding the compressor too hot.
-      const micGain = ctx.createGain();
-      micGain.gain.value = 1.5;
+      // ── Signal chain: source → compressor → makeup gain → analyser/worklet ──
+      // [FIX-CHAIN] OLD order was: source → gain(1.5) → compressor → analyser/worklet
+      //   Problem: feeding gain BEFORE the compressor means loud transients (>-20dBFS)
+      //   hit the compressor 1.5× hotter. The 3ms attack can't catch fast consonants
+      //   ("p", "t", "k") → brief pre-compression clipping → distortion/clicks.
+      // NEW order: source → compressor → makeup gain
+      //   Compressor sees the raw mic level, tames peaks, THEN we apply gentle makeup
+      //   gain to restore perceived loudness. This is the standard dynamics chain.
 
-      // ── Dynamics compressor: normalises volume & prevents clipping ──────────
-      // Soft-knee compression keeps loud voices from distorting while
-      // pulling quiet voices up to a comfortable listening level.
+      // ── Dynamics compressor: tame peaks BEFORE any gain ───────────────────
       const compressor = ctx.createDynamicsCompressor();
-      compressor.threshold.value = -20; // start compressing at -20 dBFS
-      compressor.knee.value = 6;        // smooth transition into compression
-      compressor.ratio.value = 4;       // 4:1 — effective but not over-compressed
-      compressor.attack.value = 0.003;  // 3 ms — fast enough to catch consonants
-      compressor.release.value = 0.15;  // 150 ms — natural decay
+      compressor.threshold.value = -24; // start compressing at -24 dBFS (more headroom)
+      compressor.knee.value = 8;        // smooth transition into compression
+      compressor.ratio.value = 4;       // 4:1 — effective for voice
+      compressor.attack.value = 0.002;  // 2ms — faster, catches consonant transients
+      compressor.release.value = 0.15;  // 150ms — natural decay
+      micCompressorRef.current = compressor;
 
-      // ── Signal chain: source → gain → compressor ───────────────────────────
-      source.connect(micGain);
-      micGain.connect(compressor);
+      // ── Makeup gain: restore loudness post-compression (subtle boost) ──────
+      // Applied AFTER compression — this is safe because the compressor has
+      // already tamed any peaks. 1.3× (≈ +2.3dB) is gentler than the old 1.5×.
+      const micGain = ctx.createGain();
+      micGain.gain.value = 1.3;
+      micGainRef.current = micGain;
 
-      // ── Analyser for RMS volume meter (post-compression) ───────────────────
+      // ── Analyser for RMS volume meter (post-compression, pre-gain) ──────────
+      // Placed after compressor so the meter shows compressed levels —
+      // more representative of what the receiver actually hears.
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 2048;
-      compressor.connect(analyser);
       analyserRef.current = analyser;
 
-      // ── PCM capture via AudioWorklet (replaces deprecated ScriptProcessor) ──
-      // [FIX-WORKLET] ScriptProcessorNode ran on the main JS thread and caused
-      // audio glitches whenever React re-rendered or a network event fired.
-      // AudioWorkletNode runs in a dedicated audio rendering thread that is
-      // completely isolated from the main thread — producing glitch-free capture
-      // even under heavy CPU load or on slow connections.
-      //
-      // The worklet file lives at public/audio-processor.js and is served
-      // as a static asset by Vite (no bundling required).
-      //
-      // VAD and int16 conversion are done inside the worklet (see comments there).
-      // The worklet posts { int16: Int16Array } to the main thread via port.postMessage.
+      // ── Connect: source → compressor → gain → analyser ───────────────────
+      source.connect(compressor);
+      compressor.connect(micGain);
+      micGain.connect(analyser);
+
+      // ── PCM capture via AudioWorklet ──────────────────────────────────────
+      // Worklet runs in a dedicated audio thread — isolated from React/network.
+      // VAD and int16 conversion happen inside the worklet.
+      // The worklet posts { int16: Int16Array, seq: number } messages.
       await ctx.audioWorklet.addModule("/audio-processor.js");
       const workletNode = new AudioWorkletNode(ctx, "mic-processor");
-      compressor.connect(workletNode);
-      // AudioWorkletNode does NOT need a silent output to stay active (unlike
-      // ScriptProcessorNode which required a graph connection to keep running).
+      // Connect from the gain node (post-compression) so the worklet captures
+      // the same signal level that the analyser sees.
+      micGain.connect(workletNode);
 
-      workletNode.port.onmessage = (e: MessageEvent<{ int16: Int16Array }>) => {
+      workletNode.port.onmessage = (e: MessageEvent<{ int16: Int16Array; seq: number }>) => {
         if (!micEnabledRef.current) return;
-        // Transfer ownership of the buffer (zero-copy) — avoids GC pressure
-        socketRef.current?.emit("audioChunk", { sr: ctx.sampleRate, buf: e.data.int16.buffer });
+        // [FIX-SEQ] Forward seq to the server so receivers can detect out-of-order packets.
+        // Transfer ownership of the buffer (zero-copy) — avoids GC pressure.
+        socketRef.current?.emit("audioChunk", {
+          sr: ctx.sampleRate,
+          buf: e.data.int16.buffer,
+          seq: e.data.seq,
+        });
       };
       workletNodeRef.current = workletNode;
 
