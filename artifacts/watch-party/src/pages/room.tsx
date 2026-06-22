@@ -2770,6 +2770,10 @@ export default function Room() {
 
       workletNode.port.onmessage = (e: MessageEvent<{ int16: Int16Array; seq: number }>) => {
         if (!micEnabledRef.current) return;
+        // [FIX-DUAL-AUDIO] لو WebRTC متصل، الصوت بيوصل عبره مباشرة (peer-to-peer).
+        // إرسال audioChunk عبر Socket.IO في نفس الوقت يخلّي المستقبل يسمع الصوت مرتين (echo).
+        // Socket.IO audio يُستخدم فقط كـ fallback لو WebRTC مش متصل بعد.
+        if (webrtcManagerRef.current?.hasConnectedPeers()) return;
         // [FIX-SEQ] Forward seq to the server so receivers can detect out-of-order packets.
         // Transfer ownership of the buffer (zero-copy) — avoids GC pressure.
         socketRef.current?.emit("audioChunk", {

@@ -421,6 +421,8 @@ export class WebRTCManager {
         }
         this.applyAudioEncodingParams(pc);
         this.applyVideoEncodingParams(pc);
+        // ابدأ مراقبة الشبكة وتعديل الـ bitrate تلقائياً
+        this.startAdaptiveBitrate(memberId, entry);
       } else if (pc.connectionState === "disconnected") {
         // Android Chrome frequently lands here on transient network blips (e.g. switching
         // between Wi-Fi and mobile data). Give the browser 5 s to self-recover before we
@@ -479,21 +481,66 @@ export class WebRTCManager {
     return entry;
   }
 
-  private applyAudioEncodingParams(pc: RTCPeerConnection) {
+  private applyAudioEncodingParams(pc: RTCPeerConnection, maxBitrate = 64_000) {
     for (const sender of pc.getSenders()) {
       if (sender.track?.kind !== "audio") continue;
       const params = sender.getParameters();
       if (!params.encodings?.length) params.encodings = [{}];
       for (const enc of params.encodings) {
-        // [FIX-BITRATE] 510000 bps was mis-specified (510 kbps for mono voice is absurd).
-        // Aligned with Opus SDP param: 64 kbps is transparent for voice calls.
-        // On weak connections the browser will go lower automatically (VBR).
-        enc.maxBitrate = 64_000;
+        enc.maxBitrate = maxBitrate;
         enc.priority = "high";
         enc.networkPriority = "high";
       }
       sender.setParameters(params).catch(() => {});
     }
+  }
+
+  // ─── Adaptive Bitrate ─────────────────────────────────────────────────────
+  // يراقب packet loss كل 5 ثواني ويخفّض الـ bitrate لو الشبكة ضعيفة.
+  // يعود للـ 64 kbps تلقائياً لو الشبكة تحسّنت.
+  private startAdaptiveBitrate(memberId: number, entry: PeerEntry): void {
+    // حذف أي interval قديم لنفس الـ peer
+    const existingKey = `abr-${memberId}`;
+    const existingInterval = (this as unknown as Record<string, ReturnType<typeof setInterval>>)[existingKey];
+    if (existingInterval) clearInterval(existingInterval);
+
+    const interval = setInterval(async () => {
+      if (!this.peers.has(memberId)) {
+        clearInterval(interval);
+        return;
+      }
+      if (entry.pc.connectionState !== "connected") return;
+
+      try {
+        const stats = await entry.pc.getStats();
+        let packetLoss = 0;
+
+        stats.forEach((report) => {
+          // outbound-rtp: نراقب ما نبعته نحن (الأدق لأننا نتحكم فيه)
+          if (report.type === "outbound-rtp" && report.kind === "audio") {
+            const lost = (report as RTCOutboundRtpStreamStats & { packetsLost?: number }).packetsLost ?? 0;
+            const sent = (report as RTCOutboundRtpStreamStats & { packetsSent?: number }).packetsSent ?? 1;
+            packetLoss = lost / (lost + sent);
+          }
+        });
+
+        // > 5% packet loss → جودة منخفضة (32 kbps)
+        // ≤ 5%              → جودة عادية  (64 kbps)
+        const targetBitrate = packetLoss > 0.05 ? 32_000 : 64_000;
+        this.applyAudioEncodingParams(entry.pc, targetBitrate);
+      } catch { /* ignore — peer may be closing */ }
+    }, 5_000);
+
+    (this as unknown as Record<string, ReturnType<typeof setInterval>>)[existingKey] = interval;
+  }
+
+  // ─── hasConnectedPeers ────────────────────────────────────────────────────
+  // يُستخدم في room.tsx لمنع إرسال audioChunk عبر Socket.IO لو WebRTC شغّال.
+  hasConnectedPeers(): boolean {
+    for (const [, entry] of this.peers) {
+      if (entry.pc.connectionState === "connected") return true;
+    }
+    return false;
   }
 
   private applyVideoEncodingParams(pc: RTCPeerConnection) {
@@ -650,6 +697,13 @@ export class WebRTCManager {
     if (entry.reconnectTimer !== null) {
       clearTimeout(entry.reconnectTimer);
       entry.reconnectTimer = null;
+    }
+    // إلغاء مراقبة الـ adaptive bitrate
+    const abrKey = `abr-${memberId}`;
+    const abrInterval = (this as unknown as Record<string, ReturnType<typeof setInterval>>)[abrKey];
+    if (abrInterval) {
+      clearInterval(abrInterval);
+      delete (this as unknown as Record<string, ReturnType<typeof setInterval>>)[abrKey];
     }
     entry.pc.ontrack = null;
     entry.pc.onicecandidate = null;
