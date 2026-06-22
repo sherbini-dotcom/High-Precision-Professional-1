@@ -429,8 +429,13 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
       credentials: true,
     },
     transports: ["websocket", "polling"],
-    pingInterval: 10000,
-    pingTimeout: 5000,
+    // FIX AUDIO-01: رفع timeout لتحمل النت الضعيف
+    // pingTimeout 5000 كان بيقطع الاتصال لو النت بطأ لثانية واحدة بس
+    // 25000ms → الاتصال يصمد حتى لو النت اختفى لـ 25 ثانية
+    pingInterval: 25000,
+    pingTimeout: 20000,
+    // FIX AUDIO-02: رفع حجم الـ buffer للصوت عالـ weak connections
+    maxHttpBufferSize: 2e6,
   });
 
   ioInstance = io;
@@ -1197,13 +1202,18 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
         .emit("peerMicDisabled", { memberId: currentMemberId });
     });
 
-    socket.on("audioChunk", (payload: { sr: number; buf: ArrayBuffer }) => {
+    socket.on("audioChunk", (payload: { sr: number; buf: ArrayBuffer; seq?: number }) => {
       if (!currentRoomCode || !currentMemberId) return;
       if (isSocketRateLimited(socket.id, "audio", 50)) return;
-      socket.volatile.to(currentRoomCode).emit("audioChunk", {
+      // FIX AUDIO-03: إزالة socket.volatile
+      // volatile كان يعني "لو الـ socket مشغول، اتجاهل الـ chunk" → أكبر سبب للتقطع
+      // الآن كل chunk يُرسل بموثوقية كاملة
+      socket.to(currentRoomCode).emit("audioChunk", {
         fromMemberId: currentMemberId,
         sr: payload.sr,
         buf: payload.buf,
+        seq: payload.seq,
+        ts: Date.now(),
       });
     });
 
@@ -1329,6 +1339,27 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
       },
     );
 
+    // FIX AUDIO-06: ICE Restart لإعادة الاتصال تلقائياً عند انقطاع WebRTC
+    // لما النت يضعف ويقطع WebRTC، الكليان يطلب ice restart بدل ما ينتظر reconnect كامل
+    // ده بيجدد الـ ICE candidates بسرعة ويستعيد الصوت في ثوانٍ
+    socket.on(
+      "webrtcIceRestart",
+      async ({ targetMemberId }: { targetMemberId: number }) => {
+        if (!currentRoomCode || !currentMemberId) return;
+        try {
+          const sockets = await io.in(currentRoomCode).fetchSockets();
+          for (const s of sockets) {
+            if (s.data.memberId === targetMemberId) {
+              s.emit("webrtcIceRestart", { fromMemberId: currentMemberId });
+              break;
+            }
+          }
+        } catch (err) {
+          logger.error({ err }, "Error in webrtcIceRestart relay");
+        }
+      },
+    );
+
     socket.on("hyperbeamReady", ({ embedUrl }: { embedUrl: string }) => {
       if (
         !currentRoomCode ||
@@ -1350,7 +1381,8 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
       roomHyperbeamUrls.delete(currentRoomCode);
       // سجّل وقت إنهاء الجلسة — يحمي من noPrivilegedTimer يشتغل خلال reconnect قصير
       recentHyperbeamEndTimes.set(currentRoomCode, Date.now());
-      setTimeout(() => recentHyperbeamEndTimes.delete(currentRoomCode), 15_000);
+      const snapHbCode = currentRoomCode;
+      setTimeout(() => recentHyperbeamEndTimes.delete(snapHbCode), 15_000);
       socket.to(currentRoomCode).emit("hyperbeamEnded");
     });
 
