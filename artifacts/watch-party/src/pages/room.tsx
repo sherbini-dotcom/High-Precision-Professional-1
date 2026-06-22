@@ -376,19 +376,11 @@ export default function Room() {
   // Tracks the last play() promise so safePause can wait for it before pausing,
   // preventing "play() interrupted by pause()" AbortErrors in the console.
   const playPromiseRef = useRef<Promise<void> | null>(null);
-  // [FIX] workletNodeRef replaces the deprecated ScriptProcessorNode.
-  // AudioWorkletNode runs in a dedicated audio thread — never blocked by React
-  // renders or network I/O — giving glitch-free capture on weak connections.
-  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
+  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const audioPlayerRef = useRef<AudioContext | null>(null);
   const silentKeepAliveRef = useRef<AudioBufferSourceNode | null>(null);
   const wasPlayingBeforeHiddenRef = useRef(false);
   const nextAudioTimeRef = useRef<Map<number, number>>(new Map());
-  // [FIX-CLICK] One persistent DynamicsCompressor per speaker.
-  // Creating a new compressor for every 170ms chunk made it start from zero each
-  // time → abrupt gain-reduction jumps → audible clicking. A persistent node
-  // keeps the compressor's gain-reduction history between chunks → smooth audio.
-  const speakerCompressorsRef = useRef<Map<number, DynamicsCompressorNode>>(new Map());
   const micEnabledRef = useRef(false);
   const membersRef = useRef<Member[]>([]);
   // NTP-style clock offset: server_clock - local_clock (ms)
@@ -763,9 +755,8 @@ export default function Room() {
           if (micIntervalRef.current) { clearInterval(micIntervalRef.current); micIntervalRef.current = null; }
           stream?.getTracks().forEach(t => t.stop());
           micStreamRef.current = null;
-          workletNodeRef.current?.port.close();
-          workletNodeRef.current?.disconnect();
-          workletNodeRef.current = null;
+          scriptProcessorRef.current?.disconnect();
+          scriptProcessorRef.current = null;
           if (audioContextRef.current?.state !== "closed") audioContextRef.current?.close().catch(() => {});
           audioContextRef.current = null;
           analyserRef.current = null;
@@ -1188,36 +1179,15 @@ export default function Room() {
     });
     socket.on("peerMicDisabled", ({ memberId }: { memberId: number }) => {
       nextAudioTimeRef.current.delete(memberId);
-      // [FIX-CLICK] Disconnect and discard persistent compressor when mic is disabled.
-      // Next time the speaker enables mic a fresh compressor is created.
-      speakerCompressorsRef.current.get(memberId)?.disconnect();
-      speakerCompressorsRef.current.delete(memberId);
       setSpeakingState(prev => ({ ...prev, [memberId]: 0 }));
     });
     socket.on("audioChunk", ({ fromMemberId, sr, buf }: { fromMemberId: number; sr: number; buf: ArrayBuffer }) => {
       const ctx = audioPlayerRef.current;
       if (!ctx) return;
+      // Never play back our own audio (safety guard in case server relays to sender)
       if (fromMemberId === myMemberId) return;
       if (ctx.state === "suspended") ctx.resume().catch(() => {});
       try {
-        // ── Per-speaker persistent compressor ─────────────────────────────────
-        // [FIX-CLICK] Create the DynamicsCompressor ONCE per speaker and reuse it.
-        // The old code created a new compressor every 170ms chunk — each one started
-        // with zero gain-reduction history, causing an abrupt jump → audible click.
-        // A persistent compressor keeps its internal state between chunks →
-        // smooth, continuous gain reduction → no clicks between buffers.
-        let compressor = speakerCompressorsRef.current.get(fromMemberId);
-        if (!compressor) {
-          compressor = ctx.createDynamicsCompressor();
-          compressor.threshold.value = -24; // gentler threshold (more headroom)
-          compressor.knee.value = 10;       // wider soft-knee → less abrupt
-          compressor.ratio.value = 3;       // 3:1 — softer than 4:1, less pumping
-          compressor.attack.value = 0.003;  // 3ms — fast enough for transients
-          compressor.release.value = 0.25;  // 250ms — slower release = less pumping
-          compressor.connect(ctx.destination);
-          speakerCompressorsRef.current.set(fromMemberId, compressor);
-        }
-
         const int16 = new Int16Array(buf);
         const float32 = new Float32Array(int16.length);
         for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32767;
@@ -1225,35 +1195,20 @@ export default function Room() {
         audioBuf.getChannelData(0).set(float32);
         const src = ctx.createBufferSource();
         src.buffer = audioBuf;
-
-        // ── Per-chunk fade gain — eliminates click at buffer boundaries ────────
-        // [FIX-CLICK] A sudden amplitude change at the start/end of each buffer
-        // sounds like a click (like turning a speaker on/off). A 5ms linear
-        // fade-in and fade-out makes the transition inaudible to human hearing.
-        const fadeGain = ctx.createGain();
-        src.connect(fadeGain);
-        fadeGain.connect(compressor);
-
+        // ── Playback gain: 2× boost so listeners hear clear, loud audio ────────
+        const playGain = ctx.createGain();
+        playGain.gain.value = 2.0;
+        src.connect(playGain);
+        playGain.connect(ctx.destination);
         const now = ctx.currentTime;
         const prev = nextAudioTimeRef.current.get(fromMemberId) ?? 0;
-        const maxDrift = 0.6;
-        const jitterCushion = 0.15;
+        // Cap max drift to 300ms — gives more room for jitter without resetting queue
+        const maxDrift = 0.3;
         const startAt = (prev > now + maxDrift)
-          ? now + jitterCushion
-          : Math.max(now + jitterCushion, prev);
-        const endAt = startAt + audioBuf.duration;
-        const FADE_S = 0.005; // 5ms — imperceptible to ears, eliminates clicks
-
-        // Fade in: silence → full volume over 5ms at buffer start
-        fadeGain.gain.setValueAtTime(0, startAt);
-        fadeGain.gain.linearRampToValueAtTime(1.0, startAt + FADE_S);
-        // Fade out: full volume → silence over 5ms at buffer end
-        fadeGain.gain.setValueAtTime(1.0, endAt - FADE_S);
-        fadeGain.gain.linearRampToValueAtTime(0, endAt);
-
+          ? now + 0.02
+          : Math.max(now + 0.02, prev);
         src.start(startAt);
-        src.stop(endAt);
-        nextAudioTimeRef.current.set(fromMemberId, endAt);
+        nextAudioTimeRef.current.set(fromMemberId, startAt + audioBuf.duration);
       } catch { /* ignore decode errors */ }
     });
     socket.on("modeChange", ({ mode: m }: { mode: "video" | "browser" | "screenshare" | "movies" }) => {
@@ -1408,9 +1363,6 @@ export default function Room() {
       if (audioPlayerRef.current?.state !== "closed") audioPlayerRef.current?.close().catch(() => {});
       audioPlayerRef.current = null;
       nextAudioTimeRef.current.clear();
-      // [FIX-CLICK] Discard all persistent speaker compressors on room exit.
-      speakerCompressorsRef.current.forEach(c => { try { c.disconnect(); } catch { /* already closed */ } });
-      speakerCompressorsRef.current.clear();
     };
   }, [code, sessionToken]);
 
@@ -2517,9 +2469,8 @@ export default function Room() {
     if (micIntervalRef.current) { clearInterval(micIntervalRef.current); micIntervalRef.current = null; }
     micStreamRef.current?.getTracks().forEach(t => t.stop());
     micStreamRef.current = null;
-    workletNodeRef.current?.port.close();
-    workletNodeRef.current?.disconnect();
-    workletNodeRef.current = null;
+    scriptProcessorRef.current?.disconnect();
+    scriptProcessorRef.current = null;
     if (audioContextRef.current?.state !== "closed") audioContextRef.current?.close();
     audioContextRef.current = null;
     analyserRef.current = null;
@@ -2554,13 +2505,9 @@ export default function Room() {
       audioContextRef.current = ctx;
       const source = ctx.createMediaStreamSource(stream);
 
-      // ── Gain boost: 1.5× amplification — compressor handles the rest ─────────
-      // [FIX-CLICK] 3.0 was too aggressive: transients louder than -20dBFS
-      // passed through before the 3ms compressor attack, causing pre-compression
-      // clipping that sounded like distortion/clicking on the receiver side.
-      // 1.5 gives a comfortable boost without feeding the compressor too hot.
+      // ── Gain boost: 3× amplification for clear, audible voice ──────────────
       const micGain = ctx.createGain();
-      micGain.gain.value = 1.5;
+      micGain.gain.value = 3.0;
 
       // ── Dynamics compressor: normalises volume & prevents clipping ──────────
       // Soft-knee compression keeps loud voices from distorting while
@@ -2582,30 +2529,26 @@ export default function Room() {
       compressor.connect(analyser);
       analyserRef.current = analyser;
 
-      // ── PCM capture via AudioWorklet (replaces deprecated ScriptProcessor) ──
-      // [FIX-WORKLET] ScriptProcessorNode ran on the main JS thread and caused
-      // audio glitches whenever React re-rendered or a network event fired.
-      // AudioWorkletNode runs in a dedicated audio rendering thread that is
-      // completely isolated from the main thread — producing glitch-free capture
-      // even under heavy CPU load or on slow connections.
-      //
-      // The worklet file lives at public/audio-processor.js and is served
-      // as a static asset by Vite (no bundling required).
-      //
-      // VAD and int16 conversion are done inside the worklet (see comments there).
-      // The worklet posts { int16: Int16Array } to the main thread via port.postMessage.
-      await ctx.audioWorklet.addModule("/audio-processor.js");
-      const workletNode = new AudioWorkletNode(ctx, "mic-processor");
-      compressor.connect(workletNode);
-      // AudioWorkletNode does NOT need a silent output to stay active (unlike
-      // ScriptProcessorNode which required a graph connection to keep running).
+      // ── PCM capture via ScriptProcessor (larger buffer = less CPU glitching) ─
+      const processor = ctx.createScriptProcessor(4096, 1, 1);
+      compressor.connect(processor);
+      const silentGain = ctx.createGain();
+      silentGain.gain.value = 0;
+      processor.connect(silentGain);
+      silentGain.connect(ctx.destination);
 
-      workletNode.port.onmessage = (e: MessageEvent<{ int16: Int16Array }>) => {
+      // eslint-disable-next-line @typescript-eslint/no-deprecated
+      processor.onaudioprocess = (e: AudioProcessingEvent) => {
         if (!micEnabledRef.current) return;
-        // Transfer ownership of the buffer (zero-copy) — avoids GC pressure
-        socketRef.current?.emit("audioChunk", { sr: ctx.sampleRate, buf: e.data.int16.buffer });
+        // eslint-disable-next-line @typescript-eslint/no-deprecated
+        const input = e.inputBuffer.getChannelData(0);
+        const int16 = new Int16Array(input.length);
+        for (let i = 0; i < input.length; i++) {
+          int16[i] = Math.round(Math.max(-1, Math.min(1, input[i])) * 32767);
+        }
+        socketRef.current?.volatile.emit("audioChunk", { sr: ctx.sampleRate, buf: int16.buffer });
       };
-      workletNodeRef.current = workletNode;
+      scriptProcessorRef.current = processor;
 
       setMicEnabled(true);
       setMicError(null);
@@ -2626,18 +2569,12 @@ export default function Room() {
     }
   };
 
-  // FIX-RESTART: استخدام ref بدل الـ function مباشرة عشان نتجنب stale closure.
-  // كان الكود القديم بيمسك نسخة قديمة من toggleMic (من أول render) فكان restart
-  // بيشغّل الميك حتى لو كان شغّال بالفعل، أو بيفشل بصمت.
-  const toggleMicRef = useRef(toggleMic);
-  useEffect(() => { toggleMicRef.current = toggleMic; });
-
   // Auto-restart mic after returning from iOS background
   useEffect(() => {
-    const handler = () => { toggleMicRef.current(); };
+    const handler = () => { toggleMic(); };
     document.addEventListener("wp:restartMic", handler);
     return () => document.removeEventListener("wp:restartMic", handler);
-  }, []);
+  }, [micEnabled]);
 
   const cancelUpload = () => {
     if (uploadXhrRef.current) { uploadXhrRef.current.abort(); uploadXhrRef.current = null; }
