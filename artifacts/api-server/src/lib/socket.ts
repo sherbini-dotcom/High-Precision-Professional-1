@@ -43,6 +43,7 @@ function calcCurrentPosition(tl: VideoTimeline): number {
 }
 
 interface ChatEntry {
+  id: string;
   memberId: number;
   name: string;
   message: string;
@@ -51,12 +52,14 @@ interface ChatEntry {
   whisperTo?: { memberId: number; name: string };
   voiceData?: string;
   imageData?: string;
+  reactions?: Record<string, number[]>; // emoji -> memberIds who reacted
 }
 
 const roomTimelines = new Map<string, VideoTimeline>();
 const roomSyncIntervals = new Map<string, ReturnType<typeof setInterval>>();
 const roomModes = new Map<string, "video" | "browser" | "screenshare" | "movies">();
 const roomHyperbeamUrls = new Map<string, string>();
+const recentHyperbeamEndTimes = new Map<string, number>(); // roomCode → timestamp ms
 const kickedIPs = new Map<string, Set<string>>();
 const pendingApprovals = new Map<
   string,
@@ -261,7 +264,9 @@ function scheduleDisconnectBatch(roomCode: string, memberId: number): void {
         (m) => m.role === "host" || m.role === "admin",
       );
       if (!hasPrivileged && !noPrivilegedTimers.has(roomCode)) {
-        logger.info({ roomCode }, `No host/admin — scheduling deletion in ${NO_PRIVILEGED_GRACE_MS / 1000}s`);
+        const hyperbeamJustEnded = recentHyperbeamEndTimes.has(roomCode);
+        const graceMs = hyperbeamJustEnded ? 60_000 : NO_PRIVILEGED_GRACE_MS;
+        logger.info({ roomCode }, `No host/admin — scheduling deletion in ${graceMs / 1000}s${hyperbeamJustEnded ? " (hyperbeam just ended grace)" : ""}`);
         const timer = setTimeout(async () => {
           noPrivilegedTimers.delete(roomCode);
           try {
@@ -281,7 +286,7 @@ function scheduleDisconnectBatch(roomCode: string, memberId: number): void {
           } catch (err) {
             logger.error({ err, roomCode }, "Error in no-privileged grace-period delete");
           }
-        }, NO_PRIVILEGED_GRACE_MS);
+        }, graceMs);
         noPrivilegedTimers.set(roomCode, timer);
       } else if (hasPrivileged) {
         cancelNoPrivilegedTimer(roomCode);
@@ -318,9 +323,11 @@ function scheduleRoomMembersUpdate(roomCode: string): void {
                (m as unknown as { role: string }).role === "admin",
       );
       if (!hasPrivileged && !noPrivilegedTimers.has(roomCode)) {
+        const hyperbeamJustEnded2 = recentHyperbeamEndTimes.has(roomCode);
+        const graceMs2 = hyperbeamJustEnded2 ? 60_000 : NO_PRIVILEGED_GRACE_MS;
         logger.info(
           { roomCode },
-          `No host/admin online — scheduling room deletion in ${NO_PRIVILEGED_GRACE_MS / 1000}s`,
+          `No host/admin online — scheduling room deletion in ${graceMs2 / 1000}s${hyperbeamJustEnded2 ? " (short grace: hyperbeam just ended)" : ""}`,
         );
         const timer = setTimeout(async () => {
           noPrivilegedTimers.delete(roomCode);
@@ -351,7 +358,7 @@ function scheduleRoomMembersUpdate(roomCode: string): void {
           } catch (err) {
             logger.error({ err, roomCode }, "Error in no-privileged grace-period delete");
           }
-        }, NO_PRIVILEGED_GRACE_MS);
+        }, graceMs2);
         noPrivilegedTimers.set(roomCode, timer);
       } else if (hasPrivileged) {
         cancelNoPrivilegedTimer(roomCode);
@@ -422,8 +429,13 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
       credentials: true,
     },
     transports: ["websocket", "polling"],
-    pingInterval: 10000,
-    pingTimeout: 5000,
+    // FIX AUDIO-01: رفع timeout لتحمل النت الضعيف
+    // pingTimeout 5000 كان بيقطع الاتصال لو النت بطأ لثانية واحدة بس
+    // 25000ms → الاتصال يصمد حتى لو النت اختفى لـ 25 ثانية
+    pingInterval: 25000,
+    pingTimeout: 20000,
+    // FIX AUDIO-02: رفع حجم الـ buffer للصوت عالـ weak connections
+    maxHttpBufferSize: 2e6,
   });
 
   ioInstance = io;
@@ -541,6 +553,12 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
             );
           if (ban) {
             socket.emit("banned");
+            return;
+          }
+
+          // Block guests from joining when room is private
+          if (room.isPrivate && member.role === "guest") {
+            socket.emit("error", { message: "This room is private. No new members can join." });
             return;
           }
 
@@ -752,6 +770,11 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
 
     socket.on("speaking", ({ volume }: { volume: number }) => {
       if (!currentRoomCode || !currentMemberId) return;
+      // [FIX-SPEAKING] Rate-limit to 5/sec on the server side.
+      // Client now sends 4/sec (250 ms interval) but we guard here too in case
+      // an older client version or a misbehaving client spams the event.
+      // Without this, 10+ users × 10 events/sec = 100+ broadcasts/sec per room.
+      if (isSocketRateLimited(socket.id, "speaking", 5)) return;
       socket
         .to(currentRoomCode)
         .emit("speakingUpdate", [{ memberId: currentMemberId, volume }]);
@@ -999,20 +1022,13 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
             .set({ isOnline: true })
             .where(eq(membersTable.id, memberId));
 
-          const [room] = await db
-            .select()
-            .from(roomsTable)
-            .where(eq(roomsTable.code, currentRoomCode));
-          if (room) {
-            const allMembers = await db
-              .select()
-              .from(membersTable)
-              .where(eq(membersTable.roomId, room.id));
-            io.to(currentRoomCode).emit(
-              "membersUpdate",
-              onlineMembers(allMembers),
-            );
+          // Update in-memory cache so getMembersPayload includes the approved member
+          if (approvedMember) {
+            addToOnlineCache(currentRoomCode, { ...approvedMember, isOnline: true });
           }
+
+          // Use cache-based payload (reliable, sanitized) instead of raw DB query
+          io.to(currentRoomCode).emit("membersUpdate", getMembersPayload(currentRoomCode));
 
           targetSocket.emit("joinApproved");
           emitSyncStateTo(targetSocket, currentRoomCode);
@@ -1027,6 +1043,12 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
           if (currentMode === "movies") {
             const cineState = roomCineStates.get(currentRoomCode);
             if (cineState) targetSocket.emit("moviesSync", cineState);
+          }
+
+          // Send active Hyperbeam session to rejoining member so they see the browser
+          const activeHyperbeamUrl = roomHyperbeamUrls.get(currentRoomCode);
+          if (activeHyperbeamUrl) {
+            targetSocket.emit("hyperbeamSession", { embedUrl: activeHyperbeamUrl });
           }
 
           const history = roomChatHistory.get(currentRoomCode) ?? [];
@@ -1184,13 +1206,18 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
         .emit("peerMicDisabled", { memberId: currentMemberId });
     });
 
-    socket.on("audioChunk", (payload: { sr: number; buf: ArrayBuffer }) => {
+    socket.on("audioChunk", (payload: { sr: number; buf: ArrayBuffer; seq?: number }) => {
       if (!currentRoomCode || !currentMemberId) return;
       if (isSocketRateLimited(socket.id, "audio", 50)) return;
-      socket.volatile.to(currentRoomCode).emit("audioChunk", {
+      // FIX AUDIO-03: إزالة socket.volatile
+      // volatile كان يعني "لو الـ socket مشغول، اتجاهل الـ chunk" → أكبر سبب للتقطع
+      // الآن كل chunk يُرسل بموثوقية كاملة
+      socket.to(currentRoomCode).emit("audioChunk", {
         fromMemberId: currentMemberId,
         sr: payload.sr,
         buf: payload.buf,
+        seq: payload.seq,
+        ts: Date.now(),
       });
     });
 
@@ -1316,6 +1343,27 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
       },
     );
 
+    // FIX AUDIO-06: ICE Restart لإعادة الاتصال تلقائياً عند انقطاع WebRTC
+    // لما النت يضعف ويقطع WebRTC، الكليان يطلب ice restart بدل ما ينتظر reconnect كامل
+    // ده بيجدد الـ ICE candidates بسرعة ويستعيد الصوت في ثوانٍ
+    socket.on(
+      "webrtcIceRestart",
+      async ({ targetMemberId }: { targetMemberId: number }) => {
+        if (!currentRoomCode || !currentMemberId) return;
+        try {
+          const sockets = await io.in(currentRoomCode).fetchSockets();
+          for (const s of sockets) {
+            if (s.data.memberId === targetMemberId) {
+              s.emit("webrtcIceRestart", { fromMemberId: currentMemberId });
+              break;
+            }
+          }
+        } catch (err) {
+          logger.error({ err }, "Error in webrtcIceRestart relay");
+        }
+      },
+    );
+
     socket.on("hyperbeamReady", ({ embedUrl }: { embedUrl: string }) => {
       if (
         !currentRoomCode ||
@@ -1335,6 +1383,10 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
       )
         return;
       roomHyperbeamUrls.delete(currentRoomCode);
+      // سجّل وقت إنهاء الجلسة — يحمي من noPrivilegedTimer يشتغل خلال reconnect قصير
+      recentHyperbeamEndTimes.set(currentRoomCode, Date.now());
+      const snapHbCode = currentRoomCode;
+      setTimeout(() => recentHyperbeamEndTimes.delete(snapHbCode), 60_000);
       socket.to(currentRoomCode).emit("hyperbeamEnded");
     });
 
@@ -1383,6 +1435,7 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
           .slice(0, 500);
 
         const entry: ChatEntry = {
+          id: `${currentMemberId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           memberId: currentMemberId,
           name: currentMemberName,
           message: safeTrimmed,
@@ -1412,6 +1465,46 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
         if (history.length > 200) history.shift();
         roomChatHistory.set(currentRoomCode, history);
         io.to(currentRoomCode).emit("chatMessage", entry);
+      },
+    );
+
+    // رياكت على رسالة (toggle) — لو نفس العضو ضغط نفس الإيموجي تاني بتشال، غير كده بتتبدل
+    const ALLOWED_REACTIONS = ["❤️", "😂", "👍", "😮", "😢", "🔥"];
+    socket.on(
+      "reactToMessage",
+      ({ messageId, emoji }: { messageId: string; emoji: string }) => {
+        if (!currentRoomCode || !currentMemberId) return;
+        if (isSocketRateLimited(socket.id, "reaction", 20)) return;
+        if (typeof messageId !== "string" || typeof emoji !== "string") return;
+        if (!ALLOWED_REACTIONS.includes(emoji)) return;
+
+        const history = roomChatHistory.get(currentRoomCode);
+        const entry = history?.find(e => e.id === messageId);
+        if (!entry) return;
+
+        if (!entry.reactions) entry.reactions = {};
+
+        // اشيل أي رياكت سابق لنفس العضو على نفس الرسالة (عضو واحد بإيموجي واحد بس في نفس الوقت)
+        let hadSameEmoji = false;
+        for (const key of Object.keys(entry.reactions)) {
+          const idx = entry.reactions[key].indexOf(currentMemberId);
+          if (idx !== -1) {
+            if (key === emoji) hadSameEmoji = true;
+            entry.reactions[key].splice(idx, 1);
+            if (entry.reactions[key].length === 0) delete entry.reactions[key];
+          }
+        }
+
+        // لو ماكانش حاطط نفس الإيموجي، يبقى دي إضافة. لو كان حاططه، يبقى دي إزالة (toggle off) وخلاص.
+        if (!hadSameEmoji) {
+          if (!entry.reactions[emoji]) entry.reactions[emoji] = [];
+          entry.reactions[emoji].push(currentMemberId);
+        }
+
+        io.to(currentRoomCode).emit("messageReaction", {
+          messageId,
+          reactions: entry.reactions,
+        });
       },
     );
 
