@@ -43,6 +43,7 @@ function calcCurrentPosition(tl: VideoTimeline): number {
 }
 
 interface ChatEntry {
+  id: string;
   memberId: number;
   name: string;
   message: string;
@@ -51,6 +52,7 @@ interface ChatEntry {
   whisperTo?: { memberId: number; name: string };
   voiceData?: string;
   imageData?: string;
+  reactions?: Record<string, number[]>; // emoji -> memberIds who reacted
 }
 
 const roomTimelines = new Map<string, VideoTimeline>();
@@ -1397,6 +1399,7 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
           .slice(0, 500);
 
         const entry: ChatEntry = {
+          id: `${currentMemberId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           memberId: currentMemberId,
           name: currentMemberName,
           message: safeTrimmed,
@@ -1426,6 +1429,46 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
         if (history.length > 200) history.shift();
         roomChatHistory.set(currentRoomCode, history);
         io.to(currentRoomCode).emit("chatMessage", entry);
+      },
+    );
+
+    // رياكت على رسالة (toggle) — لو نفس العضو ضغط نفس الإيموجي تاني بتشال، غير كده بتتبدل
+    const ALLOWED_REACTIONS = ["❤️", "😂", "👍", "😮", "😢", "🔥"];
+    socket.on(
+      "reactToMessage",
+      ({ messageId, emoji }: { messageId: string; emoji: string }) => {
+        if (!currentRoomCode || !currentMemberId) return;
+        if (isSocketRateLimited(socket.id, "reaction", 20)) return;
+        if (typeof messageId !== "string" || typeof emoji !== "string") return;
+        if (!ALLOWED_REACTIONS.includes(emoji)) return;
+
+        const history = roomChatHistory.get(currentRoomCode);
+        const entry = history?.find(e => e.id === messageId);
+        if (!entry) return;
+
+        if (!entry.reactions) entry.reactions = {};
+
+        // اشيل أي رياكت سابق لنفس العضو على نفس الرسالة (عضو واحد بإيموجي واحد بس في نفس الوقت)
+        let hadSameEmoji = false;
+        for (const key of Object.keys(entry.reactions)) {
+          const idx = entry.reactions[key].indexOf(currentMemberId);
+          if (idx !== -1) {
+            if (key === emoji) hadSameEmoji = true;
+            entry.reactions[key].splice(idx, 1);
+            if (entry.reactions[key].length === 0) delete entry.reactions[key];
+          }
+        }
+
+        // لو ماكانش حاطط نفس الإيموجي، يبقى دي إضافة. لو كان حاططه، يبقى دي إزالة (toggle off) وخلاص.
+        if (!hadSameEmoji) {
+          if (!entry.reactions[emoji]) entry.reactions[emoji] = [];
+          entry.reactions[emoji].push(currentMemberId);
+        }
+
+        io.to(currentRoomCode).emit("messageReaction", {
+          messageId,
+          reactions: entry.reactions,
+        });
       },
     );
 

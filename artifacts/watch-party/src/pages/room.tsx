@@ -30,12 +30,14 @@ interface Member {
 interface JoinRequest { memberId: number; name: string; }
 
 interface ChatMessage {
+  id: string;
   memberId: number;
   name: string;
   message: string;
   timestamp: number;
   replyTo?: { memberId: number; name: string; message: string };
   imageData?: string;
+  reactions?: Record<string, number[]>;
 }
 
 function formatTime(sec: number): string {
@@ -148,6 +150,7 @@ export default function Room() {
   const [chatInput, setChatInput] = useState("");
   const [replyingTo, setReplyingTo] = useState<ChatMessage | null>(null);
   const [showStickerPanel, setShowStickerPanel] = useState(false);
+  const [reactionPickerFor, setReactionPickerFor] = useState<string | null>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const [unreadCount, setUnreadCount] = useState(0);
   const chatBottomRef = useRef<HTMLDivElement>(null);
@@ -162,6 +165,9 @@ export default function Room() {
   const [swipingMsgIdx, setSwipingMsgIdx] = useState<number | null>(null);
   const [swipeOffset, setSwipeOffset] = useState(0);
   const touchStartXRef = useRef(0);
+  const touchStartYRef = useRef(0);
+  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const longPressTriggeredRef = useRef(false);
   // Toast swipe-to-dismiss
   const [toastSwipe, setToastSwipe] = useState({ x: 0, y: 0 });
   const toastTouchRef = useRef({ x: 0, y: 0 });
@@ -1308,6 +1314,9 @@ export default function Room() {
           chatToastTimerRef.current = setTimeout(() => setChatToast(null), 4500);
         }
       }
+    });
+    socket.on("messageReaction", ({ messageId, reactions }: { messageId: string; reactions: Record<string, number[]> }) => {
+      setChatMessages(prev => prev.map(m => (m.id === messageId ? { ...m, reactions } : m)));
     });
     // Batch rapid memberRemoved events (e.g. 20 users closing at once) into a single
     // React state update instead of 20 separate setMembers calls. Without batching,
@@ -2760,6 +2769,12 @@ export default function Room() {
     setReplyingTo(null);
   };
 
+  const REACTION_EMOJIS = ["❤️", "😂", "👍", "😮", "😢", "🔥"];
+  const toggleReaction = (messageId: string, emoji: string) => {
+    socketRef.current?.emit("reactToMessage", { messageId, emoji });
+    setReactionPickerFor(null);
+  };
+
   const sendStickerMessage = (sticker: string) => {
     setShowStickerPanel(false);
     socketRef.current?.emit("chatMessage", {
@@ -3241,7 +3256,7 @@ export default function Room() {
         </div>
       </div>
     )}
-    <div className="bg-background flex flex-col overflow-hidden" style={{ height: "100%", paddingBottom: "env(safe-area-inset-bottom)" }}>
+    <div className="bg-background flex flex-col overflow-hidden" style={{ height: "100%" }}>
       {/* Top bar — 2-row layout */}
       <div ref={headerRef} className="border-b border-border bg-card/50 backdrop-blur-sm flex-shrink-0" style={{ paddingTop: "env(safe-area-inset-top)" }}>
         {/* Row 1: room name + lock (left) | mode switcher (right, desktop only) */}
@@ -3961,7 +3976,7 @@ export default function Room() {
         {panelOpen && (
           <div
             className="absolute right-0 top-0 w-80 bg-card border-l border-border z-[60] flex flex-col shadow-2xl"
-            style={{ bottom: isIOSDevice ? (() => { const diff = window.innerHeight - iosViewport.h; return diff > 100 ? diff : 0; })() : 0 }}
+            style={{ bottom: 0 }}
           >
             <div className="flex items-center justify-between px-4 py-3.5 border-b border-border flex-shrink-0">
               <span className="text-base font-bold">Room Panel</span>
@@ -4163,7 +4178,7 @@ export default function Room() {
                     const triggered = isSwiping && swipeOffset > 45;
                     return (
                       <div
-                        key={i}
+                        key={msg.id ?? i}
                         className={`flex flex-col w-full min-w-0 ${isMe ? "items-end" : "items-start"}`}
                         style={{
                           transform: `translateX(${isMe ? -offset : offset}px)`,
@@ -4171,10 +4186,28 @@ export default function Room() {
                         }}
                         onTouchStart={e => {
                           touchStartXRef.current = e.touches[0].clientX;
+                          touchStartYRef.current = e.touches[0].clientY;
                           setSwipingMsgIdx(i);
                           setSwipeOffset(0);
+                          longPressTriggeredRef.current = false;
+                          if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
+                          longPressTimerRef.current = setTimeout(() => {
+                            longPressTimerRef.current = null;
+                            longPressTriggeredRef.current = true;
+                            if (navigator.vibrate) navigator.vibrate(10);
+                            setSwipingMsgIdx(null);
+                            setSwipeOffset(0);
+                            setReactionPickerFor(msg.id);
+                          }, 450);
                         }}
                         onTouchMove={e => {
+                          // أي حركة محسوسة (مش رعشة صغيرة) بتلغي الضغطة الطويلة عشان لا تتعارض مع السحب أو السكرول
+                          const movedX = Math.abs(e.touches[0].clientX - touchStartXRef.current);
+                          const movedY = Math.abs(e.touches[0].clientY - touchStartYRef.current);
+                          if ((movedX > 10 || movedY > 10) && longPressTimerRef.current) {
+                            clearTimeout(longPressTimerRef.current);
+                            longPressTimerRef.current = null;
+                          }
                           if (swipingMsgIdx !== i) return;
                           const dx = isMe
                             ? touchStartXRef.current - e.touches[0].clientX
@@ -4184,7 +4217,17 @@ export default function Room() {
                             setSwipeOffset(Math.min(dx, 65));
                           }
                         }}
-                        onTouchEnd={() => {
+                        onTouchEnd={e => {
+                          if (longPressTimerRef.current) {
+                            clearTimeout(longPressTimerRef.current);
+                            longPressTimerRef.current = null;
+                          }
+                          if (longPressTriggeredRef.current) {
+                            // المنتقي فتح فعلاً من الضغطة الطويلة — منمنع أي click/swipe زيادة بعد كده
+                            longPressTriggeredRef.current = false;
+                            e.preventDefault();
+                            return;
+                          }
                           if (swipeOffset > 45) setReplyingTo(msg);
                           setSwipeOffset(0);
                           setSwipingMsgIdx(null);
@@ -4196,7 +4239,7 @@ export default function Room() {
                             <span className="font-medium text-primary/80">{msg.replyTo.name}:</span> {msg.replyTo.message}
                           </div>
                         )}
-                        <div className="flex items-end gap-1.5">
+                        <div className="relative flex items-end gap-1.5">
                           {!isMe && (
                             <button
                               onClick={() => setReplyingTo(msg)}
@@ -4206,6 +4249,15 @@ export default function Room() {
                               <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>
                             </button>
                           )}
+                          {!isMe && msg.id && (
+                            <button
+                              onClick={() => setReactionPickerFor(p => (p === msg.id ? null : msg.id))}
+                              className={`p-1 rounded-full transition-all ${reactionPickerFor === msg.id ? "text-primary scale-125" : "text-muted-foreground/50 hover:text-foreground"}`}
+                              title="React"
+                            >
+                              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" x2="9.01" y1="9" y2="9"/><line x1="15" x2="15.01" y1="9" y2="9"/></svg>
+                            </button>
+                          )}
                           <div style={{ overflowWrap: "anywhere", wordBreak: "break-word" }} className={`max-w-[85%] rounded-2xl text-base leading-snug min-w-0 overflow-hidden ${msg.imageData || msg.message.startsWith("__sticker__") ? "bg-transparent p-0" : `px-3 py-2 ${isMe ? "bg-primary text-primary-foreground rounded-tr-sm" : "bg-muted text-foreground rounded-tl-sm"}`}`}>
                             {msg.imageData && msg.imageData.startsWith("data:image/") ? (
                               <img src={msg.imageData} alt="image" className="max-w-[200px] max-h-[200px] rounded-xl object-cover cursor-pointer" onClick={() => safeOpenImage(msg.imageData)} />
@@ -4213,6 +4265,15 @@ export default function Room() {
                               <span className="text-5xl leading-none select-none">{msg.message.replace("__sticker__", "")}</span>
                             ) : msg.message}
                           </div>
+                          {isMe && msg.id && (
+                            <button
+                              onClick={() => setReactionPickerFor(p => (p === msg.id ? null : msg.id))}
+                              className={`p-1 rounded-full transition-all ${reactionPickerFor === msg.id ? "text-primary scale-125" : "text-muted-foreground/50 hover:text-foreground"}`}
+                              title="React"
+                            >
+                              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" x2="9.01" y1="9" y2="9"/><line x1="15" x2="15.01" y1="9" y2="9"/></svg>
+                            </button>
+                          )}
                           {isMe && (
                             <button
                               onClick={() => setReplyingTo(msg)}
@@ -4222,7 +4283,41 @@ export default function Room() {
                               <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>
                             </button>
                           )}
+
+                          {/* Emoji reaction picker popup */}
+                          {reactionPickerFor === msg.id && (
+                            <div className={`absolute bottom-full mb-1 z-20 flex items-center gap-1 bg-card border border-border rounded-full shadow-xl px-2 py-1.5 ${isMe ? "right-0" : "left-0"}`}>
+                              {REACTION_EMOJIS.map(em => (
+                                <button
+                                  key={em}
+                                  onClick={() => toggleReaction(msg.id, em)}
+                                  className="text-xl hover:scale-125 transition-transform active:scale-95"
+                                >
+                                  {em}
+                                </button>
+                              ))}
+                            </div>
+                          )}
                         </div>
+
+                        {/* Reaction pills */}
+                        {msg.reactions && Object.keys(msg.reactions).length > 0 && (
+                          <div className={`flex flex-wrap gap-1 mt-1 ${isMe ? "justify-end" : "justify-start"}`}>
+                            {Object.entries(msg.reactions).map(([emoji, memberIds]) => {
+                              const reactedByMe = myMemberId != null && memberIds.includes(myMemberId);
+                              return (
+                                <button
+                                  key={emoji}
+                                  onClick={() => toggleReaction(msg.id, emoji)}
+                                  className={`flex items-center gap-1 px-1.5 py-0.5 rounded-full text-xs border transition-all ${reactedByMe ? "bg-primary/15 border-primary/50 text-primary" : "bg-muted/60 border-border/50 text-muted-foreground hover:bg-muted"}`}
+                                >
+                                  <span>{emoji}</span>
+                                  <span className="font-medium">{memberIds.length}</span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
                       </div>
                     );
                   })}
