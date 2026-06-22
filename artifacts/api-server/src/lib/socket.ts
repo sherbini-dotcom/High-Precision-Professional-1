@@ -770,6 +770,11 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
 
     socket.on("speaking", ({ volume }: { volume: number }) => {
       if (!currentRoomCode || !currentMemberId) return;
+      // [FIX-SPEAKING] Rate-limit to 5/sec on the server side.
+      // Client now sends 4/sec (250 ms interval) but we guard here too in case
+      // an older client version or a misbehaving client spams the event.
+      // Without this, 10+ users × 10 events/sec = 100+ broadcasts/sec per room.
+      if (isSocketRateLimited(socket.id, "speaking", 5)) return;
       socket
         .to(currentRoomCode)
         .emit("speakingUpdate", [{ memberId: currentMemberId, volume }]);

@@ -384,6 +384,11 @@ export default function Room() {
   const silentKeepAliveRef = useRef<AudioBufferSourceNode | null>(null);
   const wasPlayingBeforeHiddenRef = useRef(false);
   const nextAudioTimeRef = useRef<Map<number, number>>(new Map());
+  // [FIX-CLICK] One persistent DynamicsCompressor per speaker.
+  // Creating a new compressor for every 170ms chunk made it start from zero each
+  // time → abrupt gain-reduction jumps → audible clicking. A persistent node
+  // keeps the compressor's gain-reduction history between chunks → smooth audio.
+  const speakerCompressorsRef = useRef<Map<number, DynamicsCompressorNode>>(new Map());
   const micEnabledRef = useRef(false);
   const membersRef = useRef<Member[]>([]);
   // NTP-style clock offset: server_clock - local_clock (ms)
@@ -1183,15 +1188,36 @@ export default function Room() {
     });
     socket.on("peerMicDisabled", ({ memberId }: { memberId: number }) => {
       nextAudioTimeRef.current.delete(memberId);
+      // [FIX-CLICK] Disconnect and discard persistent compressor when mic is disabled.
+      // Next time the speaker enables mic a fresh compressor is created.
+      speakerCompressorsRef.current.get(memberId)?.disconnect();
+      speakerCompressorsRef.current.delete(memberId);
       setSpeakingState(prev => ({ ...prev, [memberId]: 0 }));
     });
     socket.on("audioChunk", ({ fromMemberId, sr, buf }: { fromMemberId: number; sr: number; buf: ArrayBuffer }) => {
       const ctx = audioPlayerRef.current;
       if (!ctx) return;
-      // Never play back our own audio (safety guard in case server relays to sender)
       if (fromMemberId === myMemberId) return;
       if (ctx.state === "suspended") ctx.resume().catch(() => {});
       try {
+        // ── Per-speaker persistent compressor ─────────────────────────────────
+        // [FIX-CLICK] Create the DynamicsCompressor ONCE per speaker and reuse it.
+        // The old code created a new compressor every 170ms chunk — each one started
+        // with zero gain-reduction history, causing an abrupt jump → audible click.
+        // A persistent compressor keeps its internal state between chunks →
+        // smooth, continuous gain reduction → no clicks between buffers.
+        let compressor = speakerCompressorsRef.current.get(fromMemberId);
+        if (!compressor) {
+          compressor = ctx.createDynamicsCompressor();
+          compressor.threshold.value = -24; // gentler threshold (more headroom)
+          compressor.knee.value = 10;       // wider soft-knee → less abrupt
+          compressor.ratio.value = 3;       // 3:1 — softer than 4:1, less pumping
+          compressor.attack.value = 0.003;  // 3ms — fast enough for transients
+          compressor.release.value = 0.25;  // 250ms — slower release = less pumping
+          compressor.connect(ctx.destination);
+          speakerCompressorsRef.current.set(fromMemberId, compressor);
+        }
+
         const int16 = new Int16Array(buf);
         const float32 = new Float32Array(int16.length);
         for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32767;
@@ -1199,40 +1225,35 @@ export default function Room() {
         audioBuf.getChannelData(0).set(float32);
         const src = ctx.createBufferSource();
         src.buffer = audioBuf;
-        // ── Playback signal chain: gain → compressor → destination ────────────
-        // [FIX] Added DynamicsCompressor on the receive side.
-        // A flat 2× gain without limiting caused loud voices to clip and distort.
-        // The compressor normalises loud and quiet voices to a comfortable level.
-        const playGain = ctx.createGain();
-        playGain.gain.value = 2.0;
-        const playCompressor = ctx.createDynamicsCompressor();
-        playCompressor.threshold.value = -18;
-        playCompressor.knee.value = 6;
-        playCompressor.ratio.value = 4;
-        playCompressor.attack.value = 0.003;
-        playCompressor.release.value = 0.15;
-        src.connect(playGain);
-        playGain.connect(playCompressor);
-        playCompressor.connect(ctx.destination);
+
+        // ── Per-chunk fade gain — eliminates click at buffer boundaries ────────
+        // [FIX-CLICK] A sudden amplitude change at the start/end of each buffer
+        // sounds like a click (like turning a speaker on/off). A 5ms linear
+        // fade-in and fade-out makes the transition inaudible to human hearing.
+        const fadeGain = ctx.createGain();
+        src.connect(fadeGain);
+        fadeGain.connect(compressor);
+
         const now = ctx.currentTime;
         const prev = nextAudioTimeRef.current.get(fromMemberId) ?? 0;
-        // FIX-JITTER: maxDrift 0.3s → 0.6s — على النت الضعيف، الـ packets بتتأخر
-        // أكتر من 300ms فكانت القائمة تتصفر وبيحصل تقطع. 600ms يتحمل جيتر أعلى
-        // بدون ما يزيد التأخير المسموع بشكل ملحوظ.
-        // لو prev بعيد جداً (أكتر من 600ms قُدّام) = reset مع buffer أولي 80ms
-        // لو prev قديم (وراء now) = اتصفر، ابدأ من now + 80ms (jitter cushion)
-        // لو prev طبيعي = استمر من آخر نقطة بدون فجوة
         const maxDrift = 0.6;
-        // [FIX] jitterCushion raised from 80 ms → 150 ms.
-        // On weak/high-latency connections packets arrive with >80 ms variance,
-        // causing the queue to reset every burst and producing audible cuts.
-        // 150 ms absorbs typical mobile-network jitter without noticeable delay.
-        const jitterCushion = 0.15; // 150ms initial buffer — يمتص burst jitter
+        const jitterCushion = 0.15;
         const startAt = (prev > now + maxDrift)
           ? now + jitterCushion
           : Math.max(now + jitterCushion, prev);
+        const endAt = startAt + audioBuf.duration;
+        const FADE_S = 0.005; // 5ms — imperceptible to ears, eliminates clicks
+
+        // Fade in: silence → full volume over 5ms at buffer start
+        fadeGain.gain.setValueAtTime(0, startAt);
+        fadeGain.gain.linearRampToValueAtTime(1.0, startAt + FADE_S);
+        // Fade out: full volume → silence over 5ms at buffer end
+        fadeGain.gain.setValueAtTime(1.0, endAt - FADE_S);
+        fadeGain.gain.linearRampToValueAtTime(0, endAt);
+
         src.start(startAt);
-        nextAudioTimeRef.current.set(fromMemberId, startAt + audioBuf.duration);
+        src.stop(endAt);
+        nextAudioTimeRef.current.set(fromMemberId, endAt);
       } catch { /* ignore decode errors */ }
     });
     socket.on("modeChange", ({ mode: m }: { mode: "video" | "browser" | "screenshare" | "movies" }) => {
@@ -1387,6 +1408,9 @@ export default function Room() {
       if (audioPlayerRef.current?.state !== "closed") audioPlayerRef.current?.close().catch(() => {});
       audioPlayerRef.current = null;
       nextAudioTimeRef.current.clear();
+      // [FIX-CLICK] Discard all persistent speaker compressors on room exit.
+      speakerCompressorsRef.current.forEach(c => { try { c.disconnect(); } catch { /* already closed */ } });
+      speakerCompressorsRef.current.clear();
     };
   }, [code, sessionToken]);
 
@@ -2530,9 +2554,13 @@ export default function Room() {
       audioContextRef.current = ctx;
       const source = ctx.createMediaStreamSource(stream);
 
-      // ── Gain boost: 3× amplification for clear, audible voice ──────────────
+      // ── Gain boost: 1.5× amplification — compressor handles the rest ─────────
+      // [FIX-CLICK] 3.0 was too aggressive: transients louder than -20dBFS
+      // passed through before the 3ms compressor attack, causing pre-compression
+      // clipping that sounded like distortion/clicking on the receiver side.
+      // 1.5 gives a comfortable boost without feeding the compressor too hot.
       const micGain = ctx.createGain();
-      micGain.gain.value = 3.0;
+      micGain.gain.value = 1.5;
 
       // ── Dynamics compressor: normalises volume & prevents clipping ──────────
       // Soft-knee compression keeps loud voices from distorting while
