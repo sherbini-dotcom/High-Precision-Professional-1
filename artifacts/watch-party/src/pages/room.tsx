@@ -155,7 +155,7 @@ export default function Room() {
   const [unreadCount, setUnreadCount] = useState(0);
   const chatBottomRef = useRef<HTMLDivElement>(null);
   // Floating notification toast (chat message or member join)
-  const [chatToast, setChatToast] = useState<{ name: string; text: string; tab: "chat" | "members" } | null>(null);
+  const [chatToast, setChatToast] = useState<{ name: string; text: string; tab: "chat" | "members" | "joinApproved" | "joinRejected" | "joinRequest" } | null>(null);
   const chatToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Refs so socket callbacks (captured at mount) always see the latest panel state
   const panelOpenRef = useRef(false);
@@ -657,11 +657,21 @@ export default function Room() {
       if (audioPlayerRef.current?.state === "suspended") {
         audioPlayerRef.current.resume().catch(() => {});
       }
+      // اطلب صلاحية الـ browser notification — لازم user gesture
+      if ("Notification" in window && Notification.permission === "default") {
+        Notification.requestPermission().catch(() => {});
+      }
       document.removeEventListener("touchstart", onFirstInteraction);
       document.removeEventListener("click", onFirstInteraction);
     };
     document.addEventListener("touchstart", onFirstInteraction, { passive: true });
     document.addEventListener("click", onFirstInteraction);
+
+    // مساعد لعرض إشعار OS (يشتغل حتى لو الـ tab مخفية أو الـ browser في الخلفية)
+    const showBrowserNotif = (title: string, body: string) => {
+      if (!("Notification" in window) || Notification.permission !== "granted") return;
+      try { new Notification(title, { body, icon: "/favicon.ico" }); } catch { /* ignore */ }
+    };
 
     // NTP clock sync — compute server_clock - local_clock offset for precise lag compensation
     const doClockSync = () => {
@@ -1193,6 +1203,12 @@ export default function Room() {
       setPendingApproval(false);
       setTapToPlay(false);
       refetchVideoStatus();
+      // إشعار OS لما يتوافق الطلب — بيظهر حتى لو الـ tab في الخلفية
+      showBrowserNotif("✅ تم القبول", "تم قبول طلب دخولك للروم، تفضل!");
+      // Floating toast زي chat notifications
+      if (chatToastTimerRef.current) clearTimeout(chatToastTimerRef.current);
+      setChatToast({ name: "تم قبول طلبك ✅", text: "أهلاً بيك في الروم!", tab: "joinApproved" });
+      chatToastTimerRef.current = setTimeout(() => setChatToast(null), 5000);
       // Show welcome toast after approval — only once per session
       if (!welcomeShownRef.current) {
         welcomeShownRef.current = true;
@@ -1211,10 +1227,25 @@ export default function Room() {
         }, delay);
       });
     });
-    socket.on("joinRejected", () => { setPendingApproval(false); setJoinRejected(true); });
+    socket.on("joinRejected", () => {
+      setPendingApproval(false);
+      // Floating toast قبل ما تظهر شاشة الرفض
+      if (chatToastTimerRef.current) clearTimeout(chatToastTimerRef.current);
+      setChatToast({ name: "تم رفض طلبك ❌", text: "للأسف لم يتم قبولك في الروم", tab: "joinRejected" });
+      chatToastTimerRef.current = setTimeout(() => setChatToast(null), 5000);
+      // إشعار OS لما يترفض الطلب
+      showBrowserNotif("❌ تم الرفض", "للأسف تم رفض طلب دخولك للروم");
+      setJoinRejected(true);
+    });
     socket.on("joinRequest", (req: JoinRequest) => {
       setJoinRequests(prev => [...prev.filter(r => r.memberId !== req.memberId), req]);
       playNotifSound("request");
+      // إشعار OS لما يجي طلب دخول جديد — بيظهر للهوست حتى لو الـ tab في الخلفية
+      showBrowserNotif("🔔 طلب دخول", `${req.name} يطلب الدخول للروم`);
+      // Floating toast زي chat notifications — يظهر حتى لو الـ panel مسكّر
+      if (chatToastTimerRef.current) clearTimeout(chatToastTimerRef.current);
+      setChatToast({ name: req.name, text: "يطلب الدخول للروم 🔔", tab: "joinRequest" });
+      chatToastTimerRef.current = setTimeout(() => setChatToast(null), 6000);
     });
     socket.on("joinRequestHandled", ({ memberId }: { memberId: number }) => {
       setJoinRequests(prev => prev.filter(r => r.memberId !== memberId));
@@ -3266,11 +3297,18 @@ export default function Room() {
         }}
       >
         <style>{`@keyframes toast-slide-in { from { opacity:0; transform:translateY(-10px) scale(0.92); } to { opacity:1; transform:translateY(0) scale(1); } }`}</style>
-        <div className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 ${chatToast.tab === "chat" ? "bg-primary/15" : "bg-emerald-500/15"}`}>
-          {chatToast.tab === "chat"
-            ? <MessageSquare className="w-5 h-5 text-primary" />
-            : <Users className="w-5 h-5 text-emerald-500" />
-          }
+        <div className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 ${
+          chatToast.tab === "chat"        ? "bg-primary/15"        :
+          chatToast.tab === "joinApproved" ? "bg-emerald-500/15"   :
+          chatToast.tab === "joinRejected" ? "bg-red-500/15"       :
+          chatToast.tab === "joinRequest"  ? "bg-amber-500/15"     :
+          "bg-emerald-500/15"
+        }`}>
+          {chatToast.tab === "chat"         ? <MessageSquare className="w-5 h-5 text-primary" />            :
+           chatToast.tab === "joinApproved" ? <Check          className="w-5 h-5 text-emerald-500" />       :
+           chatToast.tab === "joinRejected" ? <X              className="w-5 h-5 text-red-500" />            :
+           chatToast.tab === "joinRequest"  ? <UserCheck      className="w-5 h-5 text-amber-500" />         :
+           <Users className="w-5 h-5 text-emerald-500" />}
         </div>
         <div className="flex-1 min-w-0">
           <p className="text-base font-bold text-foreground truncate leading-tight">{chatToast.name}</p>
