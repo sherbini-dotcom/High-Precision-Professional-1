@@ -5,7 +5,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { getSession, saveSession, clearSession } from "@/lib/storage";
 import { connectSocket, disconnectSocket } from "@/lib/socket";
 import type { Socket } from "socket.io-client";
-import { WebRTCManager } from "@/lib/webrtc";
+import { WebRTCManager, getMicStream } from "@/lib/webrtc";
 import type { WebRTCSignal } from "@/lib/webrtc";
 import {
   Film, Upload, Users, Mic, MicOff, Copy, Check, Shield,
@@ -2698,20 +2698,22 @@ export default function Room() {
     const myMember = membersRef.current.find(m => m.id === myMemberId);
     if (myMember?.isMuted) return;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          // [FIX-AGC] Disable browser AGC — we apply our own compressor + makeup gain.
-          // Consistent with getMicStream() in webrtc.ts (all tiers now use false).
-          autoGainControl: false,
-          channelCount: 1,
-          sampleRate: 48000,
-          sampleSize: 16,
-        },
-        video: false,
-      });
+      // [FIX-MIC-FALLBACK] Use the shared getMicStream() helper (3-tier constraint
+      // fallback: full constraints → relaxed → audio:true). Previously this called
+      // getUserMedia directly with ONE fixed constraint set, so any device/browser
+      // that rejected sampleRate/sampleSize (some Android WebViews) failed entirely
+      // and showed a misleading "Microphone access denied" even though the
+      // permission itself was fine.
+      const stream = await getMicStream();
       micStreamRef.current = stream;
+      // [FIX-WEBRTC-AUDIO] Attach the mic track to the WebRTCManager so peer
+      // connections actually carry audio. Previously setStream() was never called,
+      // so RTCPeerConnections never had an audio sender — once a peer reached
+      // "connected" state the Socket.IO fallback path below was disabled (to avoid
+      // double-audio/echo) while WebRTC silently carried no audio at all, resulting
+      // in total silence. setStream() adds the track to existing peers and is also
+      // picked up automatically for any new peer created afterwards.
+      webrtcManagerRef.current?.setStream(stream);
       socketRef.current?.emit("micEnabled");
 
       const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -2788,6 +2790,10 @@ export default function Room() {
       setMicError(null);
 
       // ── RMS volume detection — more accurate than FFT byte average ──────────
+      // [FIX-SPEAKING-RATE] Was 100ms (10 events/sec) but the server rate-limits
+      // "speaking" to 5/sec — half of every update was silently dropped, making
+      // the speaking/volume indicator less smooth than intended. 200ms (5/sec)
+      // now matches the server limit exactly.
       micIntervalRef.current = setInterval(() => {
         const an = analyserRef.current;
         if (!an) return;
@@ -2797,7 +2803,7 @@ export default function Room() {
         const vol = Math.min(100, Math.round(rms * 400));
         socketRef.current?.emit("speaking", { volume: vol });
         setSpeakingState(prev => ({ ...prev, [myMemberId]: vol }));
-      }, 100);
+      }, 200);
     } catch {
       setMicError("Microphone access denied");
     }

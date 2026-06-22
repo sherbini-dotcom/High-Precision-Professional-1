@@ -62,6 +62,14 @@ const FALLBACK_SERVERS: IceServer[] = [
 
 let cachedServers: IceServer[] | null = null;
 let cacheExpiry = 0;
+// [FIX-TURN-CACHE] Separate, much shorter TTL for the fallback path. Previously
+// a single transient failure (network blip, 5s timeout) cached the free/shared
+// fallback TURN servers for the FULL 10 minutes for every user — even if the
+// real Metered API recovered a second later. Fallback now expires in 30s so we
+// retry the real TURN provider quickly, while a genuine success still caches
+// for the full 10 minutes.
+const SUCCESS_CACHE_TTL_MS = 10 * 60 * 1000;
+const FALLBACK_CACHE_TTL_MS = 30 * 1000;
 
 router.get("/ice-servers", async (req, res) => {
   if (cachedServers && Date.now() < cacheExpiry) {
@@ -79,7 +87,7 @@ router.get("/ice-servers", async (req, res) => {
       if (response.ok) {
         const servers = (await response.json()) as IceServer[];
         cachedServers = servers;
-        cacheExpiry = Date.now() + 10 * 60 * 1000;
+        cacheExpiry = Date.now() + SUCCESS_CACHE_TTL_MS;
         res.json({ iceServers: servers });
         return;
       }
@@ -88,9 +96,10 @@ router.get("/ice-servers", async (req, res) => {
     }
   }
 
-  // FIX AUDIO-05: cache الـ fallback servers لتسريع الاتصال التالي
+  // [FIX-TURN-CACHE] Short cache on fallback so a transient Metered outage
+  // doesn't strand every user on the shared/free TURN pool for 10 minutes.
   cachedServers = FALLBACK_SERVERS;
-  cacheExpiry = Date.now() + 10 * 60 * 1000;
+  cacheExpiry = Date.now() + FALLBACK_CACHE_TTL_MS;
 
   res.json({ iceServers: FALLBACK_SERVERS });
 });

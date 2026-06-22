@@ -580,6 +580,10 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
           socket.data.memberId = member.id;
           socket.data.role = member.role;
           socket.data.roomCode = roomCode;
+          // [FIX-MUTE-ENFORCE] Track mute state server-side so audioChunk can be
+          // rejected at the source instead of relying purely on the client to stop
+          // sending after receiving "forceMuted".
+          socket.data.isMuted = member.isMuted ?? false;
 
           const roomKickedIPs = kickedIPs.get(roomCode);
           const accessControlOn = roomAccessControl.get(roomCode) ?? false;
@@ -792,9 +796,9 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
     socket.on("speaking", ({ volume }: { volume: number }) => {
       if (!currentRoomCode || !currentMemberId) return;
       // [FIX-SPEAKING] Rate-limit to 5/sec on the server side.
-      // Client now sends 4/sec (250 ms interval) but we guard here too in case
-      // an older client version or a misbehaving client spams the event.
-      // Without this, 10+ users × 10 events/sec = 100+ broadcasts/sec per room.
+      // Client now sends 5/sec (200 ms interval, matches this limit exactly) but we
+      // guard here too in case an older client version or a misbehaving client spams
+      // the event. Without this, 10+ users × 10 events/sec = 100+ broadcasts/sec per room.
       if (isSocketRateLimited(socket.id, "speaking", 5)) return;
       socket
         .to(currentRoomCode)
@@ -930,7 +934,18 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
           const sockets = await io.in(currentRoomCode!).fetchSockets();
           for (const s of sockets) {
             if (s.data.memberId === memberId) {
+              // [FIX-MUTE-ENFORCE] Update server-side flag so audioChunk is rejected
+              // immediately, even if the client ignores/ delays "forceMuted".
+              s.data.isMuted = true;
               s.emit("forceMuted");
+              break;
+            }
+          }
+        } else {
+          const sockets = await io.in(currentRoomCode!).fetchSockets();
+          for (const s of sockets) {
+            if (s.data.memberId === memberId) {
+              s.data.isMuted = false;
               break;
             }
           }
@@ -1221,6 +1236,11 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
 
     socket.on("audioChunk", (payload: { sr: number; buf: ArrayBuffer; seq?: number }) => {
       if (!currentRoomCode || !currentMemberId) return;
+      // [FIX-MUTE-ENFORCE] Reject audio from a member the host/admin has muted,
+      // even if a modified/misbehaving client keeps emitting "audioChunk" after
+      // ignoring the "forceMuted" event. Previously this was enforced only on the
+      // client, so a tampered client could bypass a host mute entirely.
+      if (socket.data.isMuted) return;
       // [FIX-RATELIMIT] Old limit was 50 events/second (a bare counter).
       // Each audio chunk covers ~170ms → theoretical max is ~6 chunks/second.
       // 50/s is so high it passes everything through anyway, including retransmit
