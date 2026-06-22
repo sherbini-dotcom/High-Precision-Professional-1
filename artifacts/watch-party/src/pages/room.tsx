@@ -431,6 +431,9 @@ export default function Room() {
   // time → abrupt gain-reduction jumps → audible clicking. A persistent node
   // keeps the compressor's gain-reduction history between chunks → smooth audio.
   const speakerCompressorsRef = useRef<Map<number, DynamicsCompressorNode>>(new Map());
+  // [FIX-ADAPTIVE-JITTER] Per-speaker adaptive cushion (seconds). Starts at 120ms,
+  // grows when bursts are detected (Socket.IO TCP stalls), shrinks when network is clean.
+  const jitterCushionRef = useRef<Map<number, number>>(new Map());
   const micEnabledRef = useRef(false);
   const membersRef = useRef<Member[]>([]);
   // NTP-style clock offset: server_clock - local_clock (ms)
@@ -1355,6 +1358,7 @@ export default function Room() {
     socket.on("peerMicDisabled", ({ memberId }: { memberId: number }) => {
       nextAudioTimeRef.current.delete(memberId);
       lastAudioSeqRef.current.delete(memberId);
+      jitterCushionRef.current.delete(memberId);
       // [FIX-CLICK] Disconnect and discard persistent compressor when mic is disabled.
       // Next time the speaker enables mic a fresh compressor is created.
       speakerCompressorsRef.current.get(memberId)?.disconnect();
@@ -1408,15 +1412,27 @@ export default function Room() {
 
         const now = ctx.currentTime;
         const prev = nextAudioTimeRef.current.get(fromMemberId) ?? 0;
-        // [FIX-DRIFT] maxDrift reduced from 0.6s → 0.3s.
-        // 600ms allowed 3-4 chunks to stack up before re-syncing, causing
-        // noticeable audio lag on weak connections before the reset kicked in.
-        // 300ms (≈ 1.5 chunks) re-syncs faster while still absorbing brief jitter.
-        const maxDrift = 0.3;
-        const jitterCushion = 0.12;
+
+        // [FIX-ADAPTIVE-JITTER] Adaptive jitter buffer: cushion grows when chunks
+        // arrive bursty (burst = gap between arrival and scheduled play > 1 chunk),
+        // and shrinks back toward 80ms when the network is smooth.
+        // This handles the TCP burst problem (Socket.IO fallback) where chunks pile
+        // up and arrive together after a brief stall.
+        const CHUNK_DUR = audioBuf.duration; // ~0.17s
+        const arrivalGap = prev > 0 ? Math.max(0, prev - now) : 0;
+        const jitterMap = jitterCushionRef.current;
+        const prevCushion = jitterMap.get(fromMemberId) ?? 0.12;
+        // Grow by 30ms when we detect a burst backlog, decay 5ms/chunk when clean
+        const newCushion = arrivalGap > CHUNK_DUR * 1.5
+          ? Math.min(prevCushion + 0.03, 0.4)   // bursty → grow up to 400ms max
+          : Math.max(prevCushion - 0.005, 0.08); // smooth → decay to 80ms min
+        jitterMap.set(fromMemberId, newCushion);
+
+        // maxDrift: if queued audio is more than 1 chunk + cushion ahead, reset.
+        const maxDrift = CHUNK_DUR + newCushion;
         const startAt = (prev > now + maxDrift)
-          ? now + jitterCushion
-          : Math.max(now + jitterCushion, prev);
+          ? now + newCushion
+          : Math.max(now + newCushion, prev);
         const endAt = startAt + audioBuf.duration;
         const FADE_S = 0.005; // 5ms — imperceptible to ears, eliminates clicks
 
@@ -1587,6 +1603,7 @@ export default function Room() {
       audioPlayerRef.current = null;
       nextAudioTimeRef.current.clear();
       lastAudioSeqRef.current.clear();
+      jitterCushionRef.current.clear();
       // [FIX-CLICK] Discard all persistent speaker compressors on room exit.
       speakerCompressorsRef.current.forEach(c => { try { c.disconnect(); } catch { /* already closed */ } });
       speakerCompressorsRef.current.clear();
@@ -2704,6 +2721,9 @@ export default function Room() {
     // [FIX-CLEANUP] Explicitly disconnect all mic graph nodes before closing the
     // AudioContext. Skipping this step causes memory leaks on some Android browsers
     // because the nodes hold references to the (now-closed) context's internals.
+    // [FIX-SOCKET-FALLBACK] Clear the socket chunk drain timer attached to the worklet node.
+    const drainTimer = (workletNodeRef.current as unknown as { _drainTimer?: ReturnType<typeof setInterval> })?._drainTimer;
+    if (drainTimer !== undefined) clearInterval(drainTimer);
     try { workletNodeRef.current?.port.close(); } catch { /* ignore */ }
     try { workletNodeRef.current?.disconnect(); } catch { /* ignore */ }
     workletNodeRef.current = null;
@@ -2715,7 +2735,9 @@ export default function Room() {
     micCompressorRef.current = null;
     try { micSourceRef.current?.disconnect(); } catch { /* ignore */ }
     micSourceRef.current = null;
-    if (audioContextRef.current?.state !== "closed") audioContextRef.current?.close().catch(() => {});
+    // [FIX-CTX-REUSE] Do NOT close audioContextRef here — it now points to the
+    // shared audioPlayerRef context which must stay alive for playback and future
+    // mic toggles. Only clear the ref so toggleMic knows no mic graph is active.
     audioContextRef.current = null;
     setMicEnabled(false);
     setSpeakingState(prev => ({ ...prev, [myMemberId]: 0 }));
@@ -2745,8 +2767,19 @@ export default function Room() {
       webrtcManagerRef.current?.setStream(stream);
       socketRef.current?.emit("micEnabled");
 
+      // [FIX-CTX-REUSE] Reuse the shared audioPlayerRef AudioContext for mic capture
+      // instead of creating a new one each time the mic is toggled.
+      // Android caps simultaneous AudioContexts at ~6 — toggle 6 times and the app
+      // silently breaks. We share the already-running playback context; if it's closed
+      // or missing we create ONE new context and keep it alive for future toggles.
+      // Note: stopMic() must NO LONGER close audioContextRef — only the room teardown
+      // (component unmount) should close the shared playback context.
       const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      const ctx = new AudioCtx({ sampleRate: 48000 });
+      let ctx = audioPlayerRef.current;
+      if (!ctx || ctx.state === "closed") {
+        ctx = new AudioCtx({ sampleRate: 48000 });
+        audioPlayerRef.current = ctx;
+      }
       if (ctx.state === "suspended") { try { await ctx.resume(); } catch { /* ignore */ } }
       audioContextRef.current = ctx;
       const source = ctx.createMediaStreamSource(stream);
@@ -2799,19 +2832,37 @@ export default function Room() {
       // the same signal level that the analyser sees.
       micGain.connect(workletNode);
 
+      // [FIX-SOCKET-FALLBACK] Socket.IO is TCP-based — under congestion it queues
+      // chunks and delivers them in a burst. Receiving 5 chunks at once overwhelms
+      // the jitter buffer (it resets to now+cushion for each), producing a fast burst
+      // of audio followed by silence. Fix: enqueue outgoing chunks with timestamps;
+      // a throttled drain loop sends ≤6/sec (server cap is 10/sec) and discards
+      // chunks older than 500ms so stale audio from a TCP stall is silently dropped.
+      type ChunkQueueItem = { int16: Int16Array; seq: number; ts: number };
+      const socketChunkQueue: ChunkQueueItem[] = [];
+      const SOCKET_DRAIN_MS = Math.round(1000 / 6); // 166ms ≈ 6/sec
+      const SOCKET_MAX_AGE_MS = 500;
+      const socketDrainTimer = setInterval(() => {
+        if (!micEnabledRef.current) return;
+        if (webrtcManagerRef.current?.hasConnectedPeers()) { socketChunkQueue.length = 0; return; }
+        const now = Date.now();
+        // Discard chunks that have been waiting too long (TCP stall backlog)
+        while (socketChunkQueue.length > 0 && now - socketChunkQueue[0].ts > SOCKET_MAX_AGE_MS) {
+          socketChunkQueue.shift();
+        }
+        const item = socketChunkQueue.shift();
+        if (!item) return;
+        socketRef.current?.emit("audioChunk", { sr: ctx.sampleRate, buf: item.int16.buffer, seq: item.seq });
+      }, SOCKET_DRAIN_MS);
+      // Attach to workletNode so stopMic can find and clear it
+      (workletNode as unknown as { _drainTimer: ReturnType<typeof setInterval> })._drainTimer = socketDrainTimer;
+
       workletNode.port.onmessage = (e: MessageEvent<{ int16: Int16Array; seq: number }>) => {
         if (!micEnabledRef.current) return;
-        // [FIX-DUAL-AUDIO] لو WebRTC متصل، الصوت بيوصل عبره مباشرة (peer-to-peer).
-        // إرسال audioChunk عبر Socket.IO في نفس الوقت يخلّي المستقبل يسمع الصوت مرتين (echo).
-        // Socket.IO audio يُستخدم فقط كـ fallback لو WebRTC مش متصل بعد.
-        if (webrtcManagerRef.current?.hasConnectedPeers()) return;
-        // [FIX-SEQ] Forward seq to the server so receivers can detect out-of-order packets.
-        // Transfer ownership of the buffer (zero-copy) — avoids GC pressure.
-        socketRef.current?.emit("audioChunk", {
-          sr: ctx.sampleRate,
-          buf: e.data.int16.buffer,
-          seq: e.data.seq,
-        });
+        // [FIX-DUAL-AUDIO] WebRTC connected → audio goes P2P, no Socket.IO needed.
+        if (webrtcManagerRef.current?.hasConnectedPeers()) { socketChunkQueue.length = 0; return; }
+        // Push to queue; drain loop handles rate-limiting and age-based discard.
+        socketChunkQueue.push({ int16: e.data.int16, seq: e.data.seq, ts: Date.now() });
       };
       workletNodeRef.current = workletNode;
 

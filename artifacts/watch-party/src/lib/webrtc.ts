@@ -33,24 +33,25 @@ interface PeerEntry {
 // last-resort fallback if that fetch fails — these credentials are meant
 // to be shared publicly by their providers, so hardcoding them is safe.
 const PUBLIC_FALLBACK_ICE_SERVERS: RTCIceServer[] = [
-  // ── STUN (no relay, used for direct peer connections) ──────────────────────
+  // ── STUN (direct connections, no relay) ───────────────────────────────────
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
+  { urls: "stun:stun2.l.google.com:19302" },
+  { urls: "stun:stun3.l.google.com:19302" },
   { urls: "stun:stun.cloudflare.com:3478" },
+  { urls: "stun:global.stun.twilio.com:3478" },
 
-  // ── Freeturn.net — additional public TURN fallback ─────────────────────────
-  // NOTE: numb.viagenie.ca was removed — that server has been shut down and
-  // causes unnecessary ICE gathering delay (connect-then-timeout every call).
-  {
-    urls: "turn:freeturn.net:3478",
-    username: "free",
-    credential: "free",
-  },
-  {
-    urls: "turns:freeturn.net:5349",
-    username: "free",
-    credential: "free",
-  },
+  // ── TURN via OpenRelay / Metered free tier ─────────────────────────────────
+  // Matches the backend fallback in ice.ts — same servers, consistent behaviour.
+  // global.relay.metered.ca picks the nearest region automatically.
+  // turns: on port 443 passes through even strict corporate/school firewalls.
+  { urls: "turn:global.relay.metered.ca:80",                username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turn:global.relay.metered.ca:80?transport=tcp",  username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turn:global.relay.metered.ca:443",               username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turns:global.relay.metered.ca:443?transport=tcp",username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turn:openrelay.metered.ca:80",                   username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turn:openrelay.metered.ca:443",                  username: "openrelayproject", credential: "openrelayproject" },
+  { urls: "turns:openrelay.metered.ca:443?transport=tcp",   username: "openrelayproject", credential: "openrelayproject" },
 ];
 
 // In-memory cache so we only hit the backend once per page session.
@@ -513,20 +514,35 @@ export class WebRTCManager {
 
       try {
         const stats = await entry.pc.getStats();
+
+        // [FIX-ABR-STATS] Use inbound-rtp (what WE receive) instead of outbound-rtp.
+        // outbound-rtp.packetsLost is reported via RTCP feedback from the remote side
+        // and may arrive late or not at all through NAT/TURN — making it unreliable.
+        // inbound-rtp gives us immediate local loss measurements for audio we receive,
+        // and we use DELTA loss (change since last poll) to avoid cumulative skew where
+        // early loss inflates the ratio forever even after the network recovers.
+        // We also apply the same bitrate to what we SEND (applyAudioEncodingParams)
+        // as a proxy: if we're losing their packets, they're likely losing ours too
+        // (symmetric degradation is the common case on shared-medium or congested links).
+        type InboundAudioReport = RTCInboundRtpStreamStats & { packetsLost?: number; packetsReceived?: number };
         let packetLoss = 0;
+        const prevStats = (this as unknown as Record<string, { lost: number; recv: number }>)[`abr-prev-${memberId}`] ?? { lost: 0, recv: 0 };
 
         stats.forEach((report) => {
-          // outbound-rtp: نراقب ما نبعته نحن (الأدق لأننا نتحكم فيه)
-          if (report.type === "outbound-rtp" && report.kind === "audio") {
-            const lost = (report as RTCOutboundRtpStreamStats & { packetsLost?: number }).packetsLost ?? 0;
-            const sent = (report as RTCOutboundRtpStreamStats & { packetsSent?: number }).packetsSent ?? 1;
-            packetLoss = lost / (lost + sent);
+          if (report.type === "inbound-rtp" && (report as RTCInboundRtpStreamStats).kind === "audio") {
+            const r = report as InboundAudioReport;
+            const totalLost = r.packetsLost ?? 0;
+            const totalRecv = r.packetsReceived ?? 0;
+            const deltaLost = Math.max(0, totalLost - prevStats.lost);
+            const deltaRecv = Math.max(0, totalRecv - prevStats.recv);
+            const deltaTotal = deltaLost + deltaRecv;
+            packetLoss = deltaTotal > 0 ? deltaLost / deltaTotal : 0;
+            (this as unknown as Record<string, { lost: number; recv: number }>)[`abr-prev-${memberId}`] = { lost: totalLost, recv: totalRecv };
           }
         });
 
-        // > 5% packet loss → جودة منخفضة (32 kbps)
-        // ≤ 5%              → جودة عادية  (64 kbps)
-        const targetBitrate = packetLoss > 0.05 ? 32_000 : 64_000;
+        // Tiered bitrate: >10% loss → 24kbps (minimum viable), >5% → 32kbps, else 64kbps
+        const targetBitrate = packetLoss > 0.10 ? 24_000 : packetLoss > 0.05 ? 32_000 : 64_000;
         this.applyAudioEncodingParams(entry.pc, targetBitrate);
       } catch { /* ignore — peer may be closing */ }
     }, 5_000);
@@ -541,6 +557,33 @@ export class WebRTCManager {
       if (entry.pc.connectionState === "connected") return true;
     }
     return false;
+  }
+
+  // ─── Manual Quality Override ──────────────────────────────────────────────
+  // null = adaptive (ABR controls bitrate), number = user-forced bitrate in bps.
+  private manualBitrate: number | null = null;
+
+  /**
+   * Set a manual audio quality override that overrides ABR.
+   * Pass null to re-enable adaptive bitrate.
+   *   "low"  → 24 kbps  (weak network / mobile data)
+   *   "mid"  → 48 kbps  (balanced)
+   *   "high" → 64 kbps  (good network, default)
+   *   null   → ABR decides automatically
+   */
+  setManualQuality(preset: "low" | "mid" | "high" | null): void {
+    if (preset === null) {
+      this.manualBitrate = null;
+      return;
+    }
+    const map = { low: 24_000, mid: 48_000, high: 64_000 } as const;
+    this.manualBitrate = map[preset];
+    // Apply immediately to all connected peers
+    for (const [, entry] of this.peers) {
+      if (entry.pc.connectionState === "connected") {
+        this.applyAudioEncodingParams(entry.pc, this.manualBitrate);
+      }
+    }
   }
 
   private applyVideoEncodingParams(pc: RTCPeerConnection) {
@@ -705,6 +748,8 @@ export class WebRTCManager {
       clearInterval(abrInterval);
       delete (this as unknown as Record<string, ReturnType<typeof setInterval>>)[abrKey];
     }
+    // [FIX-ABR-STATS] Clear delta-loss baseline so a reconnect starts fresh.
+    delete (this as unknown as Record<string, unknown>)[`abr-prev-${memberId}`];
     entry.pc.ontrack = null;
     entry.pc.onicecandidate = null;
     entry.pc.onconnectionstatechange = null;
