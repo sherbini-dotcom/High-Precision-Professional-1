@@ -11,8 +11,13 @@ export function getSocket(): Socket {
       reconnectionAttempts: Infinity,
       reconnectionDelay: 1000,
       reconnectionDelayMax: 5000,
-      timeout: 10000,
-      upgrade: false,
+      // [FIX] Match server's new pingTimeout (20 s). Old 10 s caused false
+      // disconnects on weak connections before the server could respond.
+      timeout: 20000,
+      // [FIX] Allow upgrade from polling → WebSocket when WS initially fails.
+      // upgrade:false meant the socket stayed on polling forever if it fell back,
+      // which is far worse for latency and audio delivery than WebSocket.
+      upgrade: true,
       // [FIX C-01] auth object يُرسَل في كل handshake تلقائياً
       // يُحدَّث قبل كل connect() عبر connectSocket()
       auth: {},

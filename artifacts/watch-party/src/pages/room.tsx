@@ -376,7 +376,10 @@ export default function Room() {
   // Tracks the last play() promise so safePause can wait for it before pausing,
   // preventing "play() interrupted by pause()" AbortErrors in the console.
   const playPromiseRef = useRef<Promise<void> | null>(null);
-  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  // [FIX] workletNodeRef replaces the deprecated ScriptProcessorNode.
+  // AudioWorkletNode runs in a dedicated audio thread — never blocked by React
+  // renders or network I/O — giving glitch-free capture on weak connections.
+  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const audioPlayerRef = useRef<AudioContext | null>(null);
   const silentKeepAliveRef = useRef<AudioBufferSourceNode | null>(null);
   const wasPlayingBeforeHiddenRef = useRef(false);
@@ -755,8 +758,9 @@ export default function Room() {
           if (micIntervalRef.current) { clearInterval(micIntervalRef.current); micIntervalRef.current = null; }
           stream?.getTracks().forEach(t => t.stop());
           micStreamRef.current = null;
-          scriptProcessorRef.current?.disconnect();
-          scriptProcessorRef.current = null;
+          workletNodeRef.current?.port.close();
+          workletNodeRef.current?.disconnect();
+          workletNodeRef.current = null;
           if (audioContextRef.current?.state !== "closed") audioContextRef.current?.close().catch(() => {});
           audioContextRef.current = null;
           analyserRef.current = null;
@@ -1195,11 +1199,21 @@ export default function Room() {
         audioBuf.getChannelData(0).set(float32);
         const src = ctx.createBufferSource();
         src.buffer = audioBuf;
-        // ── Playback gain: 2× boost so listeners hear clear, loud audio ────────
+        // ── Playback signal chain: gain → compressor → destination ────────────
+        // [FIX] Added DynamicsCompressor on the receive side.
+        // A flat 2× gain without limiting caused loud voices to clip and distort.
+        // The compressor normalises loud and quiet voices to a comfortable level.
         const playGain = ctx.createGain();
         playGain.gain.value = 2.0;
+        const playCompressor = ctx.createDynamicsCompressor();
+        playCompressor.threshold.value = -18;
+        playCompressor.knee.value = 6;
+        playCompressor.ratio.value = 4;
+        playCompressor.attack.value = 0.003;
+        playCompressor.release.value = 0.15;
         src.connect(playGain);
-        playGain.connect(ctx.destination);
+        playGain.connect(playCompressor);
+        playCompressor.connect(ctx.destination);
         const now = ctx.currentTime;
         const prev = nextAudioTimeRef.current.get(fromMemberId) ?? 0;
         // FIX-JITTER: maxDrift 0.3s → 0.6s — على النت الضعيف، الـ packets بتتأخر
@@ -1209,7 +1223,11 @@ export default function Room() {
         // لو prev قديم (وراء now) = اتصفر، ابدأ من now + 80ms (jitter cushion)
         // لو prev طبيعي = استمر من آخر نقطة بدون فجوة
         const maxDrift = 0.6;
-        const jitterCushion = 0.08; // 80ms initial buffer — يمتص burst jitter
+        // [FIX] jitterCushion raised from 80 ms → 150 ms.
+        // On weak/high-latency connections packets arrive with >80 ms variance,
+        // causing the queue to reset every burst and producing audible cuts.
+        // 150 ms absorbs typical mobile-network jitter without noticeable delay.
+        const jitterCushion = 0.15; // 150ms initial buffer — يمتص burst jitter
         const startAt = (prev > now + maxDrift)
           ? now + jitterCushion
           : Math.max(now + jitterCushion, prev);
@@ -2475,8 +2493,9 @@ export default function Room() {
     if (micIntervalRef.current) { clearInterval(micIntervalRef.current); micIntervalRef.current = null; }
     micStreamRef.current?.getTracks().forEach(t => t.stop());
     micStreamRef.current = null;
-    scriptProcessorRef.current?.disconnect();
-    scriptProcessorRef.current = null;
+    workletNodeRef.current?.port.close();
+    workletNodeRef.current?.disconnect();
+    workletNodeRef.current = null;
     if (audioContextRef.current?.state !== "closed") audioContextRef.current?.close();
     audioContextRef.current = null;
     analyserRef.current = null;
@@ -2535,45 +2554,30 @@ export default function Room() {
       compressor.connect(analyser);
       analyserRef.current = analyser;
 
-      // ── PCM capture via ScriptProcessor ────────────────────────────────────
-      // FIX-BUFFER: 4096 → 8192 samples (~170ms على 48kHz).
-      // Buffer أكبر = استدعاءات أقل لـ onaudioprocess = CPU أقل = تقطع أقل
-      // على الأجهزة الضعيفة والنت البطيء.
-      // eslint-disable-next-line @typescript-eslint/no-deprecated
-      const processor = ctx.createScriptProcessor(8192, 1, 1);
-      compressor.connect(processor);
-      const silentGain = ctx.createGain();
-      silentGain.gain.value = 0;
-      processor.connect(silentGain);
-      silentGain.connect(ctx.destination);
+      // ── PCM capture via AudioWorklet (replaces deprecated ScriptProcessor) ──
+      // [FIX-WORKLET] ScriptProcessorNode ran on the main JS thread and caused
+      // audio glitches whenever React re-rendered or a network event fired.
+      // AudioWorkletNode runs in a dedicated audio rendering thread that is
+      // completely isolated from the main thread — producing glitch-free capture
+      // even under heavy CPU load or on slow connections.
+      //
+      // The worklet file lives at public/audio-processor.js and is served
+      // as a static asset by Vite (no bundling required).
+      //
+      // VAD and int16 conversion are done inside the worklet (see comments there).
+      // The worklet posts { int16: Int16Array } to the main thread via port.postMessage.
+      await ctx.audioWorklet.addModule("/audio-processor.js");
+      const workletNode = new AudioWorkletNode(ctx, "mic-processor");
+      compressor.connect(workletNode);
+      // AudioWorkletNode does NOT need a silent output to stay active (unlike
+      // ScriptProcessorNode which required a graph connection to keep running).
 
-      // FIX-VAD: Voice Activity Detection — لا نبعت صوت إذا المستخدم صامت.
-      // بيوفّر bandwidth ويمنع إشغال النت الضعيف بـ packets فاضية.
-      // threshold = 0.008 RMS ≈ -42 dBFS — صوت كلام حقيقي دايماً فوق هذا.
-      const VAD_THRESHOLD = 0.008;
-
-      // eslint-disable-next-line @typescript-eslint/no-deprecated
-      processor.onaudioprocess = (e: AudioProcessingEvent) => {
+      workletNode.port.onmessage = (e: MessageEvent<{ int16: Int16Array }>) => {
         if (!micEnabledRef.current) return;
-        // eslint-disable-next-line @typescript-eslint/no-deprecated
-        const input = e.inputBuffer.getChannelData(0);
-
-        // FIX-VAD: احسب RMS، لو الصوت صمت تجاهل الـ chunk
-        let sumSq = 0;
-        for (let i = 0; i < input.length; i++) sumSq += input[i] * input[i];
-        const rms = Math.sqrt(sumSq / input.length);
-        if (rms < VAD_THRESHOLD) return; // صمت — لا ترسل
-
-        const int16 = new Int16Array(input.length);
-        for (let i = 0; i < input.length; i++) {
-          int16[i] = Math.round(Math.max(-1, Math.min(1, input[i])) * 32767);
-        }
-        // FIX-VOLATILE: بدّلنا volatile.emit بـ emit عادي.
-        // volatile كان يضيّع الـ packets لو الـ socket مشغول (شائع على النت الضعيف).
-        // الـ chunks صغيرة (~16KB) فمافيش مشكلة في الإرسال الموثوق.
-        socketRef.current?.emit("audioChunk", { sr: ctx.sampleRate, buf: int16.buffer });
+        // Transfer ownership of the buffer (zero-copy) — avoids GC pressure
+        socketRef.current?.emit("audioChunk", { sr: ctx.sampleRate, buf: e.data.int16.buffer });
       };
-      scriptProcessorRef.current = processor;
+      workletNodeRef.current = workletNode;
 
       setMicEnabled(true);
       setMicError(null);

@@ -38,19 +38,9 @@ const PUBLIC_FALLBACK_ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun1.l.google.com:19302" },
   { urls: "stun:stun.cloudflare.com:3478" },
 
-  // ── Numb (Citrix) — long-running public TURN fallback ──────────────────────
-  {
-    urls: "turn:numb.viagenie.ca",
-    username: "webrtc@live.com",
-    credential: "muazkh",
-  },
-  {
-    urls: "turn:numb.viagenie.ca?transport=tcp",
-    username: "webrtc@live.com",
-    credential: "muazkh",
-  },
-
   // ── Freeturn.net — additional public TURN fallback ─────────────────────────
+  // NOTE: numb.viagenie.ca was removed — that server has been shut down and
+  // causes unnecessary ICE gathering delay (connect-then-timeout every call).
   {
     urls: "turn:freeturn.net:3478",
     username: "free",
@@ -63,11 +53,13 @@ const PUBLIC_FALLBACK_ICE_SERVERS: RTCIceServer[] = [
   },
 ];
 
-// In-memory cache so we only hit the backend once per page session, with a
-// short TTL matching the backend's own Metered credential cache (4 min).
+// In-memory cache so we only hit the backend once per page session.
+// [FIX] TTL raised from 4 min → 10 min to match the backend's own cache TTL.
+// Mismatched TTLs caused the frontend to re-fetch ICE credentials more often
+// than the backend refreshes them, resulting in stale credentials on re-fetch.
 let cachedIceServers: RTCIceServer[] | null = null;
 let iceServersCacheExpiry = 0;
-const ICE_SERVERS_CACHE_TTL_MS = 4 * 60 * 1000;
+const ICE_SERVERS_CACHE_TTL_MS = 10 * 60 * 1000;
 
 /**
  * Fetches the real TURN/STUN server list from our backend (which holds the
