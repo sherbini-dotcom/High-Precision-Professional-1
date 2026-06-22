@@ -179,14 +179,24 @@ export default function Room() {
   useEffect(() => { panelOpenRef.current = panelOpen; }, [panelOpen]);
   useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
 
+  // FIX SOUND-STUCK: إشعار اتعلق لأن الـ context كان suspended والـ resume فشل من غير user gesture.
+  // نخزن النوع هنا ونشغله أول ما المستخدم يلمس الشاشة في tryResumeAudio.
+  const pendingSoundTypeRef = useRef<"request" | "message" | null>(null);
+  // Stable ref to playNotifSound so tryResumeAudio (defined in a [] effect) can call it
+  const playNotifSoundRef = useRef<((type: "request" | "message") => void) | null>(null);
+
+
   useEffect(() => {
     const el = headerRef.current;
     if (!el) return;
+    // FIX TOAST-POS: نعيد القياس لما pendingApproval يتغير
+    // لأن لما pendingApproval=true الـ header مش بيتعرض فـ headerH بيفضل 0
+    // ولما approval بييجي والـ header يظهر للأول مرة لازم نقيسه من جديد
     const ro = new ResizeObserver(() => setHeaderH(el.offsetHeight));
     ro.observe(el);
     setHeaderH(el.offsetHeight);
     return () => ro.disconnect();
-  }, []);
+  }, [pendingApproval]);
   // Clear draft when panel closes so the input is always fresh on reopen
   useEffect(() => { if (!panelOpen) setChatInput(""); }, [panelOpen]);
 
@@ -233,7 +243,33 @@ export default function Room() {
           } catch { /* ignore */ }
         } catch { /* ignore */ }
       } else if (ctx.state === "suspended") {
-        ctx.resume().catch(() => {});
+        ctx.resume()
+          .then(() => {
+            // Restart silent keep-alive after resume so iOS keeps the audio session alive
+            try {
+              const buf = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
+              const ch = buf.getChannelData(0);
+              for (let i = 0; i < ch.length; i++) ch[i] = (Math.random() * 2 - 1) * 0.0005;
+              const src = ctx.createBufferSource();
+              src.buffer = buf;
+              src.loop = true;
+              const gain = ctx.createGain();
+              gain.gain.value = 0.001;
+              src.connect(gain);
+              gain.connect(ctx.destination);
+              src.start();
+              silentKeepAliveRef.current = src;
+            } catch { /* ignore */ }
+            // FIX SOUND-STUCK: play any notification that arrived while ctx was suspended.
+            // We deferred it because resume() without a user gesture silently fails on iOS.
+            // Now we ARE inside a user-gesture handler so it works.
+            const pending = pendingSoundTypeRef.current;
+            if (pending) {
+              pendingSoundTypeRef.current = null;
+              setTimeout(() => { playNotifSoundRef.current?.(pending); }, 50);
+            }
+          })
+          .catch(() => {});
       }
     };
     document.addEventListener("touchstart", tryResumeAudio, { passive: true, capture: true });
@@ -281,28 +317,26 @@ export default function Room() {
         }
       };
 
-      // iOS critical fix: schedule notes AFTER resume() resolves so currentTime
-      // is valid and notes aren't placed in the past (which causes silent playback).
+      // FIX SOUND-STUCK: على iOS/Android، الـ resume() من غير user gesture بيرجع resolved
+      // لكن الصوت الفعلي مش بيشتغل. الحل: نخزن نوع الإشعار في ref ونشغله في
+      // tryResumeAudio أول ما المستخدم يلمس الشاشة (user gesture حقيقي).
       if (ctx.state === "suspended") {
-        // If resume() doesn't resolve within 1.5s the context is permanently stuck
-        // (browser blocked it because there's no user gesture). Mark it as dead so
-        // the next user interaction (e.g. bell toggle or tap) recreates it cleanly.
-        const resumeTimer = setTimeout(() => {
-          if (audioPlayerRef.current === ctx && ctx.state !== "running") {
-            // Close the stuck context but keep the ref pointing at it (state="closed").
-            // tryResumeAudio checks state==="closed" and recreates — nulling it out
-            // would cause tryResumeAudio to return early and never recover.
-            ctx.close().catch(() => {});
+        pendingSoundTypeRef.current = type;
+        // حاول resume بدون أمل كبير — لو نجح تمام، لو لا tryResumeAudio بيعمله
+        ctx.resume().then(() => {
+          const pending = pendingSoundTypeRef.current;
+          if (pending) {
+            pendingSoundTypeRef.current = null;
+            setTimeout(() => { scheduleNotes(ctx); }, 50);
           }
-        }, 1500);
-        ctx.resume()
-          .then(() => { clearTimeout(resumeTimer); scheduleNotes(ctx); })
-          .catch(() => { clearTimeout(resumeTimer); });
+        }).catch(() => { /* deferred to tryResumeAudio on next user touch */ });
       } else {
         scheduleNotes(ctx);
       }
     } catch { /* ignore */ }
   }, [triggerBellPulse]);
+  // FIX: نحدث الـ ref مباشرة بعد التعريف (بدل useEffect) عشان نتجنب "used before declaration"
+  playNotifSoundRef.current = playNotifSound;
 
   const playWelcomeSound = useCallback(() => {
     try {
@@ -583,7 +617,9 @@ export default function Room() {
     const socket = connectSocket(code, sessionToken);
     socketRef.current = socket;
 
-    // Init audio player context lazily on first user interaction (avoids Android crash)
+    // FIX RE-ENTER: بنعمل الـ AudioContext فوراً لما الـ effect يشتغل لأن المستخدم
+    // بيكون لسه في نافذة الـ user gesture من الـ navigation. لو فشل (blocked)
+    // بيرجع suspended ونصلحه في tryResumeAudio على أول لمسة.
     const initAudioPlayer = () => {
       if (audioPlayerRef.current) return;
       try {
@@ -611,8 +647,16 @@ export default function Room() {
         } catch { /* ignore */ }
       } catch { /* ignore — AudioContext not available or blocked on this device */ }
     };
+    // نستدعيه فوراً — Navigation IS a user gesture, so this often creates a running context.
+    // لو الـ browser رفض (created as suspended) بيصحح tryResumeAudio على أول touchstart.
+    initAudioPlayer();
+    // Fallback: لو فشل تماماً أو الـ context لسه null، نعيد المحاولة على أول interaction
     const onFirstInteraction = () => {
       initAudioPlayer();
+      // لو الـ context اتعمل وحالته suspended، نحاول resume فوراً (ده user gesture)
+      if (audioPlayerRef.current?.state === "suspended") {
+        audioPlayerRef.current.resume().catch(() => {});
+      }
       document.removeEventListener("touchstart", onFirstInteraction);
       document.removeEventListener("click", onFirstInteraction);
     };
@@ -3189,7 +3233,7 @@ export default function Room() {
       <div
         className="fixed z-[100000] flex items-start gap-3 w-[260px] sm:w-[300px] bg-background/98 border border-border rounded-2xl px-3 py-3 shadow-2xl cursor-pointer select-none"
         style={{
-          top: headerH, right: 12,
+          top: headerH > 0 ? headerH : 60, right: 12,
           backdropFilter: "blur(16px)",
           animation: toastSwipe.x === 0 && toastSwipe.y === 0 ? "toast-slide-in 0.25s cubic-bezier(0.34,1.56,0.64,1)" : undefined,
           transform: `translate(${toastSwipe.x}px, ${toastSwipe.y}px)`,
@@ -4227,7 +4271,7 @@ export default function Room() {
             {/* Chat tab */}
             {activeTab === "chat" && (
               <div className="flex-1 flex flex-col overflow-hidden">
-                <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2">
+                <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2" style={{ touchAction: "pan-y", overscrollBehavior: "none" }}>
                   {chatMessages.length === 0 && (
                     <div className="flex flex-col items-center justify-center py-8 text-center">
                       <MessageSquare className="w-8 h-8 text-muted-foreground/30 mb-2" />
@@ -4272,11 +4316,15 @@ export default function Room() {
                             longPressTimerRef.current = null;
                           }
                           if (swipingMsgIdx !== i) return;
+                          // FIX PANEL-SWIPE: لو الحركة أفقية بشكل واضح، وقف الـ bubble
+                          // عشان الـ panel أو الـ browser ما يتحركوش مع السحب
+                          if (movedX > movedY && movedX > 5) {
+                            e.stopPropagation();
+                          }
                           const dx = isMe
                             ? touchStartXRef.current - e.touches[0].clientX
                             : e.touches[0].clientX - touchStartXRef.current;
                           if (dx > 0) {
-                            e.stopPropagation();
                             setSwipeOffset(Math.min(dx, 65));
                           }
                         }}
