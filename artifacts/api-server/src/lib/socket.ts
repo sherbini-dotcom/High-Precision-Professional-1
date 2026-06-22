@@ -246,14 +246,24 @@ function scheduleDisconnectBatch(roomCode: string, memberId: number): void {
     if (!ioInstance || memberIds.length === 0) return;
 
     try {
-      if (memberIds.length > 0) {
+      // FIX TAB-SWITCH: لو العضو رجع وعمل reconnect قبل انتهاء الـ 150ms
+      // مش هنعلمه offline ومش هنبعت memberRemoved — عشان مش نكسر الـ sync
+      const roomSockets = await ioInstance.in(roomCode).fetchSockets();
+      const connectedMemberIds = new Set(
+        roomSockets.map((s) => s.data.memberId as number | undefined).filter((id): id is number => id !== undefined),
+      );
+      const stillOffline = memberIds.filter((id) => !connectedMemberIds.has(id));
+
+      if (stillOffline.length === 0) return;
+
+      if (stillOffline.length > 0) {
         await db
           .update(membersTable)
           .set({ isOnline: false })
-          .where(inArray(membersTable.id, memberIds));
+          .where(inArray(membersTable.id, stillOffline));
       }
 
-      for (const id of memberIds) {
+      for (const id of stillOffline) {
         ioInstance.to(roomCode).emit("memberRemoved", { memberId: id });
       }
 
@@ -813,21 +823,12 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
           }
         }
 
-        const [room] = await db
-          .select()
-          .from(roomsTable)
-          .where(eq(roomsTable.code, currentRoomCode));
-        if (room) {
-          const allMembers = await db
-            .select()
-            .from(membersTable)
-            .where(eq(membersTable.roomId, room.id));
-          io.to(currentRoomCode).emit(
-            "membersUpdate",
-            onlineMembers(allMembers),
-          );
-          io.to(currentRoomCode).emit("memberRemoved", { memberId });
-        }
+        // FIX KICK-CACHE: إزالة العضو من الـ online cache فوراً
+        // بدونها getMembersPayload بيفضل يشيله في كل membersUpdate جاي
+        removeFromOnlineCache(currentRoomCode, memberId);
+
+        io.to(currentRoomCode).emit("memberRemoved", { memberId });
+        io.to(currentRoomCode).emit("membersUpdate", getMembersPayload(currentRoomCode));
       } catch (err) {
         logger.error({ err }, "Error in kickMember");
       }
@@ -869,12 +870,11 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
           }
         }
 
-        const allMembers = await db
-          .select()
-          .from(membersTable)
-          .where(eq(membersTable.roomId, room.id));
-        io.to(currentRoomCode).emit("membersUpdate", onlineMembers(allMembers));
+        // FIX BAN-CACHE: إزالة العضو من الـ online cache فوراً
+        removeFromOnlineCache(currentRoomCode, memberId);
+
         io.to(currentRoomCode).emit("memberRemoved", { memberId });
+        io.to(currentRoomCode).emit("membersUpdate", getMembersPayload(currentRoomCode));
       } catch (err) {
         logger.error({ err }, "Error in banMember");
       }
@@ -1013,7 +1013,9 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
           approvedMembers.set(currentRoomCode, roomApproved);
 
           targetSocket.data.memberId = memberId;
-          targetSocket.data.role = "guest";
+          // FIX APPROVE-ROLE: استخدام الدور الفعلي من الـ DB بدل "guest" المكتوبة hard-coded
+          // لو الشخص كان admin واتطرد وعاد، لازم يرجع بنفس دوره مش كـ guest
+          targetSocket.data.role = approvedMember?.role ?? "guest";
           targetSocket.data.roomCode = currentRoomCode;
           await targetSocket.join(currentRoomCode);
 
@@ -1542,13 +1544,19 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
         if (key.startsWith(socket.id + ":")) socketEventTimestamps.delete(key);
       }
 
-      if (!currentMemberId || !currentRoomCode) return;
-      const snapRoomCode = currentRoomCode;
-      const snapMemberId = currentMemberId;
+      // FIX APPROVE-CLEANUP: لو الـ socket دخل عن طريق approveJoin،
+      // الـ closure vars (currentMemberId/currentRoomCode) بتبقى null
+      // لأن joinRoom خرج بـ return قبل ما يضبطهم.
+      // نستخدم socket.data كـ fallback عشان الـ disconnect يشتغل صح.
+      const snapRoomCode = currentRoomCode ?? (socket.data.roomCode as string | undefined) ?? null;
+      const snapMemberId = currentMemberId ?? (socket.data.memberId as number | undefined) ?? null;
+      const snapRole = currentRole ?? (socket.data.role as string | undefined) ?? null;
+
+      if (!snapMemberId || !snapRoomCode) return;
 
       if (
-        (currentRole === "host" || currentRole === "admin") &&
-        roomUploading.get(snapRoomCode) 
+        (snapRole === "host" || snapRole === "admin") &&
+        roomUploading.get(snapRoomCode)
       ) {
         roomUploading.delete(snapRoomCode);
         roomTimelines.delete(snapRoomCode);
