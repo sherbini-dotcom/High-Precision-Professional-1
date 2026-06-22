@@ -947,6 +947,35 @@ export default function Room() {
             },
           );
           webrtcManagerRef.current = newManager;
+
+          // [FIX-RECONNECT-AUDIO] The old manager (and all its peer connections)
+          // was just destroyed and replaced. Without these two steps, WebRTC audio
+          // silently breaks again after every network change (Wi-Fi ↔ mobile data,
+          // VPN toggle, airplane mode):
+          //
+          // 1. Re-attach the live mic stream to the NEW manager. setStream() was
+          //    only ever called once, in toggleMic(); the new manager starts with
+          //    localStream = null, so any peer it creates would carry no audio —
+          //    the exact same bug as the original missing setStream() call, just
+          //    triggered by manager recreation instead of by toggleMic never being wired up.
+          if (micEnabledRef.current && micStreamRef.current) {
+            newManager.setStream(micStreamRef.current);
+          }
+
+          // 2. Re-initiate offers to existing online peers. webrtcInitiatedRef is
+          //    set to true once on the FIRST membersUpdate and never reset, so
+          //    without this, peers are never re-offered after recreation — for any
+          //    peer pair where this side isn't the "lower ID" initiator, the WebRTC
+          //    connection would never be rebuilt at all post-reconnect (it would
+          //    silently fall back to Socket.IO audio only, and screen share/video
+          //    would stay broken indefinitely).
+          const myId = session?.memberId ?? 0;
+          const peers = membersRef.current.filter(m => m.id !== myId && m.isOnline && myId < m.id);
+          peers.forEach((m, i) => {
+            setTimeout(() => {
+              webrtcManagerRef.current?.initiateOffer(m.id);
+            }, i * 300);
+          });
         }, 500);
       }
     };
