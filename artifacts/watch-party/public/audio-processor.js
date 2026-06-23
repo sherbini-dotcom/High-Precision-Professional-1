@@ -5,18 +5,17 @@
  * thread (React renders, DOM updates, network activity) → glitch-free capture
  * even on weak devices and slow connections.
  *
- * FIX LIST (v2):
- *  [FIX-SEQ]   Each chunk now carries a monotonic seq number so the receiver
- *               can detect and discard out-of-order packets on weak networks.
- *  [FIX-VAD]   VAD threshold is now configurable via port.postMessage from
- *               the main thread (message: { type: "setThreshold", value: 0.01 }).
- *               This lets the UI expose a sensitivity slider without reloading
- *               the worklet.
- *  [FIX-FLUSH] Partial buffer is flushed on port.close() / processor stop so
- *               the last syllable of speech is never silently dropped.
- *
- * Drop this file in: artifacts/watch-party/public/audio-processor.js
- * (Vite serves everything in public/ as-is at the root URL.)
+ * FIX LIST (v3):
+ *  [FIX-SEQ]     Each chunk carries a monotonic seq number so the receiver
+ *                can detect and discard out-of-order packets on weak networks.
+ *  [FIX-VAD]     VAD threshold is configurable via port.postMessage from
+ *                the main thread (message: { type: "setThreshold", value: 0.01 }).
+ *  [FIX-FLUSH]   Partial buffer is flushed on port.close() / processor stop so
+ *                the last syllable of speech is never silently dropped.
+ *  [FIX-LATENCY] TARGET_SAMPLES reduced 8192 → 4096 (170ms → ~85ms at 48kHz).
+ *                Halves worklet-side latency. Kept at 4096 (not 2048) so the
+ *                Socket.IO fallback path can deliver ~12 chunks/sec — well within
+ *                the server's 15/sec rate cap (no chunks dropped on fallback).
  */
 
 // ── VAD constants ─────────────────────────────────────────────────────────────
@@ -24,9 +23,11 @@
 // Can be overridden at runtime via port.postMessage({ type: "setThreshold", value: N }).
 let VAD_THRESHOLD = 0.008;
 
-// Accumulate ~170 ms of audio before sending (8192 samples at 48 kHz).
-// AudioWorklet delivers 128 frames per process() call.
-const TARGET_SAMPLES = 8192;
+// [FIX-LATENCY] Accumulate ~85 ms of audio before sending (4096 samples at 48 kHz).
+// AudioWorklet delivers 128 frames per process() call → 32 calls per chunk (~12/sec).
+// Server rate cap is 15/sec — 12/sec fits with headroom, so no chunks are dropped
+// on the Socket.IO fallback path. Keeps latency at ~85ms vs original 170ms.
+const TARGET_SAMPLES = 4096;
 
 class MicProcessor extends AudioWorkletProcessor {
   constructor() {

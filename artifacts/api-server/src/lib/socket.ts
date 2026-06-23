@@ -1246,12 +1246,13 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
       // ignoring the "forceMuted" event. Previously this was enforced only on the
       // client, so a tampered client could bypass a host mute entirely.
       if (socket.data.isMuted) return;
-      // [FIX-RATELIMIT] Old limit was 50 events/second (a bare counter).
-      // Each audio chunk covers ~170ms → theoretical max is ~6 chunks/second.
-      // 50/s is so high it passes everything through anyway, including retransmit
-      // bursts that can flood the room. Lowered to 10/s: still 1.7× the nominal
-      // rate so brief network catch-ups pass, but blocks real abuse / runaway loops.
-      if (isSocketRateLimited(socket.id, "audio", 10)) return;
+      // [FIX-RATELIMIT] Raised from 10/s → 15/s to match the new worklet chunk
+      // rate (~12 chunks/sec at 4096 samples / 48kHz). The old 10/s cap was set
+      // when chunks were 170ms (6/sec) — it silently dropped ~2 of every 12 new
+      // chunks on the Socket.IO fallback path, causing choppy audio.
+      // 15/s gives 25% headroom above the 12/sec nominal rate for TCP catch-up
+      // bursts while still blocking real abuse / runaway clients.
+      if (isSocketRateLimited(socket.id, "audio", 15)) return;
       // FIX AUDIO-03: إزالة socket.volatile
       // volatile كان يعني "لو الـ socket مشغول، اتجاهل الـ chunk" → أكبر سبب للتقطع
       // الآن كل chunk يُرسل بموثوقية كاملة
