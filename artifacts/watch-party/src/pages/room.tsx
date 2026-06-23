@@ -229,6 +229,12 @@ export default function Room() {
           if (!AudioCtxClass) return;
           const newCtx = new AudioCtxClass();
           audioPlayerRef.current = newCtx;
+          // [FIX-WORKLET-PRELOAD-RESUME] Also preload the worklet on the recreated
+          // context so the next mic toggle doesn't hit the 50-200ms addModule delay.
+          newCtx.audioWorklet
+            .addModule("/audio-processor.js")
+            .then(() => { workletModuleLoadedForCtxRef.current = audioPlayerRef.current; })
+            .catch(() => { /* non-fatal — toggleMic will retry */ });
           try {
             const buf = newCtx.createBuffer(1, newCtx.sampleRate, newCtx.sampleRate);
             const ch2 = buf.getChannelData(0);
@@ -766,6 +772,17 @@ export default function Room() {
         // as a voice-chat session which loses background audio playback permission.
         // Default (no hint) keeps the "music" session type that iOS allows in background.
         audioPlayerRef.current = new AudioCtxClass();
+
+        // [FIX-WORKLET-PRELOAD] Pre-load the worklet module right after context
+        // creation so it's cached by the time the user first presses the mic button.
+        // Without this, addModule() runs AFTER the mic press (50-200ms delay) and
+        // the opening syllable of the first sentence is silently dropped.
+        // toggleMic() guards with workletModuleLoadedForCtxRef so it won't reload.
+        audioPlayerRef.current.audioWorklet
+          .addModule("/audio-processor.js")
+          .then(() => { workletModuleLoadedForCtxRef.current = audioPlayerRef.current; })
+          .catch(() => { /* non-fatal — toggleMic will retry */ });
+
         // iOS keep-alive: loop a buffer with imperceptible low-level noise so iOS
         // detects a real audio signal and keeps the audio session alive on lock screen.
         // An all-zeros buffer (gain 0.0001) is indistinguishable from silence to iOS
@@ -980,8 +997,14 @@ export default function Room() {
       // لكن لما النت يقطع ويرجع، الـ stream تفضل active لكن الـ track
       // نفسه بيبقى readyState === "ended" أو muted، فالصوت يقطع بدون
       // ما الـ recovery تشتغل. الحل: نفحص التراكات نفسها كمان.
+      // [FIX-MUTED-FALSEPOSITIVE] Only treat readyState === "ended" as "dead".
+      // t.muted is a TEMPORARY state set by the OS during phone calls, Bluetooth
+      // headset switches, and audio-route changes — the OS clears it automatically
+      // seconds later. Treating muted as dead triggers a full 500ms mic teardown +
+      // restart on every phone call / BT connect, causing an audible gap for all
+      // peers. readyState === "ended" is permanent and IS the right signal to act on.
       const trackDead = stream?.getAudioTracks().some(
-        t => t.readyState === "ended" || t.muted
+        t => t.readyState === "ended"
       ) ?? false;
       // [FIX-BG-MIC] On iOS/Android the mic track can be silently killed while in
       // background. By the time visibilitychange fires on return, readyState may
@@ -1018,9 +1041,13 @@ export default function Room() {
         analyserRef.current = null;
         micEnabledRef.current = false;
         setMicEnabled(false);
+        // [FIX-DOUBLE-DISPATCH] Previously two dispatches fired simultaneously:
+        // one unconditional and one inside a setMicEnabled() updater — both called
+        // toggleMic before React re-rendered, starting two concurrent mic sessions
+        // (duplicate audio, resource leaks, state corruption). Fix: single dispatch,
+        // guarded by micEnabledRef (the synchronous source-of-truth), not React state.
         setTimeout(() => {
-          if (socketRef.current) {
-            setMicEnabled(prev => { if (!prev) document.dispatchEvent(new CustomEvent("wp:restartMic")); return prev; });
+          if (socketRef.current && !micEnabledRef.current) {
             document.dispatchEvent(new CustomEvent("wp:restartMic"));
           }
         }, 500);
@@ -1164,6 +1191,17 @@ export default function Room() {
       }
       prevOnlineMembersRef.current = new Set(updated.filter(m => m.isOnline).map(m => m.id));
       setMembers(updated);
+      // [FIX-IOS-PREEXIST] On iOS/Android, <audio> elements need an explicit .play()
+      // after a user gesture. peerMicEnabled only fires when a peer TOGGLES their
+      // mic — if someone was already speaking when we joined, we miss that event
+      // and their WebRTC audio never starts. Pre-unlock ALL online peers on every
+      // membersUpdate — preUnlockAudio just calls audio.play().catch() which is
+      // safe and a no-op when no track is attached yet.
+      updated.forEach(m => {
+        if (m.id !== myMemberId && m.isOnline) {
+          webrtcManagerRef.current?.preUnlockAudio(m.id);
+        }
+      });
       // On first membersUpdate, all users establish WebRTC connections so anyone can share.
       // Lower-ID-initiates rule avoids simultaneous offer collisions between peers.
       // Deferred via setTimeout to avoid blocking the main thread on Android during ICE gathering.
@@ -1600,7 +1638,15 @@ export default function Room() {
           // 20ms is small enough to schedule before the chunk's deadline and
           // large enough to avoid waking the event loop too aggressively.
           const LOOKAHEAD_S = 0.3; // schedule chunks up to 300ms ahead
-          const FADE_S = 0.005;    // 5ms fade-in/out to eliminate boundary clicks
+          const FADE_S = 0.003;    // 3ms fade-in only — no fade-out (see below)
+
+          // [FIX-DRAIN-GAP] Grace counter: keep the drain loop alive for up to
+          // 150ms of empty heap (7 × 20ms ticks) before stopping. Without this,
+          // any momentary pause in speech (even 1 TCP packet gap) stops the loop
+          // and the next chunk restarts it with a forced now+cushion delay, creating
+          // an audible ~60ms gap at the start of every resumed utterance.
+          let emptyTicks = 0;
+          const MAX_EMPTY_TICKS = 7; // 7 × 20ms = 140ms grace
 
           const drainTimer = setInterval(() => {
             const heap = jitterQueuesRef.current.get(fromMemberId);
@@ -1657,21 +1703,34 @@ export default function Room() {
                 try { fadeGain.disconnect(); } catch { /* ignore */ }
               }, { once: true });
 
+              // [FIX-FADE-DIP] Fade-in ONLY — no fade-out.
+              // The old approach faded gain to 0 at endAt and the next chunk faded
+              // in from 0 at the same instant → amplitude dip to 0 at every 85ms
+              // boundary, audible as a 12Hz tremolo / robotic flutter in continuous
+              // speech. Fix: ramp in from 0 on start, then hold at 1.0 for the full
+              // buffer duration. The AudioBufferSourceNode stops automatically when
+              // the buffer finishes (= endAt), so no explicit src.stop() is needed.
+              // With no fade-out, consecutive chunk boundaries are seamless.
               fadeGain.gain.setValueAtTime(0, startAt);
               fadeGain.gain.linearRampToValueAtTime(1.0, startAt + FADE_S);
-              fadeGain.gain.setValueAtTime(1.0, endAt - FADE_S);
-              fadeGain.gain.linearRampToValueAtTime(0, endAt);
 
               src.start(startAt);
-              src.stop(endAt);
+              // No src.stop() — buffer plays to natural end (= endAt implicitly).
               nextAudioTimeRef.current.set(fromMemberId, endAt);
             }
 
-            // Stop the drain loop when the heap has been empty for a while.
-            // We check size AFTER the drain above; if still empty, clean up.
+            // [FIX-DRAIN-GAP] Grace-period stop: only stop after MAX_EMPTY_TICKS
+            // consecutive empty-heap ticks. A single empty tick (heap momentarily
+            // drained between two network packets) no longer kills the loop,
+            // preventing the now+cushion restart-gap on the next chunk.
             if (heap.size === 0) {
-              clearInterval(drainTimer);
-              jitterDrainTimersRef.current.delete(fromMemberId);
+              emptyTicks++;
+              if (emptyTicks >= MAX_EMPTY_TICKS) {
+                clearInterval(drainTimer);
+                jitterDrainTimersRef.current.delete(fromMemberId);
+              }
+            } else {
+              emptyTicks = 0;
             }
           }, 20);
 
@@ -3243,20 +3302,23 @@ export default function Room() {
       // of audio followed by silence. Fix: enqueue outgoing chunks with timestamps;
       // a throttled drain loop sends ≤6/sec (server cap is 10/sec) and discards
       // chunks older than 500ms so stale audio from a TCP stall is silently dropped.
-      type ChunkQueueItem = { int16: Int16Array; seq: number; ts: number };
+      // [FIX-AUDIOTIME-FWD] audioTime from the worklet's audio-rendering clock is
+      // more accurate than Date.now() for jitter-buffer scheduling on the receiver.
+      // Previously it was received here but immediately discarded — never forwarded.
+      type ChunkQueueItem = { int16: Int16Array; seq: number; ts: number; audioTime?: number };
       const socketChunkQueue: ChunkQueueItem[] = [];
       // [FIX-LATENCY] Chunks are ~85ms (4096 samples at 48kHz) → ~12 chunks/sec.
       // Drain at ~12/sec (83ms interval) to keep pace with production rate.
       // Server cap is 15/sec so no chunks are dropped server-side.
-      // [FIX-WEAK-NET] SOCKET_MAX_AGE_MS raised 300ms → 500ms.
+      // [FIX-WEAK-NET] SOCKET_MAX_AGE_MS raised 300ms → 500ms → 800ms.
       // On genuinely weak connections (3G, congested Wi-Fi, high-latency VPN),
       // a chunk can be legitimately delayed 300-400ms in the TCP send buffer before
-      // the kernel flushes it — not due to stall, just slow path RTT. At 300ms we
-      // were silently discarding valid audio and producing choppy output on poor
-      // networks. 500ms keeps the original intent (drop truly stale/burst backlog)
-      // while giving real-world slow links enough headroom.
+      // the kernel flushes it — not due to stall, just slow path RTT. At 500ms we
+      // were still silently discarding valid audio on lossy mobile connections.
+      // 800ms gives real-world slow links enough headroom while still dropping
+      // truly stale burst backlogs from multi-second TCP stalls.
       const SOCKET_DRAIN_MS = 83; // ~12/sec — matches worklet production rate
-      const SOCKET_MAX_AGE_MS = 500;
+      const SOCKET_MAX_AGE_MS = 800;
       const socketDrainTimer = setInterval(() => {
         if (!micEnabledRef.current) return;
         // [FIX-MULTIROOM] Do NOT skip Socket.IO when WebRTC peers exist.
@@ -3273,7 +3335,7 @@ export default function Room() {
         }
         const item = socketChunkQueue.shift();
         if (!item) return;
-        socketRef.current?.emit("audioChunk", { sr: ctx.sampleRate, buf: item.int16.buffer, seq: item.seq });
+        socketRef.current?.emit("audioChunk", { sr: ctx.sampleRate, buf: item.int16.buffer, seq: item.seq, audioTime: item.audioTime });
       }, SOCKET_DRAIN_MS);
       // Attach to workletNode so stopMic can find and clear it
       (workletNode as unknown as { _drainTimer: ReturnType<typeof setInterval> })._drainTimer = socketDrainTimer;
@@ -3293,7 +3355,9 @@ export default function Room() {
         // WebRTC peers who have a live P2P connection to us will ignore our Socket.IO
         // chunks on their side (hasConnectedPeer check in audioChunk handler).
         // Push to queue; drain loop handles rate-limiting and age-based discard.
-        socketChunkQueue.push({ int16: e.data.int16, seq: e.data.seq, ts: Date.now() });
+        // [FIX-AUDIOTIME-FWD] Forward audioTime so the receiver can use the
+        // worklet's precise audio-rendering clock for jitter-buffer scheduling.
+        socketChunkQueue.push({ int16: e.data.int16, seq: e.data.seq, ts: Date.now(), audioTime: e.data.audioTime });
       };
       workletNodeRef.current = workletNode;
 

@@ -1243,7 +1243,7 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
         .emit("peerMicDisabled", { memberId: currentMemberId });
     });
 
-    socket.on("audioChunk", (payload: { sr: number; buf: ArrayBuffer; seq?: number }) => {
+    socket.on("audioChunk", (payload: { sr: number; buf: ArrayBuffer; seq?: number; audioTime?: number }) => {
       if (!currentRoomCode || !currentMemberId) return;
       // [FIX-MUTE-ENFORCE] Reject audio from a member the host/admin has muted,
       // even if a modified/misbehaving client keeps emitting "audioChunk" after
@@ -1267,12 +1267,15 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
       // volatile كان يعني "لو الـ socket مشغول، اتجاهل الـ chunk" → أكبر سبب للتقطع
       // الآن كل chunk يُرسل بموثوقية كاملة
       // [FIX-SEQ] Forward the sequence number so receivers can detect out-of-order delivery.
+      // [FIX-AUDIOTIME-FWD] Forward audioTime from the sender's worklet audio-rendering
+      // clock. Receivers use it for accurate jitter-buffer scheduling instead of
+      // arrival wall-clock time which drifts under main-thread CPU load.
       socket.to(currentRoomCode).emit("audioChunk", {
         fromMemberId: currentMemberId,
         sr: payload.sr,
         buf: payload.buf,
         seq: payload.seq,
-        ts: Date.now(),
+        audioTime: payload.audioTime,
       });
     });
 

@@ -67,7 +67,7 @@ const PUBLIC_FALLBACK_ICE_SERVERS: RTCIceServer[] = [
 // than the backend refreshes them, resulting in stale credentials on re-fetch.
 let cachedIceServers: RTCIceServer[] | null = null;
 let iceServersCacheExpiry = 0;
-const ICE_SERVERS_CACHE_TTL_MS = 4 * 60 * 1000;
+const ICE_SERVERS_CACHE_TTL_MS = 10 * 60 * 1000;
 
 /**
  * Fetches the real TURN/STUN server list from our backend (which holds the
@@ -497,8 +497,12 @@ export class WebRTCManager {
         // navigator.connection?.type (Network Information API, supported on Chrome/Android)
         // and use 4 s for cellular, 2 s for everything else. On browsers that don't
         // expose connection.type we conservatively default to 3 s.
+        // [FIX-ICE-DELAY] Reduced delays: cellular 4s→1.5s, known-type 2s→1s,
+        // unknown 3s→1.5s. The old 4s cellular delay was chosen to wait for OS-level
+        // reconnect, but in practice browsers self-recover within 1s or don't recover
+        // at all — waiting 4s just extended the silence window needlessly.
         const netType = (navigator as Navigator & { connection?: { type?: string } }).connection?.type;
-        const RECONNECT_DELAY_MS = netType === "cellular" ? 4000 : netType ? 2000 : 3000;
+        const RECONNECT_DELAY_MS = netType === "cellular" ? 1500 : netType ? 1000 : 1500;
         if (entry.reconnectTimer !== null) return; // already waiting
         entry.reconnectTimer = setTimeout(() => {
           entry.reconnectTimer = null;
