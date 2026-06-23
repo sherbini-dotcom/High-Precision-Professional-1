@@ -1458,6 +1458,11 @@ export default function Room() {
     socket.on("peerMicEnabled", ({ memberId }: { memberId: number }) => {
       // Resume audio player on any user interaction (required for iOS autoplay policy)
       if (audioPlayerRef.current?.state === "suspended") audioPlayerRef.current.resume().catch(() => {});
+      // [FIX-MIC-REOPEN] When a peer re-enables their mic, resume ALL WebRTC
+      // audio elements. On iOS/Android, <audio> elements can enter a paused state
+      // after being muted (track=null) and don't auto-resume when a track returns —
+      // the volume indicator shows signal but no sound is heard.
+      webrtcManagerRef.current?.resumeAllAudio();
       // Force reset next-play-time for this member so first chunk plays immediately
       nextAudioTimeRef.current.delete(memberId);
     });
