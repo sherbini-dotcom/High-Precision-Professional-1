@@ -67,7 +67,7 @@ const PUBLIC_FALLBACK_ICE_SERVERS: RTCIceServer[] = [
 // than the backend refreshes them, resulting in stale credentials on re-fetch.
 let cachedIceServers: RTCIceServer[] | null = null;
 let iceServersCacheExpiry = 0;
-const ICE_SERVERS_CACHE_TTL_MS = 10 * 60 * 1000;
+const ICE_SERVERS_CACHE_TTL_MS = 4 * 60 * 1000;
 
 /**
  * Fetches the real TURN/STUN server list from our backend (which holds the

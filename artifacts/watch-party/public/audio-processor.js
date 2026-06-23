@@ -126,8 +126,10 @@ class MicProcessor extends AudioWorkletProcessor {
       }
     }
 
-    // [FIX-VAD] VAD: skip silent frames to save bandwidth — unless forced.
-    if (!force && rms < VAD_THRESHOLD) return;
+    // VAD disabled — audio always sent without gating.
+    // Auto-calibrated threshold caused false cutouts on sensitive mics.
+    // Opus handles silence efficiency at the codec level instead.
+    void rms; void VAD_THRESHOLD; void force;
 
     // Convert float32 → int16 for compact network transfer.
     const int16 = new Int16Array(buf.length);
