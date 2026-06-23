@@ -607,7 +607,7 @@ export class WebRTCManager {
         // Delta-based calculation avoids cumulative skew (early loss inflating the
         // ratio forever even after the network recovers).
         type InboundAudioReport  = RTCInboundRtpStreamStats  & { packetsLost?: number; packetsReceived?: number };
-        type RemoteInboundReport = RTCRemoteInboundRtpStreamStats & { packetsLost?: number; kind?: string };
+        type RemoteInboundReport = RTCInboundRtpStreamStats & { packetsLost?: number; kind?: string };
         type OutboundAudioReport = RTCOutboundRtpStreamStats & { packetsSent?: number };
 
         let packetLoss = 0;
