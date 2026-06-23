@@ -20,8 +20,13 @@ export function getSocket(): Socket {
       reconnectionAttempts: Infinity,
       reconnectionDelay: 1000,
       reconnectionDelayMax: 5000,
-      // [FIX] Match server's new pingTimeout (20 s). Old 10 s caused false
-      // disconnects on weak connections before the server could respond.
+      // [FIX-COMMENT] `timeout` here is the Socket.IO connection/handshake timeout
+      // (how long a single connect/reconnect attempt waits), NOT the heartbeat
+      // pingTimeout — that's negotiated automatically by the server during the
+      // handshake and the client doesn't need to "match" it. The server currently
+      // runs pingInterval: 60s / pingTimeout: 90s for iOS background tolerance
+      // (see artifacts/api-server/src/lib/socket.ts). 20s here just avoids the
+      // client giving up on a single attempt too early on a slow/weak network.
       timeout: 20000,
       // [FIX] Allow upgrade from polling → WebSocket when WS initially fails.
       // upgrade:false meant the socket stayed on polling forever if it fell back,

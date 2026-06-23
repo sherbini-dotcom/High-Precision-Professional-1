@@ -16,6 +16,13 @@ interface PeerEntry {
   pendingCandidates: RTCIceCandidateInit[];
   screenSender: RTCRtpSender | null;
   screenAudioSender: RTCRtpSender | null;
+  // [FIX-ABR-SCOPE] Explicit reference to the MIC audio sender, kept separate
+  // from screenAudioSender. Previously the ABR loop (startAdaptiveBitrate)
+  // touched every sender with kind === "audio", which meant a bad mic packet-loss
+  // reading also throttled screen-share system audio (movie/game sound) down to
+  // 24 kbps even though that track's own delivery may be perfectly healthy.
+  // With this reference, mic ABR only ever adjusts the mic sender.
+  micAudioSender: RTCRtpSender | null;
   // Android: "disconnected" state timer — wait 5 s before attempting ICE restart
   // to allow transient network blips to self-recover before we intervene.
   reconnectTimer: ReturnType<typeof setTimeout> | null;
@@ -178,22 +185,49 @@ export function createVoiceActivityDetector(
 // usedtx=1 (discontinuous transmission) silences the stream during pauses,
 // saving bandwidth on weak connections — pairs well with our Worklet-side VAD.
 // cbr=0 (variable bitrate) lets Opus use fewer bits for silence/simple audio.
-function applyOpusParams(sdp: string): string {
-  const match = sdp.match(/a=rtpmap:(\d+) opus\/48000/i);
-  if (!match) return sdp;
+//
+// [FIX-OPUS-PTIME] ptime raised 10 → 20 ms. 10 ms doubles the packet rate for
+// the same audio duration vs the 20 ms default, which INCREASES relative
+// RTP/UDP/IP header overhead and gives packet loss more chances to hit any
+// given chunk of audio — the opposite of what we want on a weak connection.
+// 20 ms is the standard interval used by mainstream voice apps specifically
+// because it is more loss-resilient; minptime stays at 10 so a peer that
+// truly needs lower latency can still negotiate down.
+//
+// [FIX-OPUS-MULTI-AUDIO] Previously this used sdp.match()/sdp.replace() WITHOUT
+// the "g" flag, so only the FIRST "m=audio" section in the whole SDP ever got
+// these params — the SECOND audio section (e.g. screen-share system audio
+// running alongside the mic) had its original fmtp line stripped by the
+// global removal regex but never replaced, leaving it on un-tuned Opus
+// defaults (no bitrate cap, no FEC, no DTX). Fixed by splitting the SDP into
+// its m= sections and patching each "m=audio" section independently.
+function applyOpusParamsToSection(section: string): string {
+  const match = section.match(/a=rtpmap:(\d+) opus\/48000/i);
+  if (!match) return section;
   const pt = match[1];
-  let out = sdp.replace(new RegExp(`a=fmtp:${pt}[^\r\n]*\r\n`, "g"), "");
+  let out = section.replace(new RegExp(`a=fmtp:${pt}[^\r\n]*\r\n`, "g"), "");
   // maxaveragebitrate=64000: transparent mono voice; browsers cap higher values anyway
   // useinbandfec=1: packet-loss concealment built into the bitstream
   // usedtx=1: sends ~0 bps during silence (complements our Worklet VAD)
   // cbr=0: variable bitrate — fewer bits for silence/simple audio
-  // minptime=10,ptime=10: 10 ms packetisation — balances latency vs packet overhead
-  const fmtp = `a=fmtp:${pt} maxaveragebitrate=64000;useinbandfec=1;usedtx=1;cbr=0;minptime=10;ptime=10\r\n`;
+  // minptime=10,ptime=20: 20 ms packetisation — more loss-resilient on weak networks
+  const fmtp = `a=fmtp:${pt} maxaveragebitrate=64000;useinbandfec=1;usedtx=1;cbr=0;minptime=10;ptime=20\r\n`;
   out = out.replace(
     new RegExp(`(a=rtpmap:${pt} opus/48000[^\r\n]*\r\n)`, "i"),
     `$1${fmtp}`,
   );
   return out;
+}
+
+function applyOpusParams(sdp: string): string {
+  // Split right before every "m=" line so each section (m=audio / m=video, and
+  // everything that belongs to it) is patched independently, then re-joined.
+  const sections = sdp.split(/(?=\r\nm=)/);
+  return sections
+    .map((section) =>
+      /^\r?\n?m=audio/i.test(section) ? applyOpusParamsToSection(section) : section,
+    )
+    .join("");
 }
 
 // ─── WebRTC Manager ───────────────────────────────────────────────────────────
@@ -214,17 +248,20 @@ export class WebRTCManager {
     this.onRemoteScreenStream = onRemoteScreenStream ?? null;
   }
 
-  setStream(stream: MediaStream) {
+  setStream(stream: MediaStream | null) {
     this.localStream = stream;
     for (const [, entry] of this.peers) {
-      const senders = entry.pc.getSenders();
       const audioTrack = stream?.getAudioTracks()[0] ?? null;
-      const existingSender = senders.find((s) => s.track?.kind === "audio");
-      if (existingSender) {
-        if (audioTrack) existingSender.replaceTrack(audioTrack).catch(() => {});
-        else existingSender.replaceTrack(null).catch(() => {});
+      // [FIX-ABR-SCOPE] Use the tracked micAudioSender reference instead of
+      // `senders.find(s => s.track?.kind === "audio")`. The old lookup could
+      // grab the SCREEN-SHARE audio sender by mistake whenever the mic sender's
+      // track was momentarily null (e.g. between toggles) — replacing the
+      // wrong sender's track entirely.
+      if (entry.micAudioSender) {
+        if (audioTrack) entry.micAudioSender.replaceTrack(audioTrack).catch(() => {});
+        else entry.micAudioSender.replaceTrack(null).catch(() => {});
       } else if (audioTrack) {
-        entry.pc.addTrack(audioTrack, stream);
+        entry.micAudioSender = entry.pc.addTrack(audioTrack, stream as MediaStream);
       }
     }
   }
@@ -257,6 +294,8 @@ export class WebRTCManager {
         } else {
           entry.screenAudioSender = entry.pc.addTrack(audioTrack, stream);
         }
+        // [FIX-ABR-SCOPE] Fixed bitrate for screen-share audio, independent of mic ABR.
+        this.applyScreenAudioEncodingParams(entry);
       }
       this.applyVideoEncodingParams(entry.pc);
     }
@@ -310,14 +349,18 @@ export class WebRTCManager {
       pendingCandidates: [],
       screenSender: null,
       screenAudioSender: null,
+      micAudioSender: null,
       reconnectTimer: null,
     };
     this.peers.set(memberId, entry);
 
-    // Add local audio track if available
+    // Add local audio track if available.
+    // [FIX-ABR-SCOPE] Track the sender explicitly as micAudioSender so later
+    // bitrate adjustments (ABR) only ever target the mic, never screen-share audio.
     if (this.localStream) {
-      for (const track of this.localStream.getAudioTracks()) {
-        pc.addTrack(track, this.localStream);
+      const micTrack = this.localStream.getAudioTracks()[0];
+      if (micTrack) {
+        entry.micAudioSender = pc.addTrack(micTrack, this.localStream);
       }
     }
 
@@ -420,7 +463,8 @@ export class WebRTCManager {
           clearTimeout(entry.reconnectTimer);
           entry.reconnectTimer = null;
         }
-        this.applyAudioEncodingParams(pc);
+        this.applyAudioEncodingParams(entry);
+        this.applyScreenAudioEncodingParams(entry);
         this.applyVideoEncodingParams(pc);
         // ابدأ مراقبة الشبكة وتعديل الـ bitrate تلقائياً
         this.startAdaptiveBitrate(memberId, entry);
@@ -482,18 +526,38 @@ export class WebRTCManager {
     return entry;
   }
 
-  private applyAudioEncodingParams(pc: RTCPeerConnection, maxBitrate = 64_000) {
-    for (const sender of pc.getSenders()) {
-      if (sender.track?.kind !== "audio") continue;
-      const params = sender.getParameters();
-      if (!params.encodings?.length) params.encodings = [{}];
-      for (const enc of params.encodings) {
-        enc.maxBitrate = maxBitrate;
-        enc.priority = "high";
-        enc.networkPriority = "high";
-      }
-      sender.setParameters(params).catch(() => {});
+  // [FIX-ABR-SCOPE] Now takes the PeerEntry (not the raw RTCPeerConnection) and
+  // targets ONLY entry.micAudioSender. Previously this looped over every sender
+  // with kind === "audio", which also caught screenAudioSender — meaning mic
+  // packet loss silently throttled screen-share system audio (movie/game sound)
+  // down to 24 kbps even when that track's own delivery was perfectly fine.
+  private applyAudioEncodingParams(entry: PeerEntry, maxBitrate = 64_000) {
+    const sender = entry.micAudioSender;
+    if (!sender) return;
+    const params = sender.getParameters();
+    if (!params.encodings?.length) params.encodings = [{}];
+    for (const enc of params.encodings) {
+      enc.maxBitrate = maxBitrate;
+      enc.priority = "high";
+      enc.networkPriority = "high";
     }
+    sender.setParameters(params).catch(() => {});
+  }
+
+  // [FIX-ABR-SCOPE] Screen-share system audio gets its own fixed, generous
+  // bitrate independent of mic ABR — it has nothing to do with voice-chat
+  // network conditions and shouldn't be dragged down by them.
+  private applyScreenAudioEncodingParams(entry: PeerEntry, maxBitrate = 128_000) {
+    const sender = entry.screenAudioSender;
+    if (!sender) return;
+    const params = sender.getParameters();
+    if (!params.encodings?.length) params.encodings = [{}];
+    for (const enc of params.encodings) {
+      enc.maxBitrate = maxBitrate;
+      enc.priority = "high";
+      enc.networkPriority = "high";
+    }
+    sender.setParameters(params).catch(() => {});
   }
 
   // ─── Adaptive Bitrate ─────────────────────────────────────────────────────
@@ -543,7 +607,7 @@ export class WebRTCManager {
 
         // Tiered bitrate: >10% loss → 24kbps (minimum viable), >5% → 32kbps, else 64kbps
         const targetBitrate = packetLoss > 0.10 ? 24_000 : packetLoss > 0.05 ? 32_000 : 64_000;
-        this.applyAudioEncodingParams(entry.pc, targetBitrate);
+        this.applyAudioEncodingParams(entry, targetBitrate);
       } catch { /* ignore — peer may be closing */ }
     }, 5_000);
 
@@ -581,7 +645,7 @@ export class WebRTCManager {
     // Apply immediately to all connected peers
     for (const [, entry] of this.peers) {
       if (entry.pc.connectionState === "connected") {
-        this.applyAudioEncodingParams(entry.pc, this.manualBitrate);
+        this.applyAudioEncodingParams(entry, this.manualBitrate);
       }
     }
   }

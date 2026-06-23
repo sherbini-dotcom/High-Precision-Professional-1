@@ -419,6 +419,15 @@ export default function Room() {
   const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const micCompressorRef = useRef<DynamicsCompressorNode | null>(null);
   const micGainRef = useRef<GainNode | null>(null);
+  // [FIX-WEBRTC-PROCESSED-AUDIO] Destination node that receives the PROCESSED
+  // signal (compressor + makeup gain) and is what we actually hand to WebRTC.
+  // Previously WebRTCManager.setStream() was given the raw getUserMedia stream
+  // directly, so the entire compressor/gain chain built below only ever fed the
+  // volume meter and the Socket.IO fallback worklet — the common-case WebRTC
+  // path carried completely unprocessed audio (no AGC, since we disabled the
+  // browser's own AGC to avoid double-AGC with a compressor that, in practice,
+  // never reached that path). Now both paths hear the same processed signal.
+  const micDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
   const audioPlayerRef = useRef<AudioContext | null>(null);
   const silentKeepAliveRef = useRef<AudioBufferSourceNode | null>(null);
   const wasPlayingBeforeHiddenRef = useRef(false);
@@ -882,6 +891,11 @@ export default function Room() {
           workletNodeRef.current?.port.close();
           workletNodeRef.current?.disconnect();
           workletNodeRef.current = null;
+          // [FIX-WEBRTC-PROCESSED-AUDIO] Drop the WebRTC-bound track explicitly too —
+          // the destination node belongs to the AudioContext we're about to close.
+          webrtcManagerRef.current?.setStream(null);
+          micDestRef.current?.stream.getTracks().forEach(t => t.stop());
+          micDestRef.current = null;
           if (audioContextRef.current?.state !== "closed") audioContextRef.current?.close().catch(() => {});
           audioContextRef.current = null;
           analyserRef.current = null;
@@ -956,13 +970,16 @@ export default function Room() {
           // silently breaks again after every network change (Wi-Fi ↔ mobile data,
           // VPN toggle, airplane mode):
           //
-          // 1. Re-attach the live mic stream to the NEW manager. setStream() was
-          //    only ever called once, in toggleMic(); the new manager starts with
+          // 1. Re-attach the live PROCESSED mic stream to the NEW manager. setStream()
+          //    was only ever called once, in toggleMic(); the new manager starts with
           //    localStream = null, so any peer it creates would carry no audio —
           //    the exact same bug as the original missing setStream() call, just
           //    triggered by manager recreation instead of by toggleMic never being wired up.
-          if (micEnabledRef.current && micStreamRef.current) {
-            newManager.setStream(micStreamRef.current);
+          //    [FIX-WEBRTC-PROCESSED-AUDIO] Use micDestRef (post compressor/gain), not
+          //    the raw micStreamRef, so re-negotiated peers keep the same processed
+          //    audio quality instead of silently dropping back to an unprocessed track.
+          if (micEnabledRef.current && micDestRef.current) {
+            newManager.setStream(micDestRef.current.stream);
           }
 
           // 2. Re-initiate offers to existing online peers. webrtcInitiatedRef is
@@ -2729,6 +2746,18 @@ export default function Room() {
     workletNodeRef.current = null;
     try { analyserRef.current?.disconnect(); } catch { /* ignore */ }
     analyserRef.current = null;
+    // [FIX-WEBRTC-PROCESSED-AUDIO] Explicitly remove the audio track from every
+    // WebRTC sender AND stop the destination node's track. Previously the only
+    // thing silencing the WebRTC side was the raw getUserMedia track ending
+    // (which happened to also be the track attached to the sender); now that
+    // WebRTC is fed by a separate MediaStreamDestination track, both must be
+    // torn down explicitly. This also closes most of the gap where a mute
+    // ("forceMuted") only stopped the local capture but never told WebRTC
+    // peer connections to drop the track immediately.
+    webrtcManagerRef.current?.setStream(null);
+    micDestRef.current?.stream.getTracks().forEach(t => t.stop());
+    try { micDestRef.current?.disconnect(); } catch { /* ignore */ }
+    micDestRef.current = null;
     try { micGainRef.current?.disconnect(); } catch { /* ignore */ }
     micGainRef.current = null;
     try { micCompressorRef.current?.disconnect(); } catch { /* ignore */ }
@@ -2757,14 +2786,6 @@ export default function Room() {
       // permission itself was fine.
       const stream = await getMicStream();
       micStreamRef.current = stream;
-      // [FIX-WEBRTC-AUDIO] Attach the mic track to the WebRTCManager so peer
-      // connections actually carry audio. Previously setStream() was never called,
-      // so RTCPeerConnections never had an audio sender — once a peer reached
-      // "connected" state the Socket.IO fallback path below was disabled (to avoid
-      // double-audio/echo) while WebRTC silently carried no audio at all, resulting
-      // in total silence. setStream() adds the track to existing peers and is also
-      // picked up automatically for any new peer created afterwards.
-      webrtcManagerRef.current?.setStream(stream);
       socketRef.current?.emit("micEnabled");
 
       // [FIX-CTX-REUSE] Reuse the shared audioPlayerRef AudioContext for mic capture
@@ -2785,7 +2806,7 @@ export default function Room() {
       const source = ctx.createMediaStreamSource(stream);
       micSourceRef.current = source;
 
-      // ── Signal chain: source → compressor → makeup gain → analyser/worklet ──
+      // ── Signal chain: source → compressor → makeup gain → analyser/worklet/WebRTC ──
       // [FIX-CHAIN] OLD order was: source → gain(1.5) → compressor → analyser/worklet
       //   Problem: feeding gain BEFORE the compressor means loud transients (>-20dBFS)
       //   hit the compressor 1.5× hotter. The 3ms attack can't catch fast consonants
@@ -2822,6 +2843,22 @@ export default function Room() {
       compressor.connect(micGain);
       micGain.connect(analyser);
 
+      // [FIX-WEBRTC-PROCESSED-AUDIO] Feed the PROCESSED (compressor + makeup gain)
+      // signal into WebRTC instead of the raw getUserMedia track. Previously
+      // webrtcManagerRef.setStream(stream) was called with the raw stream — the
+      // compressor/gain chain above only ever reached the volume meter and the
+      // Socket.IO fallback worklet below, so on a healthy connection (WebRTC,
+      // the common case) peers heard completely unprocessed audio with no AGC
+      // (browser AGC is deliberately off — see getMicStream) and no replacement
+      // gain control, while the WEAK-network fallback path got the nicer,
+      // boosted signal. That's backwards: the common case should get the
+      // processed audio, not the fallback. createMediaStreamDestination() lets
+      // a Web Audio graph hand a real MediaStreamTrack to WebRTC.
+      const micDest = ctx.createMediaStreamDestination();
+      micGain.connect(micDest);
+      micDestRef.current = micDest;
+      webrtcManagerRef.current?.setStream(micDest.stream);
+
       // ── PCM capture via AudioWorklet ──────────────────────────────────────
       // Worklet runs in a dedicated audio thread — isolated from React/network.
       // VAD and int16 conversion happen inside the worklet.
@@ -2829,7 +2866,7 @@ export default function Room() {
       await ctx.audioWorklet.addModule("/audio-processor.js");
       const workletNode = new AudioWorkletNode(ctx, "mic-processor");
       // Connect from the gain node (post-compression) so the worklet captures
-      // the same signal level that the analyser sees.
+      // the same signal level that the analyser and WebRTC destination see.
       micGain.connect(workletNode);
 
       // [FIX-SOCKET-FALLBACK] Socket.IO is TCP-based — under congestion it queues
