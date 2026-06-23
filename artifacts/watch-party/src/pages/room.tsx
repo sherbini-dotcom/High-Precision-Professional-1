@@ -2951,13 +2951,20 @@ export default function Room() {
         settled = true;
         clearTimeout(timeoutId);
         worklet.port.onmessage = prevHandler;
-        if (!hadConnectedPeers) {
-          socketRef.current?.emit("audioChunk", {
-            sr: sampleRateAtStop,
-            buf: e.data.int16.buffer,
-            seq: e.data.seq,
-          });
-        }
+        // [FIX-MULTIROOM-FLUSH] Always emit the final flush chunk via Socket.IO,
+        // even when WebRTC peers are connected. The drain loop (every 83ms) was
+        // already updated by [FIX-MULTIROOM] to remove the hadConnectedPeers guard
+        // so non-WebRTC peers in 3+ member rooms receive audio. The flush path
+        // must use the same rule — otherwise the last partial speech buffer (the
+        // last syllable before the user presses mute) is silently dropped for any
+        // peer on the Socket.IO fallback path whenever WebRTC peers exist.
+        // Receiver-side filtering (hasConnectedPeer) correctly ignores the copy
+        // for peers who already have the audio via WebRTC.
+        socketRef.current?.emit("audioChunk", {
+          sr: sampleRateAtStop,
+          buf: e.data.int16.buffer,
+          seq: e.data.seq,
+        });
         finishTeardown();
       };
       worklet.port.onmessage = onFlushResponse;
@@ -3187,6 +3194,17 @@ export default function Room() {
         setSpeakingState(prev => ({ ...prev, [myMemberId]: vol }));
       }, 200);
     } catch {
+      // [FIX-REF-RESET] Reset micEnabledRef synchronously before any cleanup so
+      // all guards below evaluate correctly. micEnabledRef.current was set to true
+      // at the top of toggleMic() as a pre-async reservation (FIX-RACE-TOGGLE-ENABLE).
+      // If any await in the try block throws, we never reach setMicEnabled(true),
+      // so the ref must return to false to match the React state. Without this reset:
+      //   • setStream(null) is guarded by `!micEnabledRef.current` → evaluates false
+      //     → SKIPPED → WebRTC peers keep streaming from the now-dead micDest track
+      //     (tracks stopped below, but senders still attached) until the next
+      //     successful mic enable. Every connected peer receives dead/silent audio.
+      //   • audioContextRef guard also evaluates false → skipped (safe but misleading).
+      micEnabledRef.current = false;
       // [FIX-CATCH-CLEANUP] Clean up any audio graph nodes that were already set
       // up before the failure. Previously, if addModule() threw (e.g. worklet file
       // not served, network blip), WebRTC was already sending audio via the
