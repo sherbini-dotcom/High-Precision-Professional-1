@@ -272,22 +272,38 @@ export class WebRTCManager {
     this.onNetworkQuality = onNetworkQuality ?? null;
   }
 
-  setStream(stream: MediaStream | null) {
+  // [FIX-P2] async so callers can await the full track-switch before proceeding.
+  // Collecting all replaceTrack() promises and awaiting them with Promise.all
+  // ensures the browser's media engine has committed the new track on every peer
+  // before this method returns — eliminating the 200-500ms silence window that
+  // occurred on iOS/Android when the old fire-and-forget calls returned while the
+  // engine was still mid-switch.
+  async setStream(stream: MediaStream | null): Promise<void> {
     this.localStream = stream;
+    const audioTrack = stream?.getAudioTracks()[0] ?? null;
+    const promises: Promise<void>[] = [];
     for (const [, entry] of this.peers) {
-      const audioTrack = stream?.getAudioTracks()[0] ?? null;
       // [FIX-ABR-SCOPE] Use the tracked micAudioSender reference instead of
       // `senders.find(s => s.track?.kind === "audio")`. The old lookup could
       // grab the SCREEN-SHARE audio sender by mistake whenever the mic sender's
       // track was momentarily null (e.g. between toggles) — replacing the
       // wrong sender's track entirely.
       if (entry.micAudioSender) {
-        if (audioTrack) entry.micAudioSender.replaceTrack(audioTrack).catch(() => {});
-        else entry.micAudioSender.replaceTrack(null).catch(() => {});
+        // [FIX-P2] Collect promise instead of fire-and-forget .catch(() => {})
+        promises.push(
+          (audioTrack
+            ? entry.micAudioSender.replaceTrack(audioTrack)
+            : entry.micAudioSender.replaceTrack(null)
+          ).catch(() => {}),
+        );
       } else if (audioTrack) {
+        // [FIX-P3] Last-resort: createPeer() pre-creates the sender via
+        // addTransceiver so this branch is now rarely hit (only if the peer
+        // was created by a version of the code that didn't pre-create it).
         entry.micAudioSender = entry.pc.addTrack(audioTrack, stream as MediaStream);
       }
     }
+    await Promise.all(promises);
   }
 
   // ─── Screen Share ───────────────────────────────────────────────────────────
@@ -378,13 +394,29 @@ export class WebRTCManager {
     };
     this.peers.set(memberId, entry);
 
-    // Add local audio track if available.
+    // [FIX-P3] Always pre-create an audio transceiver, even when the mic is off.
+    // Previously: addTrack() was only called when this.localStream was non-null,
+    // so a peer that joined while the mic was off got no micAudioSender. When the
+    // user later turned the mic on, setStream() fell into the addTrack() branch
+    // which triggers full SDP renegotiation (offer/answer round-trip, ~500ms-1s
+    // on mobile) — producing a long silence window or no audio at all.
+    //
+    // Fix: addTransceiver("audio") always reserves a sender slot. setStream() can
+    // then always use replaceTrack() (no renegotiation needed, near-instant switch).
+    // If the mic is already on when the peer connects, replaceTrack() attaches the
+    // live track immediately; if it's off, the sender stays with a null track until
+    // the user opens the mic.
+    //
     // [FIX-ABR-SCOPE] Track the sender explicitly as micAudioSender so later
     // bitrate adjustments (ABR) only ever target the mic, never screen-share audio.
-    if (this.localStream) {
-      const micTrack = this.localStream.getAudioTracks()[0];
-      if (micTrack) {
-        entry.micAudioSender = pc.addTrack(micTrack, this.localStream);
+    {
+      const micTransceiver = pc.addTransceiver("audio", { direction: "sendrecv" });
+      entry.micAudioSender = micTransceiver.sender;
+      if (this.localStream) {
+        const micTrack = this.localStream.getAudioTracks()[0];
+        if (micTrack) {
+          micTransceiver.sender.replaceTrack(micTrack).catch(() => {});
+        }
       }
     }
 

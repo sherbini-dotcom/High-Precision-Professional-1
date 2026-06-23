@@ -1068,7 +1068,9 @@ export default function Room() {
           //    "wp:restartMic" rebuild will call setStream() on this same manager once
           //    a fresh mic stream exists.
           if (!micWasDead && micEnabledRef.current && micDestRef.current) {
-            newManager.setStream(micDestRef.current.stream);
+            // [FIX-P2] void — this runs inside a socket event handler (sync context).
+            // The Promise resolves asynchronously; we don't need to wait for it here.
+            void newManager.setStream(micDestRef.current.stream);
           }
 
           // 2. Re-initiate offers to existing online peers. webrtcInitiatedRef is
@@ -2883,8 +2885,10 @@ export default function Room() {
       // If the user reopened the mic before this timer fired, the new
       // setStream(micDest.stream) call in toggleMic is already active — calling
       // setStream(null) here would silence that freshly-started session.
+      // [FIX-P2] void the promise — finishTeardown is a sync callback inside a
+      // setTimeout; awaiting would not help since we're not in an async function.
       if (!micEnabledRef.current) {
-        webrtcManagerRef.current?.setStream(null);
+        void webrtcManagerRef.current?.setStream(null);
       }
       capturedMicDest?.stream.getTracks().forEach(t => t.stop());
       try { capturedMicDest?.disconnect(); } catch { /* ignore */ }
@@ -3043,7 +3047,10 @@ export default function Room() {
       const micDest = ctx.createMediaStreamDestination();
       micGain.connect(micDest);
       micDestRef.current = micDest;
-      webrtcManagerRef.current?.setStream(micDest.stream);
+      // [FIX-P2] await setStream so all replaceTrack() calls complete before we
+      // proceed to addModule/worklet — guarantees the browser's media engine has
+      // committed the new track on every connected peer with no silence gap.
+      await webrtcManagerRef.current?.setStream(micDest.stream);
 
       // ── PCM capture via AudioWorklet ──────────────────────────────────────
       // Worklet runs in a dedicated audio thread — isolated from React/network.
@@ -3139,7 +3146,10 @@ export default function Room() {
       // everything down so the next toggle starts from a clean state.
       micStreamRef.current?.getTracks().forEach(t => t.stop());
       micStreamRef.current = null;
-      if (!micEnabledRef.current) webrtcManagerRef.current?.setStream(null);
+      // [FIX-P2] void the promise — catch block is sync-style cleanup, awaiting
+      // here would delay the error feedback. setStream is async but the track switch
+      // failure is not critical during teardown.
+      if (!micEnabledRef.current) void webrtcManagerRef.current?.setStream(null);
       micDestRef.current?.stream.getTracks().forEach(t => t.stop());
       try { micDestRef.current?.disconnect(); } catch { /* ignore */ }
       micDestRef.current = null;
