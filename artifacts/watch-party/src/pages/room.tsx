@@ -1700,7 +1700,22 @@ export default function Room() {
           for (const id of batch) delete n[id];
           return n;
         });
-        for (const id of batch) webrtcManagerRef.current?.removePeer(id);
+        // [FIX-COMPRESSOR-LEAK] A member who disconnects abruptly (browser crash,
+        // network drop, tab killed) never sends "micDisabled" → peerMicDisabled
+        // never fires → their DynamicsCompressorNode stays connected inside
+        // speakerCompressorsRef indefinitely. Over a long session with many
+        // join/leave cycles this accumulates zombie nodes that hold references
+        // to the AudioContext internals and waste memory. Clean up all audio state
+        // here, mirroring exactly what peerMicDisabled does, so the next time
+        // this member joins and enables mic a fresh compressor is created.
+        for (const id of batch) {
+          nextAudioTimeRef.current.delete(id);
+          lastAudioSeqRef.current.delete(id);
+          jitterCushionRef.current.delete(id);
+          speakerCompressorsRef.current.get(id)?.disconnect();
+          speakerCompressorsRef.current.delete(id);
+          webrtcManagerRef.current?.removePeer(id);
+        }
       }, 100); // 100 ms debounce — batches mass-exit cascade into one update
     });
     socket.on("forceMuted", () => {
