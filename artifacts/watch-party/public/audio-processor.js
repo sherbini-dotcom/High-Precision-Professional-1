@@ -19,9 +19,13 @@
  */
 
 // ── VAD constants ─────────────────────────────────────────────────────────────
-// Default RMS ≈ -42 dBFS — real speech is always above this.
+// [FIX-VAD-THRESHOLD] Reduced from 0.008 (-42 dBFS) to 0.004 (-48 dBFS).
+// On low-sensitivity microphones (many mid-range Android devices), quiet speech
+// and the first syllable of utterances fell below 0.008, causing the opening
+// consonant to be silently dropped by the worklet. 0.004 still rejects true
+// silence (noise floor is typically < 0.001) while capturing softer voices.
 // Can be overridden at runtime via port.postMessage({ type: "setThreshold", value: N }).
-let VAD_THRESHOLD = 0.008;
+let VAD_THRESHOLD = 0.004;
 
 // [FIX-LATENCY] Accumulate ~85 ms of audio before sending (4096 samples at 48 kHz).
 // AudioWorklet delivers 128 frames per process() call → 32 calls per chunk (~12/sec).

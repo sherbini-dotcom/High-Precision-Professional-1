@@ -2845,6 +2845,13 @@ export default function Room() {
   }, [isConnected]);
 
   const stopMic = useCallback(() => {
+    // [FIX-REF-SYNC] Set the ref to false synchronously BEFORE any async work.
+    // stopMic() calls setMicEnabled(false) which is a React state update — the
+    // corresponding useEffect that syncs micEnabledRef only runs after the next
+    // render. If finishTeardown() fires (60ms later) before that render, the ref
+    // still reads true and the setStream(null) guard is skipped, leaving a dead
+    // track attached to every WebRTC peer connection. Setting it here closes the gap.
+    micEnabledRef.current = false;
     if (micIntervalRef.current) { clearInterval(micIntervalRef.current); micIntervalRef.current = null; }
     micStreamRef.current?.getTracks().forEach(t => t.stop());
     micStreamRef.current = null;
@@ -2968,6 +2975,16 @@ export default function Room() {
     if (micEnabled) { stopMic(); return; }
     const myMember = membersRef.current.find(m => m.id === myMemberId);
     if (myMember?.isMuted) return;
+    // [FIX-RACE-TOGGLE-ENABLE] Reserve the "mic is on" slot synchronously BEFORE
+    // any await. Without this, a rapid off→on toggle within the 60ms flush window
+    // leaves micEnabledRef.current = false while async work (addModule: 50-200ms)
+    // is still in flight. When finishTeardown() fires at t=60ms, it sees the ref
+    // as false and calls setStream(null) — silencing the brand-new mic session
+    // AFTER setStream(micDest.stream) was already called. The UI's analyser keeps
+    // running (driven by the local RMS interval) so the volume bar appears active
+    // for all participants, but no audio actually reaches any peer — the exact
+    // symptom reported: "مؤشر الصوت شغّال بس الكل مش بيسمع".
+    micEnabledRef.current = true;
     try {
       // [FIX-MIC-FALLBACK] Use the shared getMicStream() helper (3-tier constraint
       // fallback: full constraints → relaxed → audio:true). Previously this called
@@ -3087,9 +3104,15 @@ export default function Room() {
       // [FIX-LATENCY] Chunks are ~85ms (4096 samples at 48kHz) → ~12 chunks/sec.
       // Drain at ~12/sec (83ms interval) to keep pace with production rate.
       // Server cap is 15/sec so no chunks are dropped server-side.
-      // SOCKET_MAX_AGE_MS reduced 500ms → 300ms: stale 85ms chunks go cold fast.
+      // [FIX-WEAK-NET] SOCKET_MAX_AGE_MS raised 300ms → 500ms.
+      // On genuinely weak connections (3G, congested Wi-Fi, high-latency VPN),
+      // a chunk can be legitimately delayed 300-400ms in the TCP send buffer before
+      // the kernel flushes it — not due to stall, just slow path RTT. At 300ms we
+      // were silently discarding valid audio and producing choppy output on poor
+      // networks. 500ms keeps the original intent (drop truly stale/burst backlog)
+      // while giving real-world slow links enough headroom.
       const SOCKET_DRAIN_MS = 83; // ~12/sec — matches worklet production rate
-      const SOCKET_MAX_AGE_MS = 300;
+      const SOCKET_MAX_AGE_MS = 500;
       const socketDrainTimer = setInterval(() => {
         if (!micEnabledRef.current) return;
         // [FIX-MULTIROOM] Do NOT skip Socket.IO when WebRTC peers exist.
