@@ -135,48 +135,6 @@ export async function getMicStream(): Promise<MediaStream> {
   return navigator.mediaDevices.getUserMedia({ audio: true, video: false });
 }
 
-// ─── Voice Activity Detector ──────────────────────────────────────────────────
-export function createVoiceActivityDetector(
-  stream: MediaStream,
-  onVolume: (volume: number) => void,
-): () => void {
-  let animFrame: number;
-  let stopped = false;
-
-  const AudioCtxClass =
-    window.AudioContext ||
-    (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-  const ctx = new AudioCtxClass({ latencyHint: "interactive" });
-  const source = ctx.createMediaStreamSource(stream);
-  const analyser = ctx.createAnalyser();
-  analyser.fftSize = 512;
-  analyser.smoothingTimeConstant = 0.3;
-  source.connect(analyser);
-
-  const buffer = new Uint8Array(analyser.frequencyBinCount);
-
-  function tick() {
-    if (stopped) return;
-    analyser.getByteFrequencyData(buffer);
-    const binHz = ctx.sampleRate / analyser.fftSize;
-    const startBin = Math.floor(80 / binHz);
-    const endBin = Math.min(Math.floor(3000 / binHz), buffer.length - 1);
-    let sum = 0;
-    for (let i = startBin; i <= endBin; i++) sum += buffer[i];
-    const avg = sum / (endBin - startBin + 1);
-    onVolume(Math.round((avg / 255) * 100));
-    animFrame = requestAnimationFrame(tick);
-  }
-
-  ctx.resume().then(() => { animFrame = requestAnimationFrame(tick); });
-
-  return () => {
-    stopped = true;
-    cancelAnimationFrame(animFrame);
-    source.disconnect();
-    ctx.close();
-  };
-}
 
 // ─── SDP: Force Opus with Optimal Parameters ──────────────────────────────────
 // [FIX-OPUS] maxaveragebitrate reduced from 510000 → 64000 bps (Opus spec maximum
@@ -208,10 +166,13 @@ function applyOpusParamsToSection(section: string): string {
   let out = section.replace(new RegExp(`a=fmtp:${pt}[^\r\n]*\r\n`, "g"), "");
   // maxaveragebitrate=64000: transparent mono voice; browsers cap higher values anyway
   // useinbandfec=1: packet-loss concealment built into the bitstream
-  // usedtx=1: sends ~0 bps during silence (complements our Worklet VAD)
+  // usedtx=0: DTX disabled — worklet VAD already handles silence detection;
+  //           Opus DTX can worsen recovery from packet loss (first frame after
+  //           silence has no redundancy protection). Worklet VAD is the sole
+  //           silence gate so we avoid the double-DTX problem.
   // cbr=0: variable bitrate — fewer bits for silence/simple audio
   // minptime=10,ptime=20: 20 ms packetisation — more loss-resilient on weak networks
-  const fmtp = `a=fmtp:${pt} maxaveragebitrate=64000;useinbandfec=1;usedtx=1;cbr=0;minptime=10;ptime=20\r\n`;
+  const fmtp = `a=fmtp:${pt} maxaveragebitrate=64000;useinbandfec=1;usedtx=0;cbr=0;minptime=10;ptime=20\r\n`;
   out = out.replace(
     new RegExp(`(a=rtpmap:${pt} opus/48000[^\r\n]*\r\n)`, "i"),
     `$1${fmtp}`,
@@ -652,33 +613,38 @@ export class WebRTCManager {
         const prevStats = this.abrPrevStats.get(memberId)
           ?? { inLost: 0, inRecv: 0, outLost: 0, outSent: 0 };
 
-        // Collect outbound SSRC→packetsSent for matching with remote-inbound reports
-        const outboundSentBySsrc = new Map<number, number>();
-        stats.forEach((report) => {
-          if (report.type === "outbound-rtp" && (report as RTCOutboundRtpStreamStats).kind === "audio") {
-            const r = report as OutboundAudioReport;
-            if (r.ssrc !== undefined) outboundSentBySsrc.set(r.ssrc, r.packetsSent ?? 0);
-          }
-        });
-
         let inLost = prevStats.inLost, inRecv = prevStats.inRecv;
         let outLost = prevStats.outLost, outSent = prevStats.outSent;
 
+        // [FIX-ABR-INBOUND] Inbound loss: what WE receive from the remote peer (download).
         stats.forEach((report) => {
           if (report.type === "inbound-rtp" && (report as RTCInboundRtpStreamStats).kind === "audio") {
             const r = report as InboundAudioReport;
             inLost = r.packetsLost ?? inLost;
             inRecv = r.packetsReceived ?? inRecv;
           }
-          // remote-inbound-rtp: RTCP feedback from the remote peer about what they received from us
-          if (report.type === "remote-inbound-rtp") {
-            const r = report as RemoteInboundReport;
-            if (r.kind === "audio" || (r.ssrc !== undefined && outboundSentBySsrc.has(r.ssrc))) {
-              outLost = r.packetsLost ?? outLost;
-              outSent = r.ssrc !== undefined ? (outboundSentBySsrc.get(r.ssrc) ?? outSent) : outSent;
-            }
-          }
         });
+
+        // [FIX-ABR-OUTBOUND-ISOLATED] Use micAudioSender.getStats() for outbound measurement
+        // so we only see the mic sender's stats — never screen-share audio stats.
+        // Previously pc.getStats() returned ALL audio senders (mic + screen audio) and the
+        // remote-inbound-rtp lookup could mix them, making a healthy mic look lossy whenever
+        // screen audio was degraded, or vice-versa.
+        if (entry.micAudioSender) {
+          try {
+            const micSenderStats = await entry.micAudioSender.getStats();
+            micSenderStats.forEach((report) => {
+              if (report.type === "outbound-rtp") {
+                const r = report as OutboundAudioReport;
+                outSent = r.packetsSent ?? outSent;
+              }
+              if (report.type === "remote-inbound-rtp") {
+                const r = report as RemoteInboundReport;
+                outLost = r.packetsLost ?? outLost;
+              }
+            });
+          } catch { /* sender may be closing */ }
+        }
 
         // Delta download loss
         const dInLost  = Math.max(0, inLost  - prevStats.inLost);
@@ -697,9 +663,18 @@ export class WebRTCManager {
 
         this.abrPrevStats.set(memberId, { inLost, inRecv, outLost, outSent });
 
-        // Tiered bitrate: >10% loss → 24kbps (minimum viable), >5% → 32kbps, else 64kbps
-        const targetBitrate = packetLoss > 0.10 ? 24_000 : packetLoss > 0.05 ? 32_000 : 64_000;
-        this.applyAudioEncodingParams(entry, targetBitrate);
+        // [FIX-MANUAL-OVERRIDE] Respect manual quality preset: if the user explicitly
+        // chose a quality tier, do NOT override it with ABR. Manual preset is sticky
+        // until explicitly cleared with setManualQuality(null).
+        // Previously the ABR interval always wrote its own targetBitrate every 3s,
+        // silently overwriting any manual selection 3 seconds after it was applied.
+        if (this.manualBitrate !== null) {
+          this.applyAudioEncodingParams(entry, this.manualBitrate);
+        } else {
+          // Tiered bitrate: >10% loss → 24kbps (minimum viable), >5% → 32kbps, else 64kbps
+          const targetBitrate = packetLoss > 0.10 ? 24_000 : packetLoss > 0.05 ? 32_000 : 64_000;
+          this.applyAudioEncodingParams(entry, targetBitrate);
+        }
 
         // ── Network Quality Indicator ────────────────────────────────────────
         // نطلق الـ callback مع جودة الشبكة بناءً على packet loss.
@@ -727,7 +702,10 @@ export class WebRTCManager {
           this.onNetworkQuality(worstQuality);
         }
       } catch { /* ignore — peer may be closing */ }
-    }, 5_000);
+    // [FIX-ABR-INTERVAL] Reduced from 5s → 3s: faster detection of network
+    // degradation means we reduce bitrate sooner and the user hears less
+    // artefacts. 3s is enough averaging time to avoid thrashing on transient loss.
+    }, 3_000);
 
     this.abrIntervals.set(memberId, interval);
   }
@@ -739,6 +717,19 @@ export class WebRTCManager {
       if (entry.pc.connectionState === "connected") return true;
     }
     return false;
+  }
+
+  // ─── hasConnectedPeer (per-member) ───────────────────────────────────────
+  // [FIX-MULTIROOM] Checks if a SPECIFIC member has an active WebRTC connection.
+  // Used on the RECEIVER side in the audioChunk handler: if we have a live P2P
+  // connection with the sender (fromMemberId), we can safely ignore their
+  // Socket.IO chunk since the audio is already arriving via the WebRTC path.
+  // This prevents double-audio on WebRTC peers while still letting non-WebRTC
+  // peers (who don't appear in our peers map as "connected") receive audio
+  // through the Socket.IO jitter buffer — fixing the 3+ member blackout bug.
+  hasConnectedPeer(memberId: number): boolean {
+    const entry = this.peers.get(memberId);
+    return entry?.pc.connectionState === "connected";
   }
 
   // ─── forceIceRestart ─────────────────────────────────────────────────────

@@ -1482,6 +1482,11 @@ export default function Room() {
       const ctx = audioPlayerRef.current;
       if (!ctx) return;
       if (fromMemberId === myMemberId) return;
+      // [FIX-MULTIROOM] If we have a live WebRTC P2P connection with this sender,
+      // their audio is already arriving via the WebRTC audio element — ignore the
+      // Socket.IO copy to prevent double-audio. Peers without WebRTC will NOT match
+      // this check and will correctly receive via the jitter buffer below.
+      if (webrtcManagerRef.current?.hasConnectedPeer(fromMemberId)) return;
       if (ctx.state === "suspended") ctx.resume().catch(() => {});
 
       // [FIX-SEQ] Discard out-of-order packets on lossy/weak connections.
@@ -3087,7 +3092,13 @@ export default function Room() {
       const SOCKET_MAX_AGE_MS = 300;
       const socketDrainTimer = setInterval(() => {
         if (!micEnabledRef.current) return;
-        if (webrtcManagerRef.current?.hasConnectedPeers()) { socketChunkQueue.length = 0; return; }
+        // [FIX-MULTIROOM] Do NOT skip Socket.IO when WebRTC peers exist.
+        // In a 3+ member room, some peers may be connected via WebRTC (P2P) while
+        // others are not. The old hasConnectedPeers() guard blocked Socket.IO for
+        // EVERYONE as soon as ONE peer had WebRTC — meaning non-WebRTC peers went
+        // permanently silent. Fix: always send via Socket.IO so the server can relay
+        // to all non-WebRTC members. Peers that DO have a live WebRTC connection with
+        // us will skip the Socket.IO chunk on their receiver side (hasConnectedPeer check).
         const now = Date.now();
         // Discard chunks that have been waiting too long (TCP stall backlog)
         while (socketChunkQueue.length > 0 && now - socketChunkQueue[0].ts > SOCKET_MAX_AGE_MS) {
@@ -3102,8 +3113,9 @@ export default function Room() {
 
       workletNode.port.onmessage = (e: MessageEvent<{ int16: Int16Array; seq: number }>) => {
         if (!micEnabledRef.current) return;
-        // [FIX-DUAL-AUDIO] WebRTC connected → audio goes P2P, no Socket.IO needed.
-        if (webrtcManagerRef.current?.hasConnectedPeers()) { socketChunkQueue.length = 0; return; }
+        // [FIX-MULTIROOM] Always push to queue so Socket.IO reaches non-WebRTC peers.
+        // WebRTC peers who have a live P2P connection to us will ignore our Socket.IO
+        // chunks on their side (hasConnectedPeer check in audioChunk handler).
         // Push to queue; drain loop handles rate-limiting and age-based discard.
         socketChunkQueue.push({ int16: e.data.int16, seq: e.data.seq, ts: Date.now() });
       };

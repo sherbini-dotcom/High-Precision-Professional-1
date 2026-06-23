@@ -444,8 +444,12 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
     // الحل: 60s + 90s = يصمد لـ 2.5 دقيقة في الخلفية قبل ما ينقطع
     pingInterval: 60000,
     pingTimeout: 90000,
-    // FIX AUDIO-02: رفع حجم الـ buffer للصوت عالـ weak connections
-    maxHttpBufferSize: 2e6,
+    // [FIX-BUFFER-SIZE] Reduced from 2MB → 100KB.
+    // Each audio chunk is ~8 KB (4096 samples × 2 bytes at 16-bit).
+    // 100 KB is ~12× a single chunk — plenty of headroom for burst delivery
+    // without allowing a malicious client to send 2 MB payloads that would
+    // force the server to relay 2 MB to every other member in the room.
+    maxHttpBufferSize: 1e5,
   });
 
   ioInstance = io;
@@ -1253,6 +1257,12 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
       // 15/s gives 25% headroom above the 12/sec nominal rate for TCP catch-up
       // bursts while still blocking real abuse / runaway clients.
       if (isSocketRateLimited(socket.id, "audio", 15)) return;
+      // [FIX-BUFFER-VALIDATION] Reject oversized or missing audio buffers.
+      // A legitimate chunk is ≤8 KB (4096 samples × 2 bytes). We allow up to
+      // 65 536 bytes (~680 ms at 48 kHz) as a generous upper bound to tolerate
+      // future worklet tuning, while blocking a malicious client from sending
+      // megabyte-scale payloads that the server would blindly relay to all members.
+      if (!payload.buf || payload.buf.byteLength === 0 || payload.buf.byteLength > 65_536) return;
       // FIX AUDIO-03: إزالة socket.volatile
       // volatile كان يعني "لو الـ socket مشغول، اتجاهل الـ chunk" → أكبر سبب للتقطع
       // الآن كل chunk يُرسل بموثوقية كاملة
