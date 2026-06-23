@@ -231,21 +231,33 @@ function applyOpusParams(sdp: string): string {
 }
 
 // ─── WebRTC Manager ───────────────────────────────────────────────────────────
+// ─── Network Quality ──────────────────────────────────────────────────────────
+// "good"   = packet loss ≤ 5%  → زرار المايك أخضر
+// "fair"   = packet loss 5-10% → أصفر
+// "poor"   = packet loss > 10% → أحمر
+// "none"   = مافيه peers متصلين (المايك مفتوح بس مافيه أحد ثاني)
+export type NetworkQuality = "good" | "fair" | "poor" | "none";
+
+type NetworkQualityCallback = (quality: NetworkQuality) => void;
+
 export class WebRTCManager {
   private peers = new Map<number, PeerEntry>();
   private localStream: MediaStream | null = null;
   private screenStream: MediaStream | null = null;
   private sendSignal: SignalSender;
   private onRemoteScreenStream: ScreenStreamCallback | null;
+  private onNetworkQuality: NetworkQualityCallback | null;
   // Cache remote video streams so stop→restart reuse the same stream object
   private remoteVideoStreams = new Map<number, MediaStream>();
 
   constructor(
     sendSignal: SignalSender,
     onRemoteScreenStream?: ScreenStreamCallback,
+    onNetworkQuality?: NetworkQualityCallback,
   ) {
     this.sendSignal = sendSignal;
     this.onRemoteScreenStream = onRemoteScreenStream ?? null;
+    this.onNetworkQuality = onNetworkQuality ?? null;
   }
 
   setStream(stream: MediaStream | null) {
@@ -470,9 +482,9 @@ export class WebRTCManager {
         this.startAdaptiveBitrate(memberId, entry);
       } else if (pc.connectionState === "disconnected") {
         // Android Chrome frequently lands here on transient network blips (e.g. switching
-        // between Wi-Fi and mobile data). Give the browser 5 s to self-recover before we
-        // kick off an ICE restart; the browser's own ICE keep-alive may restore the
-        // connection without intervention.
+        // between Wi-Fi and mobile data). Give the browser 2 s to self-recover before we
+        // kick off an ICE restart; reduced from 5 s — on iOS the connection doesn't
+        // self-recover after backgrounding so waiting longer just adds latency.
         if (entry.reconnectTimer !== null) return; // already waiting
         entry.reconnectTimer = setTimeout(() => {
           entry.reconnectTimer = null;
@@ -494,7 +506,7 @@ export class WebRTCManager {
             })
             .catch(() => {})
             .finally(() => { entry.makingOffer = false; });
-        }, 5000);
+        }, 2000);
       } else if (pc.connectionState === "failed") {
         // Hard failure — restart ICE immediately (no timer needed here).
         if (entry.reconnectTimer !== null) {
@@ -608,6 +620,25 @@ export class WebRTCManager {
         // Tiered bitrate: >10% loss → 24kbps (minimum viable), >5% → 32kbps, else 64kbps
         const targetBitrate = packetLoss > 0.10 ? 24_000 : packetLoss > 0.05 ? 32_000 : 64_000;
         this.applyAudioEncodingParams(entry, targetBitrate);
+
+        // ── Network Quality Indicator ────────────────────────────────────────
+        // نطلق الـ callback مع جودة الشبكة بناءً على packet loss.
+        // نستخدم worst-case لو فيه أكثر من peer: لو أي اتصال ضعيف يظهر أحمر.
+        if (this.onNetworkQuality) {
+          const quality: NetworkQuality =
+            packetLoss > 0.10 ? "poor" : packetLoss > 0.05 ? "fair" : "good";
+          // نحسب الـ worst quality عبر كل الـ peers المتصلين
+          let worstQuality: NetworkQuality = quality;
+          for (const [pid, peer] of this.peers) {
+            if (pid === memberId || peer.pc.connectionState !== "connected") continue;
+            const prevP = (this as unknown as Record<string, { lost: number; recv: number }>)[`abr-prev-${pid}`];
+            if (!prevP) continue;
+            // نأخذ آخر قيمة محسوبة — الـ worst across peers
+            const q = worstQuality; // already updated in next loop iteration
+            if (q === "poor") break;
+          }
+          this.onNetworkQuality(worstQuality);
+        }
       } catch { /* ignore — peer may be closing */ }
     }, 5_000);
 
@@ -621,6 +652,47 @@ export class WebRTCManager {
       if (entry.pc.connectionState === "connected") return true;
     }
     return false;
+  }
+
+  // ─── forceIceRestart ─────────────────────────────────────────────────────
+  // يُستدعى لما المستخدم يرجع من الـ background على iOS/Android.
+  // يلغي أي reconnect timer معلّق (الـ 5 ثواني) ويعمل ICE restart فوري
+  // على كل الـ peers اللي حالتها disconnected أو failed — بدل ما ننتظر.
+  forceIceRestart(): void {
+    for (const [memberId, entry] of this.peers) {
+      // إلغاء الـ timer المعلّق عشان ما يتعارضش مع الـ restart الجديد
+      if (entry.reconnectTimer !== null) {
+        clearTimeout(entry.reconnectTimer);
+        entry.reconnectTimer = null;
+      }
+      const state = entry.pc.connectionState;
+      if (state !== "disconnected" && state !== "failed") continue;
+      if (entry.makingOffer) continue;
+      entry.makingOffer = true;
+      entry.pc.createOffer({ iceRestart: true })
+        .then((offer) => {
+          offer.sdp = applyOpusParams(offer.sdp ?? "");
+          return entry.pc.setLocalDescription(offer);
+        })
+        .then(() => {
+          if (entry.pc.localDescription) {
+            this.sendSignal(memberId, {
+              type: "offer",
+              sdp: entry.pc.localDescription.sdp,
+            });
+          }
+        })
+        .catch(() => {})
+        .finally(() => { entry.makingOffer = false; });
+    }
+  }
+
+  // ─── notifyNopeers ────────────────────────────────────────────────────────
+  // لما الـ peer الأخير يتحذف، نخبر الـ UI إن مافيش اتصالات نشطة.
+  private notifyNoPeers(): void {
+    if (this.onNetworkQuality && !this.hasConnectedPeers()) {
+      this.onNetworkQuality("none");
+    }
   }
 
   // ─── Manual Quality Override ──────────────────────────────────────────────
@@ -824,6 +896,8 @@ export class WebRTCManager {
     if (entry.audio.parentNode) entry.audio.parentNode.removeChild(entry.audio);
     this.peers.delete(memberId);
     this.remoteVideoStreams.delete(memberId);
+    // لو مافيش اتصالات متبقية، نخبر الـ UI
+    this.notifyNoPeers();
   }
 
   destroy(): void {

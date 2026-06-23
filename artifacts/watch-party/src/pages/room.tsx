@@ -5,7 +5,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { getSession, saveSession, clearSession } from "@/lib/storage";
 import { connectSocket, disconnectSocket } from "@/lib/socket";
 import type { Socket } from "socket.io-client";
-import { WebRTCManager, getMicStream } from "@/lib/webrtc";
+import { WebRTCManager, getMicStream, type NetworkQuality } from "@/lib/webrtc";
 import type { WebRTCSignal } from "@/lib/webrtc";
 import {
   Film, Upload, Users, Mic, MicOff, Copy, Check, Shield,
@@ -66,6 +66,8 @@ export default function Room() {
 
   const [members, setMembers] = useState<Member[]>([]);
   const [speakingState, setSpeakingState] = useState<Record<number, number>>({});
+  // مؤشر جودة الشبكة: good=أخضر / fair=أصفر / poor=أحمر / none=مافيش peers
+  const [networkQuality, setNetworkQuality] = useState<NetworkQuality>("none");
   const [videoHlsPath, setVideoHlsPath] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [uploadSpeed, setUploadSpeed] = useState<number | null>(null);
@@ -803,6 +805,13 @@ export default function Room() {
     // and the network online event. Recovers audio, video, socket, and mic after the
     // app returns from the background or after a network interruption.
     const handleForeground = () => {
+      // 0. [FIX-IOS-RECONNECT] ICE restart فوري لما المستخدم يرجع من الـ background.
+      //    الكود القديم كان ينتظر 5 ثواني قبل ICE restart (في onconnectionstatechange)
+      //    + 500ms للـ WebRTCManager destroy/recreate = أكثر من 10 ثواني تأخير على iOS.
+      //    نشغّل forceIceRestart هنا فوراً على الـ peers المنقطعة قبل أي حاجة تانية،
+      //    وبالتوازي مع باقي الـ recovery steps — بدل ما نستنى.
+      webrtcManagerRef.current?.forceIceRestart();
+
       // 1. Resume AudioContext (suspended by browser on background/lock screen)
       if (audioPlayerRef.current?.state === "suspended") {
         audioPlayerRef.current.resume().catch(() => {});
@@ -884,7 +893,14 @@ export default function Room() {
       // 4. Mic recovery — restart if Android/iOS killed the media stream.
       if (micEnabledRef.current) {
         const stream = micStreamRef.current;
-        if (!stream || !stream.active) {
+        // [FIX-MIC-TRACK-ENDED] الكود القديم كان يفحص stream.active بس —
+        // لكن لما النت يقطع ويرجع، الـ stream تفضل active لكن الـ track
+        // نفسه بيبقى readyState === "ended" أو muted، فالصوت يقطع بدون
+        // ما الـ recovery تشتغل. الحل: نفحص التراكات نفسها كمان.
+        const trackDead = stream?.getAudioTracks().some(
+          t => t.readyState === "ended" || t.muted
+        ) ?? false;
+        if (!stream || !stream.active || trackDead) {
           if (micIntervalRef.current) { clearInterval(micIntervalRef.current); micIntervalRef.current = null; }
           stream?.getTracks().forEach(t => t.stop());
           micStreamRef.current = null;
@@ -961,6 +977,9 @@ export default function Room() {
             (_memberId, stream) => {
               if (stream) setRemoteScreenStream(stream);
               else { setRemoteScreenStream(null); setMode("video"); }
+            },
+            (quality) => {
+              setNetworkQuality(quality);
             },
           );
           webrtcManagerRef.current = newManager;
@@ -2771,6 +2790,8 @@ export default function Room() {
     setMicEnabled(false);
     setSpeakingState(prev => ({ ...prev, [myMemberId]: 0 }));
     socketRef.current?.emit("micDisabled");
+    // [FIX-MIC-PERSIST] لما المستخدم يوقف المايك يدوياً، نمسح الـ flag
+    try { localStorage.removeItem(`wp_mic_${code}`); } catch { /* ignore */ }
   }, [myMemberId]);
 
   const toggleMic = async () => {
@@ -2905,6 +2926,9 @@ export default function Room() {
 
       setMicEnabled(true);
       setMicError(null);
+      // [FIX-MIC-PERSIST] نحفظ إن المايك كان شغّال عشان لو الصفحة اترفرشت
+      // نرجعه تلقائياً بدون ما المستخدم يعمل حاجة.
+      try { localStorage.setItem(`wp_mic_${code}`, "1"); } catch { /* ignore */ }
 
       // ── RMS volume detection — more accurate than FFT byte average ──────────
       // [FIX-SPEAKING-RATE] Was 100ms (10 events/sec) but the server rate-limits
@@ -2938,6 +2962,24 @@ export default function Room() {
     document.addEventListener("wp:restartMic", handler);
     return () => document.removeEventListener("wp:restartMic", handler);
   }, []);
+
+  // [FIX-MIC-PERSIST] لو المستخدم كان المايك شغّال وعمل refresh أو رجع للصفحة،
+  // نشغّل المايك تلقائياً بعد ما يكون join الغرفة (بعد 1.5 ثانية عشان يتأكد
+  // إن الـ socket جاهز والـ session اتأكدت).
+  useEffect(() => {
+    if (!myMemberId) return;
+    try {
+      const wasOn = localStorage.getItem(`wp_mic_${code}`);
+      if (wasOn === "1") {
+        setTimeout(() => {
+          if (!micEnabledRef.current) {
+            document.dispatchEvent(new CustomEvent("wp:restartMic"));
+          }
+        }, 1500);
+      }
+    } catch { /* ignore */ }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [myMemberId]);
 
   const cancelUpload = () => {
     if (uploadXhrRef.current) { uploadXhrRef.current.abort(); uploadXhrRef.current = null; }
@@ -3360,6 +3402,36 @@ export default function Room() {
     if (role === "host") return "ring-2 ring-yellow-500";
     if (role === "admin") return "ring-2 ring-purple-500";
     return "ring-2 ring-blue-500";
+  };
+
+  // ── Network Quality Helpers ──────────────────────────────────────────────
+  // يرجع ألوان زرار المايك وأيقونة المؤشر بناءً على جودة الشبكة
+  const getNetworkQualityMicClass = (quality: NetworkQuality) => {
+    if (quality === "poor")
+      return "bg-red-500/10 border-red-500/40 text-red-400 shadow-[0_0_10px_rgba(239,68,68,0.3)]";
+    if (quality === "fair")
+      return "bg-yellow-500/10 border-yellow-500/40 text-yellow-400 shadow-[0_0_10px_rgba(234,179,8,0.3)]";
+    // good أو none → أخضر (الأصلي)
+    return "bg-green-500/10 border-green-500/30 text-green-400 shadow-[0_0_10px_rgba(34,197,94,0.3)]";
+  };
+
+  const getNetworkQualityBarClass = (quality: NetworkQuality) => {
+    if (quality === "poor") return "bg-red-400";
+    if (quality === "fair") return "bg-yellow-400";
+    return "bg-green-400";
+  };
+
+  const getNetworkQualityDotClass = (quality: NetworkQuality) => {
+    if (quality === "poor") return "bg-red-500";
+    if (quality === "fair") return "bg-yellow-400";
+    return "bg-green-500";
+  };
+
+  const getNetworkQualityLabel = (quality: NetworkQuality) => {
+    if (quality === "poor") return "إشارة ضعيفة";
+    if (quality === "fair") return "إشارة متوسطة";
+    if (quality === "good") return "إشارة ممتازة";
+    return "Mic On";
   };
 
   const getRoleCardBorder = (role: string) => {
@@ -3868,23 +3940,38 @@ export default function Room() {
               <button
                 onClick={toggleMic}
                 disabled={isMutedByHost && !micEnabled}
-                className={`flex items-center justify-center gap-1.5 px-2 sm:px-3 sm:py-2.5 rounded-lg border text-sm sm:text-base font-medium transition-all duration-200 ease-out select-none flex-1 sm:flex-initial min-w-0 ${
+                className={`relative flex items-center justify-center gap-1.5 px-2 sm:px-3 sm:py-2.5 rounded-lg border text-sm sm:text-base font-medium transition-all duration-200 ease-out select-none flex-1 sm:flex-initial min-w-0 ${
                   isMutedByHost && !micEnabled
                     ? "bg-muted/40 border-destructive/30 text-destructive/50 cursor-not-allowed opacity-60"
                     : micEnabled
-                    ? "bg-green-500/10 border-green-500/30 text-green-400 shadow-[0_0_10px_rgba(34,197,94,0.3)] active:scale-90"
+                    ? getNetworkQualityMicClass(networkQuality)
                     : "bg-muted border-border text-muted-foreground hover:text-foreground hover:border-muted-foreground/40 active:scale-90"
-                }`}
-                title={isMutedByHost && !micEnabled ? "Muted by host" : micEnabled ? "Mic On" : "Mic Off"}
+                } ${micEnabled ? "active:scale-90" : ""}`}
+                title={
+                  isMutedByHost && !micEnabled
+                    ? "Muted by host"
+                    : micEnabled
+                    ? getNetworkQualityLabel(networkQuality)
+                    : "Mic Off"
+                }
               >
                 {micEnabled ? <Mic className="w-4 h-4 sm:w-5 sm:h-5 flex-shrink-0" /> : <MicOff className="w-4 h-4 sm:w-5 sm:h-5 flex-shrink-0" />}
                 {micEnabled && (
-                  <div className="flex items-end gap-0.5 h-4 ml-0.5 flex-shrink-0">
-                    {[0.4, 0.7, 1, 0.7, 0.4].map((mult, i) => {
-                      const vol = speakingState[myMemberId] ?? 0;
-                      return <div key={i} className="w-0.5 bg-green-400 rounded-full transition-all duration-100" style={{ height: `${Math.max(2, Math.min(16, vol * mult * 0.16))}px` }} />;
-                    })}
-                  </div>
+                  <>
+                    <div className="flex items-end gap-0.5 h-4 ml-0.5 flex-shrink-0">
+                      {[0.4, 0.7, 1, 0.7, 0.4].map((mult, i) => {
+                        const vol = speakingState[myMemberId] ?? 0;
+                        return <div key={i} className={`w-0.5 rounded-full transition-all duration-100 ${getNetworkQualityBarClass(networkQuality)}`} style={{ height: `${Math.max(2, Math.min(16, vol * mult * 0.16))}px` }} />;
+                      })}
+                    </div>
+                    {/* نقطة مؤشر جودة الشبكة في أعلى يمين الزرار */}
+                    {networkQuality !== "none" && (
+                      <span
+                        className={`absolute top-1 right-1 w-2 h-2 rounded-full ${getNetworkQualityDotClass(networkQuality)} ${networkQuality === "poor" ? "animate-pulse" : ""}`}
+                        aria-label={getNetworkQualityLabel(networkQuality)}
+                      />
+                    )}
+                  </>
                 )}
               </button>
             );
@@ -4480,6 +4567,13 @@ export default function Room() {
                           <div className="flex items-center gap-1.5 min-w-0">
                             <span className="text-sm font-semibold truncate">{member.name}{isMe ? " (you)" : ""}</span>
                             {member.isMuted && <MicOff className="w-3 h-3 text-destructive flex-shrink-0" />}
+                            {/* مؤشر جودة الشبكة — يظهر فقط لصاحب الجهاز لما المايك شغّال */}
+                            {isMe && micEnabled && networkQuality !== "none" && (
+                              <span
+                                className={`w-2 h-2 rounded-full flex-shrink-0 ${getNetworkQualityDotClass(networkQuality)} ${networkQuality === "poor" ? "animate-pulse" : ""}`}
+                                title={getNetworkQualityLabel(networkQuality)}
+                              />
+                            )}
                           </div>
                           <div className="mt-1">{getRoleBadge(member.role)}</div>
                         </div>
