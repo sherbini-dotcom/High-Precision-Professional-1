@@ -596,31 +596,70 @@ export class WebRTCManager {
       try {
         const stats = await entry.pc.getStats();
 
-        // [FIX-ABR-STATS] Use inbound-rtp (what WE receive) instead of outbound-rtp.
-        // outbound-rtp.packetsLost is reported via RTCP feedback from the remote side
-        // and may arrive late or not at all through NAT/TURN — making it unreliable.
-        // inbound-rtp gives us immediate local loss measurements for audio we receive,
-        // and we use DELTA loss (change since last poll) to avoid cumulative skew where
-        // early loss inflates the ratio forever even after the network recovers.
-        // We also apply the same bitrate to what we SEND (applyAudioEncodingParams)
-        // as a proxy: if we're losing their packets, they're likely losing ours too
-        // (symmetric degradation is the common case on shared-medium or congested links).
-        type InboundAudioReport = RTCInboundRtpStreamStats & { packetsLost?: number; packetsReceived?: number };
+        // [FIX-ABR-ASYMMETRIC] Measure packet loss from BOTH directions and take
+        // the worst of the two. Previously only inbound-rtp was checked, which works
+        // well for symmetric links (home Wi-Fi, LAN) but misses the common mobile
+        // case where upload is far weaker than download:
+        //   • inbound-rtp  = what WE receive (download direction, immediate & accurate)
+        //   • outbound-rtp remote-inbound-rtp = what THEY receive from US (upload direction)
+        //     This is reported via RTCP feedback; latency ~1-2s but still far more
+        //     accurate than the old "symmetric proxy" assumption for asymmetric links.
+        // Delta-based calculation avoids cumulative skew (early loss inflating the
+        // ratio forever even after the network recovers).
+        type InboundAudioReport  = RTCInboundRtpStreamStats  & { packetsLost?: number; packetsReceived?: number };
+        type RemoteInboundReport = RTCRemoteInboundRtpStreamStats & { packetsLost?: number; kind?: string };
+        type OutboundAudioReport = RTCOutboundRtpStreamStats & { packetsSent?: number };
+
         let packetLoss = 0;
-        const prevStats = (this as unknown as Record<string, { lost: number; recv: number }>)[`abr-prev-${memberId}`] ?? { lost: 0, recv: 0 };
+        type PrevStats = { inLost: number; inRecv: number; outLost: number; outSent: number };
+        const prevStats = (this as unknown as Record<string, PrevStats>)[`abr-prev-${memberId}`]
+          ?? { inLost: 0, inRecv: 0, outLost: 0, outSent: 0 };
+
+        // Collect outbound SSRC→packetsSent for matching with remote-inbound reports
+        const outboundSentBySsrc = new Map<number, number>();
+        stats.forEach((report) => {
+          if (report.type === "outbound-rtp" && (report as RTCOutboundRtpStreamStats).kind === "audio") {
+            const r = report as OutboundAudioReport;
+            if (r.ssrc !== undefined) outboundSentBySsrc.set(r.ssrc, r.packetsSent ?? 0);
+          }
+        });
+
+        let inLost = prevStats.inLost, inRecv = prevStats.inRecv;
+        let outLost = prevStats.outLost, outSent = prevStats.outSent;
 
         stats.forEach((report) => {
           if (report.type === "inbound-rtp" && (report as RTCInboundRtpStreamStats).kind === "audio") {
             const r = report as InboundAudioReport;
-            const totalLost = r.packetsLost ?? 0;
-            const totalRecv = r.packetsReceived ?? 0;
-            const deltaLost = Math.max(0, totalLost - prevStats.lost);
-            const deltaRecv = Math.max(0, totalRecv - prevStats.recv);
-            const deltaTotal = deltaLost + deltaRecv;
-            packetLoss = deltaTotal > 0 ? deltaLost / deltaTotal : 0;
-            (this as unknown as Record<string, { lost: number; recv: number }>)[`abr-prev-${memberId}`] = { lost: totalLost, recv: totalRecv };
+            inLost = r.packetsLost ?? inLost;
+            inRecv = r.packetsReceived ?? inRecv;
+          }
+          // remote-inbound-rtp: RTCP feedback from the remote peer about what they received from us
+          if (report.type === "remote-inbound-rtp") {
+            const r = report as RemoteInboundReport;
+            if (r.kind === "audio" || (r.ssrc !== undefined && outboundSentBySsrc.has(r.ssrc))) {
+              outLost = r.packetsLost ?? outLost;
+              outSent = r.ssrc !== undefined ? (outboundSentBySsrc.get(r.ssrc) ?? outSent) : outSent;
+            }
           }
         });
+
+        // Delta download loss
+        const dInLost  = Math.max(0, inLost  - prevStats.inLost);
+        const dInRecv  = Math.max(0, inRecv  - prevStats.inRecv);
+        const dInTotal = dInLost + dInRecv;
+        const inboundLoss = dInTotal > 0 ? dInLost / dInTotal : 0;
+
+        // Delta upload loss
+        const dOutLost  = Math.max(0, outLost - prevStats.outLost);
+        const dOutSent  = Math.max(0, outSent  - prevStats.outSent);
+        const dOutTotal = dOutLost + dOutSent;
+        const outboundLoss = dOutTotal > 0 ? dOutLost / dOutTotal : 0;
+
+        // Worst of the two directions — conservative but correct
+        packetLoss = Math.max(inboundLoss, outboundLoss);
+
+        (this as unknown as Record<string, PrevStats>)[`abr-prev-${memberId}`] =
+          { inLost, inRecv, outLost, outSent };
 
         // Tiered bitrate: >10% loss → 24kbps (minimum viable), >5% → 32kbps, else 64kbps
         const targetBitrate = packetLoss > 0.10 ? 24_000 : packetLoss > 0.05 ? 32_000 : 64_000;
