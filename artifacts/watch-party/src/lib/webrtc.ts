@@ -254,6 +254,13 @@ export class WebRTCManager {
   // actually compare real values across peers instead of re-reading the same
   // variable it's trying to compute.
   private lastQualityByPeer = new Map<number, NetworkQuality>();
+  // [FIX-ABR-TYPED] ABR interval handles and previous stats, stored as proper
+  // private Maps instead of dynamic properties on `this`. Dynamic properties
+  // bypass TypeScript's type system and state model, risking subtle bugs if a
+  // property name collides with a real class member. Maps are the idiomatic
+  // solution: keyed by memberId, correctly typed, and scoped to the class.
+  private abrIntervals = new Map<number, ReturnType<typeof setInterval>>();
+  private abrPrevStats = new Map<number, { inLost: number; inRecv: number; outLost: number; outSent: number }>();
 
   constructor(
     sendSignal: SignalSender,
@@ -582,8 +589,7 @@ export class WebRTCManager {
   // يعود للـ 64 kbps تلقائياً لو الشبكة تحسّنت.
   private startAdaptiveBitrate(memberId: number, entry: PeerEntry): void {
     // حذف أي interval قديم لنفس الـ peer
-    const existingKey = `abr-${memberId}`;
-    const existingInterval = (this as unknown as Record<string, ReturnType<typeof setInterval>>)[existingKey];
+    const existingInterval = this.abrIntervals.get(memberId);
     if (existingInterval) clearInterval(existingInterval);
 
     const interval = setInterval(async () => {
@@ -611,8 +617,7 @@ export class WebRTCManager {
         type OutboundAudioReport = RTCOutboundRtpStreamStats & { packetsSent?: number };
 
         let packetLoss = 0;
-        type PrevStats = { inLost: number; inRecv: number; outLost: number; outSent: number };
-        const prevStats = (this as unknown as Record<string, PrevStats>)[`abr-prev-${memberId}`]
+        const prevStats = this.abrPrevStats.get(memberId)
           ?? { inLost: 0, inRecv: 0, outLost: 0, outSent: 0 };
 
         // Collect outbound SSRC→packetsSent for matching with remote-inbound reports
@@ -658,8 +663,7 @@ export class WebRTCManager {
         // Worst of the two directions — conservative but correct
         packetLoss = Math.max(inboundLoss, outboundLoss);
 
-        (this as unknown as Record<string, PrevStats>)[`abr-prev-${memberId}`] =
-          { inLost, inRecv, outLost, outSent };
+        this.abrPrevStats.set(memberId, { inLost, inRecv, outLost, outSent });
 
         // Tiered bitrate: >10% loss → 24kbps (minimum viable), >5% → 32kbps, else 64kbps
         const targetBitrate = packetLoss > 0.10 ? 24_000 : packetLoss > 0.05 ? 32_000 : 64_000;
@@ -693,7 +697,7 @@ export class WebRTCManager {
       } catch { /* ignore — peer may be closing */ }
     }, 5_000);
 
-    (this as unknown as Record<string, ReturnType<typeof setInterval>>)[existingKey] = interval;
+    this.abrIntervals.set(memberId, interval);
   }
 
   // ─── hasConnectedPeers ────────────────────────────────────────────────────
@@ -929,14 +933,13 @@ export class WebRTCManager {
       entry.reconnectTimer = null;
     }
     // إلغاء مراقبة الـ adaptive bitrate
-    const abrKey = `abr-${memberId}`;
-    const abrInterval = (this as unknown as Record<string, ReturnType<typeof setInterval>>)[abrKey];
+    const abrInterval = this.abrIntervals.get(memberId);
     if (abrInterval) {
       clearInterval(abrInterval);
-      delete (this as unknown as Record<string, ReturnType<typeof setInterval>>)[abrKey];
+      this.abrIntervals.delete(memberId);
     }
     // [FIX-ABR-STATS] Clear delta-loss baseline so a reconnect starts fresh.
-    delete (this as unknown as Record<string, unknown>)[`abr-prev-${memberId}`];
+    this.abrPrevStats.delete(memberId);
     entry.pc.ontrack = null;
     entry.pc.onicecandidate = null;
     entry.pc.onconnectionstatechange = null;
