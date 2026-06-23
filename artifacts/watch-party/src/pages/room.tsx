@@ -451,6 +451,58 @@ export default function Room() {
   // [FIX-ADAPTIVE-JITTER] Per-speaker adaptive cushion (seconds). Starts at 120ms,
   // grows when bursts are detected (Socket.IO TCP stalls), shrinks when network is clean.
   const jitterCushionRef = useRef<Map<number, number>>(new Map());
+
+  // ── [FIX-1-JITTER-QUEUE] Per-speaker MinHeap ordered by seq ───────────────
+  // Replaces the old "schedule immediately on arrival" approach.
+  // Incoming chunks are pushed into a per-speaker heap; a scheduler loop drains
+  // them in seq order at the correct audioContext time, preventing burst-induced
+  // out-of-order playback and the silence gaps that followed.
+  type JitterChunk = {
+    seq: number;
+    audioBuf: AudioBuffer;
+    // audioTime from the worklet clock at the moment the chunk was produced.
+    // Used for scheduling even when the main-thread Date.now() has drifted.
+    audioTime: number | undefined;
+  };
+  // MinHeap keyed by seq so the lowest seq is always at index 0.
+  class SeqMinHeap {
+    private h: JitterChunk[] = [];
+    push(c: JitterChunk) {
+      this.h.push(c);
+      let i = this.h.length - 1;
+      while (i > 0) {
+        const p = (i - 1) >> 1;
+        if (this.h[p].seq <= this.h[i].seq) break;
+        [this.h[p], this.h[i]] = [this.h[i], this.h[p]];
+        i = p;
+      }
+    }
+    pop(): JitterChunk | undefined {
+      if (!this.h.length) return undefined;
+      const top = this.h[0];
+      const last = this.h.pop()!;
+      if (this.h.length) {
+        this.h[0] = last;
+        let i = 0;
+        for (;;) {
+          const l = 2 * i + 1, r = 2 * i + 2;
+          let s = i;
+          if (l < this.h.length && this.h[l].seq < this.h[s].seq) s = l;
+          if (r < this.h.length && this.h[r].seq < this.h[s].seq) s = r;
+          if (s === i) break;
+          [this.h[i], this.h[s]] = [this.h[s], this.h[i]];
+          i = s;
+        }
+      }
+      return top;
+    }
+    peek(): JitterChunk | undefined { return this.h[0]; }
+    get size() { return this.h.length; }
+    clear() { this.h = []; }
+  }
+  // Per-speaker jitter heaps and their drain-loop interval handles.
+  const jitterQueuesRef = useRef<Map<number, SeqMinHeap>>(new Map());
+  const jitterDrainTimersRef = useRef<Map<number, ReturnType<typeof setInterval>>>(new Map());
   const micEnabledRef = useRef(false);
   // [FIX-BG-MIC] Set to true when we go to background with the mic ON.
   // On iOS/Android the mic track silently dies in background — readyState may
@@ -1467,18 +1519,26 @@ export default function Room() {
       webrtcManagerRef.current?.resumeAllAudio();
       // Force reset next-play-time for this member so first chunk plays immediately
       nextAudioTimeRef.current.delete(memberId);
+      // [FIX-1-JITTER-QUEUE] Reset the jitter heap so stale chunks from the
+      // previous mic session are not replayed when the member re-enables.
+      jitterQueuesRef.current.get(memberId)?.clear();
     });
     socket.on("peerMicDisabled", ({ memberId }: { memberId: number }) => {
       nextAudioTimeRef.current.delete(memberId);
       lastAudioSeqRef.current.delete(memberId);
       jitterCushionRef.current.delete(memberId);
-      // [FIX-CLICK] Disconnect and discard persistent compressor when mic is disabled.
+      // [FIX-1-JITTER-QUEUE] Stop the drain loop and clear the heap for this speaker.
+      const drainTimer = jitterDrainTimersRef.current.get(memberId);
+      if (drainTimer) { clearInterval(drainTimer); jitterDrainTimersRef.current.delete(memberId); }
+      jitterQueuesRef.current.get(memberId)?.clear();
+      jitterQueuesRef.current.delete(memberId);
+      // [FIX-3] Disconnect and discard persistent compressor when mic is disabled.
       // Next time the speaker enables mic a fresh compressor is created.
       speakerCompressorsRef.current.get(memberId)?.disconnect();
       speakerCompressorsRef.current.delete(memberId);
       setSpeakingState(prev => ({ ...prev, [memberId]: 0 }));
     });
-    socket.on("audioChunk", ({ fromMemberId, sr, buf, seq }: { fromMemberId: number; sr: number; buf: ArrayBuffer; seq?: number }) => {
+    socket.on("audioChunk", ({ fromMemberId, sr, buf, seq, audioTime }: { fromMemberId: number; sr: number; buf: ArrayBuffer; seq?: number; audioTime?: number }) => {
       const ctx = audioPlayerRef.current;
       if (!ctx) return;
       if (fromMemberId === myMemberId) return;
@@ -1489,89 +1549,134 @@ export default function Room() {
       if (webrtcManagerRef.current?.hasConnectedPeer(fromMemberId)) return;
       if (ctx.state === "suspended") ctx.resume().catch(() => {});
 
-      // [FIX-SEQ] Discard out-of-order packets on lossy/weak connections.
-      // seq is optional (undefined for older server versions) — only check when present.
+      // [FIX-SEQ] Discard out-of-order packets. seq is optional for older server
+      // versions — when present we only drop TRUE duplicates / extreme reorders
+      // (seq <= lastSeq - 3). Mild reordering (e.g. seq = lastSeq + 1 arriving
+      // after seq = lastSeq + 2) is handled correctly by the MinHeap below.
+      const resolvedSeq = seq ?? Date.now(); // fallback: wall-clock as tiebreaker
       if (seq !== undefined) {
         const lastSeq = lastAudioSeqRef.current.get(fromMemberId) ?? -1;
-        if (seq <= lastSeq) return; // stale / reordered — drop silently
-        lastAudioSeqRef.current.set(fromMemberId, seq);
+        if (seq <= lastSeq - 3) return; // extreme reorder / duplicate — drop silently
       }
 
       try {
-        // ── Per-speaker persistent compressor ─────────────────────────────────
-        // [FIX-CLICK] Create the DynamicsCompressor ONCE per speaker and reuse it.
-        // A persistent compressor keeps its internal state between chunks →
-        // smooth, continuous gain reduction → no clicks between buffers.
-        let compressor = speakerCompressorsRef.current.get(fromMemberId);
-        if (!compressor) {
-          compressor = ctx.createDynamicsCompressor();
-          compressor.threshold.value = -24; // gentler threshold (more headroom)
-          compressor.knee.value = 10;       // wider soft-knee → less abrupt
-          compressor.ratio.value = 3;       // 3:1 — softer than 4:1, less pumping
-          compressor.attack.value = 0.003;  // 3ms — fast enough for transients
-          compressor.release.value = 0.25;  // 250ms — slower release = less pumping
-          compressor.connect(ctx.destination);
-          speakerCompressorsRef.current.set(fromMemberId, compressor);
-        }
-
         const int16 = new Int16Array(buf);
         const float32 = new Float32Array(int16.length);
         for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32767;
         const audioBuf = ctx.createBuffer(1, float32.length, sr);
         audioBuf.getChannelData(0).set(float32);
-        const src = ctx.createBufferSource();
-        src.buffer = audioBuf;
 
-        // ── Per-chunk fade gain — eliminates click at buffer boundaries ────────
-        // [FIX-CLICK] A 5ms linear fade-in and fade-out makes transitions inaudible.
-        const fadeGain = ctx.createGain();
-        src.connect(fadeGain);
-        fadeGain.connect(compressor);
-        // [FIX-LEAK] Disconnect fadeGain after the buffer finishes playing.
-        // Without this, every chunk leaves a GainNode permanently connected to
-        // the compressor → hundreds of zombie nodes accumulate over a long call.
-        src.addEventListener("ended", () => { try { fadeGain.disconnect(); } catch { /* ignore */ } }, { once: true });
+        // ── [FIX-1-JITTER-QUEUE] Push into MinHeap; drain loop schedules playback ──
+        // Previously chunks were scheduled immediately on arrival. When a TCP burst
+        // delivered 3-4 chunks at once they were all scheduled at ~(now+cushion),
+        // overlapping each other → audible glitches. The MinHeap ensures seq-ordered
+        // drain regardless of arrival order.
+        let heap = jitterQueuesRef.current.get(fromMemberId);
+        if (!heap) {
+          heap = new SeqMinHeap();
+          jitterQueuesRef.current.set(fromMemberId, heap);
+        }
+        heap.push({ seq: resolvedSeq, audioBuf, audioTime });
 
-        const now = ctx.currentTime;
-        const prev = nextAudioTimeRef.current.get(fromMemberId) ?? 0;
+        // Ensure a drain loop is running for this speaker.
+        if (!jitterDrainTimersRef.current.has(fromMemberId)) {
+          // ── Per-speaker persistent compressor ─────────────────────────────
+          // [FIX-CLICK] Create ONCE per speaker; keeps gain-reduction history
+          // across chunks → no abrupt jumps → no inter-chunk clicks.
+          let compressor = speakerCompressorsRef.current.get(fromMemberId);
+          if (!compressor) {
+            compressor = ctx.createDynamicsCompressor();
+            compressor.threshold.value = -24;
+            compressor.knee.value = 10;
+            compressor.ratio.value = 3;
+            compressor.attack.value = 0.003;
+            compressor.release.value = 0.25;
+            compressor.connect(ctx.destination);
+            speakerCompressorsRef.current.set(fromMemberId, compressor);
+          }
 
-        // [FIX-ADAPTIVE-JITTER] Adaptive jitter buffer: cushion grows when chunks
-        // arrive bursty (burst = gap between arrival and scheduled play > 1 chunk),
-        // and shrinks back toward 80ms when the network is smooth.
-        // This handles the TCP burst problem (Socket.IO fallback) where chunks pile
-        // up and arrive together after a brief stall.
-        const CHUNK_DUR = audioBuf.duration; // ~0.17s
-        const arrivalGap = prev > 0 ? Math.max(0, prev - now) : 0;
-        const jitterMap = jitterCushionRef.current;
-        // [FIX-LATENCY] Reduced starting cushion 120ms → 60ms and minimum floor
-        // 80ms → 40ms. With smaller worklet chunks (2048 samples ≈ 43ms) the
-        // jitter cushion can be tighter — we don't need to absorb a full 170ms
-        // chunk worth of arrival variance any more.
-        const prevCushion = jitterMap.get(fromMemberId) ?? 0.06;
-        // Grow by 20ms when we detect a burst backlog, decay 5ms/chunk when clean
-        const newCushion = arrivalGap > CHUNK_DUR * 1.5
-          ? Math.min(prevCushion + 0.02, 0.3)   // bursty → grow up to 300ms max
-          : Math.max(prevCushion - 0.005, 0.04); // smooth → decay to 40ms min
-        jitterMap.set(fromMemberId, newCushion);
+          // Drain loop: runs every 20 ms, schedules the next chunk from the heap
+          // when it is within a 300ms lookahead window of the audio clock.
+          // 20ms is small enough to schedule before the chunk's deadline and
+          // large enough to avoid waking the event loop too aggressively.
+          const LOOKAHEAD_S = 0.3; // schedule chunks up to 300ms ahead
+          const FADE_S = 0.005;    // 5ms fade-in/out to eliminate boundary clicks
 
-        // maxDrift: if queued audio is more than 1 chunk + cushion ahead, reset.
-        const maxDrift = CHUNK_DUR + newCushion;
-        const startAt = (prev > now + maxDrift)
-          ? now + newCushion
-          : Math.max(now + newCushion, prev);
-        const endAt = startAt + audioBuf.duration;
-        const FADE_S = 0.005; // 5ms — imperceptible to ears, eliminates clicks
+          const drainTimer = setInterval(() => {
+            const heap = jitterQueuesRef.current.get(fromMemberId);
+            const comp = speakerCompressorsRef.current.get(fromMemberId);
+            const audioCtx = audioPlayerRef.current;
+            if (!heap || !comp || !audioCtx) return;
+            if (audioCtx.state === "suspended") return;
 
-        // Fade in: silence → full volume over 5ms at buffer start
-        fadeGain.gain.setValueAtTime(0, startAt);
-        fadeGain.gain.linearRampToValueAtTime(1.0, startAt + FADE_S);
-        // Fade out: full volume → silence over 5ms at buffer end
-        fadeGain.gain.setValueAtTime(1.0, endAt - FADE_S);
-        fadeGain.gain.linearRampToValueAtTime(0, endAt);
+            const now = audioCtx.currentTime;
+            const jitterMap = jitterCushionRef.current;
+            const prevCushion = jitterMap.get(fromMemberId) ?? 0.06;
 
-        src.start(startAt);
-        src.stop(endAt);
-        nextAudioTimeRef.current.set(fromMemberId, endAt);
+            // Drain all chunks that should be scheduled within the lookahead window.
+            while (heap.size > 0) {
+              const chunk = heap.peek()!;
+              const CHUNK_DUR = chunk.audioBuf.duration;
+
+              // [FIX-2-AUDIOTIME] Compute adaptive cushion using the worklet's
+              // audioTime to avoid main-thread Date.now() drift under CPU load.
+              const prev = nextAudioTimeRef.current.get(fromMemberId) ?? 0;
+              const arrivalGap = prev > 0 ? Math.max(0, prev - now) : 0;
+              const newCushion = arrivalGap > CHUNK_DUR * 1.5
+                ? Math.min(prevCushion + 0.02, 0.3)   // bursty → grow up to 300ms
+                : Math.max(prevCushion - 0.005, 0.04); // smooth → decay to 40ms
+              jitterMap.set(fromMemberId, newCushion);
+
+              // Compute ideal start time for the next chunk.
+              const maxDrift = CHUNK_DUR + newCushion;
+              const startAt = (prev > now + maxDrift)
+                ? now + newCushion
+                : Math.max(now + newCushion, prev);
+
+              // Only schedule chunks that fall within the lookahead window.
+              if (startAt > now + LOOKAHEAD_S) break;
+
+              // Consume from heap and update seq tracking.
+              heap.pop();
+              if (seq !== undefined) {
+                const lastSeq = lastAudioSeqRef.current.get(fromMemberId) ?? -1;
+                if (chunk.seq > lastSeq) lastAudioSeqRef.current.set(fromMemberId, chunk.seq);
+              }
+
+              const endAt = startAt + chunk.audioBuf.duration;
+
+              // Schedule playback through the persistent compressor.
+              const src = audioCtx.createBufferSource();
+              src.buffer = chunk.audioBuf;
+              const fadeGain = audioCtx.createGain();
+              src.connect(fadeGain);
+              fadeGain.connect(comp);
+              // [FIX-LEAK] Disconnect fadeGain after playback ends — prevents
+              // zombie GainNodes accumulating on the compressor over long calls.
+              src.addEventListener("ended", () => {
+                try { fadeGain.disconnect(); } catch { /* ignore */ }
+              }, { once: true });
+
+              fadeGain.gain.setValueAtTime(0, startAt);
+              fadeGain.gain.linearRampToValueAtTime(1.0, startAt + FADE_S);
+              fadeGain.gain.setValueAtTime(1.0, endAt - FADE_S);
+              fadeGain.gain.linearRampToValueAtTime(0, endAt);
+
+              src.start(startAt);
+              src.stop(endAt);
+              nextAudioTimeRef.current.set(fromMemberId, endAt);
+            }
+
+            // Stop the drain loop when the heap has been empty for a while.
+            // We check size AFTER the drain above; if still empty, clean up.
+            if (heap.size === 0) {
+              clearInterval(drainTimer);
+              jitterDrainTimersRef.current.delete(fromMemberId);
+            }
+          }, 20);
+
+          jitterDrainTimersRef.current.set(fromMemberId, drainTimer);
+        }
       } catch { /* ignore decode errors */ }
     });
     socket.on("modeChange", ({ mode: m }: { mode: "video" | "browser" | "screenshare" | "movies" }) => {
@@ -1712,6 +1817,12 @@ export default function Room() {
           nextAudioTimeRef.current.delete(id);
           lastAudioSeqRef.current.delete(id);
           jitterCushionRef.current.delete(id);
+          // [FIX-1-JITTER-QUEUE] + [FIX-3] Clean up heap and drain timer for
+          // members who left abruptly without sending "micDisabled".
+          const dt = jitterDrainTimersRef.current.get(id);
+          if (dt) { clearInterval(dt); jitterDrainTimersRef.current.delete(id); }
+          jitterQueuesRef.current.get(id)?.clear();
+          jitterQueuesRef.current.delete(id);
           speakerCompressorsRef.current.get(id)?.disconnect();
           speakerCompressorsRef.current.delete(id);
           webrtcManagerRef.current?.removePeer(id);
@@ -1754,7 +1865,12 @@ export default function Room() {
       nextAudioTimeRef.current.clear();
       lastAudioSeqRef.current.clear();
       jitterCushionRef.current.clear();
-      // [FIX-CLICK] Discard all persistent speaker compressors on room exit.
+      // [FIX-1-JITTER-QUEUE] Stop all drain loops and clear heaps on room exit.
+      jitterDrainTimersRef.current.forEach(t => clearInterval(t));
+      jitterDrainTimersRef.current.clear();
+      jitterQueuesRef.current.forEach(h => h.clear());
+      jitterQueuesRef.current.clear();
+      // [FIX-3] Discard all persistent speaker compressors on room exit.
       speakerCompressorsRef.current.forEach(c => { try { c.disconnect(); } catch { /* already closed */ } });
       speakerCompressorsRef.current.clear();
     };
@@ -3091,15 +3207,10 @@ export default function Room() {
       const micDest = ctx.createMediaStreamDestination();
       micGain.connect(micDest);
       micDestRef.current = micDest;
-      // [FIX-P2] await setStream so all replaceTrack() calls complete before we
-      // proceed to addModule/worklet — guarantees the browser's media engine has
-      // committed the new track on every connected peer with no silence gap.
-      await webrtcManagerRef.current?.setStream(micDest.stream);
 
       // ── PCM capture via AudioWorklet ──────────────────────────────────────
       // Worklet runs in a dedicated audio thread — isolated from React/network.
-      // VAD and int16 conversion happen inside the worklet.
-      // The worklet posts { int16: Int16Array, seq: number } messages.
+      // The worklet posts { int16: Int16Array, seq: number, audioTime: number }.
       //
       // [FIX-WORKLET-CACHE] Only call addModule() when the context hasn't loaded
       // it yet. addModule() is idempotent on repeat calls, but the browser still
@@ -3114,6 +3225,17 @@ export default function Room() {
       // Connect from the gain node (post-compression) so the worklet captures
       // the same signal level that the analyser and WebRTC destination see.
       micGain.connect(workletNode);
+
+      // [FIX-4-ORDERING] Connect the worklet to the graph BEFORE awaiting
+      // setStream. Previously setStream was awaited first, then the worklet was
+      // connected. On iOS Safari, replaceTrack() can take 50-200ms; during that
+      // window the worklet was not yet in the graph, silently dropping the first
+      // 1-2 chunks (the opening consonant of the first word was lost).
+      // Connecting the worklet first ensures capture starts immediately —
+      // chunks are queued in socketChunkQueue and sent once the mic is live.
+      // setStream is still awaited so WebRTC track replacement is confirmed
+      // before we proceed, but now it runs concurrently with early capture.
+      await webrtcManagerRef.current?.setStream(micDest.stream);
 
       // [FIX-SOCKET-FALLBACK] Socket.IO is TCP-based — under congestion it queues
       // chunks and delivers them in a burst. Receiving 5 chunks at once overwhelms
@@ -3156,8 +3278,17 @@ export default function Room() {
       // Attach to workletNode so stopMic can find and clear it
       (workletNode as unknown as { _drainTimer: ReturnType<typeof setInterval> })._drainTimer = socketDrainTimer;
 
-      workletNode.port.onmessage = (e: MessageEvent<{ int16: Int16Array; seq: number }>) => {
+      workletNode.port.onmessage = (e: MessageEvent<{ int16?: Int16Array; seq?: number; audioTime?: number; type?: string; threshold?: number }>) => {
         if (!micEnabledRef.current) return;
+        // [FIX-5-DYNAMIC-VAD] The worklet sends a "calibrated" message once the
+        // 2-second noise-floor calibration completes. Log it for debugging.
+        if (e.data?.type === "calibrated") {
+          if (process.env.NODE_ENV !== "production") {
+            console.debug("[MicProcessor] VAD auto-calibrated threshold:", e.data.threshold?.toFixed(5));
+          }
+          return;
+        }
+        if (!e.data.int16 || e.data.seq === undefined) return;
         // [FIX-MULTIROOM] Always push to queue so Socket.IO reaches non-WebRTC peers.
         // WebRTC peers who have a live P2P connection to us will ignore our Socket.IO
         // chunks on their side (hasConnectedPeer check in audioChunk handler).

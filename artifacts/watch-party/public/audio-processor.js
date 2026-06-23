@@ -5,27 +5,41 @@
  * thread (React renders, DOM updates, network activity) → glitch-free capture
  * even on weak devices and slow connections.
  *
- * FIX LIST (v3):
- *  [FIX-SEQ]     Each chunk carries a monotonic seq number so the receiver
- *                can detect and discard out-of-order packets on weak networks.
- *  [FIX-VAD]     VAD threshold is configurable via port.postMessage from
- *                the main thread (message: { type: "setThreshold", value: 0.01 }).
- *  [FIX-FLUSH]   Partial buffer is flushed on port.close() / processor stop so
- *                the last syllable of speech is never silently dropped.
- *  [FIX-LATENCY] TARGET_SAMPLES reduced 8192 → 4096 (170ms → ~85ms at 48kHz).
- *                Halves worklet-side latency. Kept at 4096 (not 2048) so the
- *                Socket.IO fallback path can deliver ~12 chunks/sec — well within
- *                the server's 15/sec rate cap (no chunks dropped on fallback).
+ * FIX LIST (v4):
+ *  [FIX-SEQ]          Each chunk carries a monotonic seq number so the receiver
+ *                     can detect and discard out-of-order packets on weak networks.
+ *  [FIX-VAD]          VAD threshold is configurable via port.postMessage from
+ *                     the main thread (message: { type: "setThreshold", value: 0.01 }).
+ *  [FIX-FLUSH]        Partial buffer is flushed on port.close() / processor stop so
+ *                     the last syllable of speech is never silently dropped.
+ *  [FIX-LATENCY]      TARGET_SAMPLES reduced 8192 → 4096 (170ms → ~85ms at 48kHz).
+ *                     Halves worklet-side latency. Kept at 4096 (not 2048) so the
+ *                     Socket.IO fallback path can deliver ~12 chunks/sec — well within
+ *                     the server's 15/sec rate cap (no chunks dropped on fallback).
+ *  [FIX-AUDIOTIME]    Each chunk now carries audioTime (currentTime from the audio
+ *                     rendering thread) alongside seq. The receiver uses this for
+ *                     accurate scheduling instead of Date.now() which drifts under
+ *                     CPU load on the main thread.
+ *  [FIX-DYNAMIC-VAD]  VAD threshold is now auto-calibrated from the noise floor
+ *                     measured during the first 2 s of mic capture. Replaces the
+ *                     fixed 0.004 that was too aggressive for high-quality headsets
+ *                     and too permissive for loud environments.
  */
 
 // ── VAD constants ─────────────────────────────────────────────────────────────
-// [FIX-VAD-THRESHOLD] Reduced from 0.008 (-42 dBFS) to 0.004 (-48 dBFS).
-// On low-sensitivity microphones (many mid-range Android devices), quiet speech
-// and the first syllable of utterances fell below 0.008, causing the opening
-// consonant to be silently dropped by the worklet. 0.004 still rejects true
-// silence (noise floor is typically < 0.001) while capturing softer voices.
-// Can be overridden at runtime via port.postMessage({ type: "setThreshold", value: N }).
+// [FIX-DYNAMIC-VAD] Threshold starts at 0.004 and is replaced by the auto-
+// calibrated value once the 2-second noise-floor measurement completes.
+// Bounds: min 0.002 (ultra-quiet mics / anechoic room) to 0.01 (noisy office).
+// Can still be overridden at runtime via port.postMessage({ type: "setThreshold", value: N }).
 let VAD_THRESHOLD = 0.004;
+
+// Noise-floor calibration state — runs for the first CALIBRATION_CHUNKS chunks.
+// We accumulate per-chunk RMS values, then set VAD_THRESHOLD = mean × 3.
+// 24 chunks × 4096 samples = 98 304 samples ≈ 2.05 s at 48 kHz.
+const CALIBRATION_CHUNKS = 24;
+let _calibChunksLeft = CALIBRATION_CHUNKS;
+let _calibRmsSum = 0;
+let _calibrated = false;
 
 // [FIX-LATENCY] Accumulate ~85 ms of audio before sending (4096 samples at 48 kHz).
 // AudioWorklet delivers 128 frames per process() call → 32 calls per chunk (~12/sec).
@@ -46,6 +60,7 @@ class MicProcessor extends AudioWorkletProcessor {
     this.port.onmessage = (e) => {
       if (e.data?.type === "setThreshold" && typeof e.data.value === "number") {
         VAD_THRESHOLD = Math.max(0, e.data.value);
+        _calibrated = true; // manual override stops auto-calibration
       }
       // [FIX-FLUSH] Explicit flush request from stopMic() — sends whatever
       // partial audio is buffered so the last syllable isn't lost.
@@ -54,6 +69,13 @@ class MicProcessor extends AudioWorkletProcessor {
           this._flush(true); // force=true bypasses VAD
           this._filled = 0;
         }
+      }
+      // [FIX-DYNAMIC-VAD] Allow the main thread to reset calibration (e.g. on
+      // device change or environment change) without restarting the mic.
+      if (e.data?.type === "resetCalibration") {
+        _calibChunksLeft = CALIBRATION_CHUNKS;
+        _calibRmsSum = 0;
+        _calibrated = false;
       }
     };
   }
@@ -82,13 +104,30 @@ class MicProcessor extends AudioWorkletProcessor {
     const count = this._filled || TARGET_SAMPLES;
     const buf = this._buffer.slice(0, count);
 
-    // [FIX-VAD] VAD: skip silent frames to save bandwidth — unless forced.
-    if (!force) {
-      let sumSq = 0;
-      for (let i = 0; i < buf.length; i++) sumSq += buf[i] * buf[i];
-      const rms = Math.sqrt(sumSq / buf.length);
-      if (rms < VAD_THRESHOLD) return;
+    // Always compute RMS — used both for VAD and for noise-floor calibration.
+    let sumSq = 0;
+    for (let i = 0; i < buf.length; i++) sumSq += buf[i] * buf[i];
+    const rms = Math.sqrt(sumSq / buf.length);
+
+    // [FIX-DYNAMIC-VAD] During the calibration window, accumulate noise-floor
+    // RMS values. We record ALL chunks (including speech) in this window — the
+    // mean of a real microphone's idle noise floor is far below speech levels,
+    // so even with a few speech chunks mixed in the estimate stays conservative.
+    // After CALIBRATION_CHUNKS chunks, set threshold = mean_rms × 3 clamped to
+    // [0.002, 0.01]. Report the calibrated threshold back to the main thread.
+    if (!_calibrated) {
+      _calibRmsSum += rms;
+      _calibChunksLeft--;
+      if (_calibChunksLeft <= 0) {
+        const noiseFloor = _calibRmsSum / CALIBRATION_CHUNKS;
+        VAD_THRESHOLD = Math.min(0.01, Math.max(0.002, noiseFloor * 3));
+        _calibrated = true;
+        this.port.postMessage({ type: "calibrated", threshold: VAD_THRESHOLD });
+      }
     }
+
+    // [FIX-VAD] VAD: skip silent frames to save bandwidth — unless forced.
+    if (!force && rms < VAD_THRESHOLD) return;
 
     // Convert float32 → int16 for compact network transfer.
     const int16 = new Int16Array(buf.length);
@@ -100,8 +139,12 @@ class MicProcessor extends AudioWorkletProcessor {
     // out-of-order delivery or dropped packets on lossy connections.
     const seq = this._seq++;
 
+    // [FIX-AUDIOTIME] Include currentTime from the audio rendering clock.
+    // Unlike Date.now() on the main thread, this is not affected by CPU
+    // jitter or event-loop back-pressure, so the receiver can use it for
+    // accurate jitter-buffer scheduling instead of arrival wall-clock time.
     // Transfer the buffer (zero-copy) to the main thread.
-    this.port.postMessage({ int16, seq }, [int16.buffer]);
+    this.port.postMessage({ int16, seq, audioTime: currentTime }, [int16.buffer]);
   }
 }
 

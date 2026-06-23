@@ -487,9 +487,18 @@ export class WebRTCManager {
         this.startAdaptiveBitrate(memberId, entry);
       } else if (pc.connectionState === "disconnected") {
         // Android Chrome frequently lands here on transient network blips (e.g. switching
-        // between Wi-Fi and mobile data). Give the browser 2 s to self-recover before we
-        // kick off an ICE restart; reduced from 5 s — on iOS the connection doesn't
-        // self-recover after backgrounding so waiting longer just adds latency.
+        // between Wi-Fi and mobile data). Give the browser time to self-recover before we
+        // kick off an ICE restart.
+        //
+        // [FIX-6-RECONNECT-TIMER] Use a network-aware delay instead of a fixed 2s.
+        // On cellular (4G/5G) handoffs between towers, the OS-level reconnect can take
+        // 2.5–4 s — triggering ICE restart at 2 s forces a full round-trip that extends
+        // the audio gap. On Wi-Fi / Ethernet, 2 s is already generous. We read
+        // navigator.connection?.type (Network Information API, supported on Chrome/Android)
+        // and use 4 s for cellular, 2 s for everything else. On browsers that don't
+        // expose connection.type we conservatively default to 3 s.
+        const netType = (navigator as Navigator & { connection?: { type?: string } }).connection?.type;
+        const RECONNECT_DELAY_MS = netType === "cellular" ? 4000 : netType ? 2000 : 3000;
         if (entry.reconnectTimer !== null) return; // already waiting
         entry.reconnectTimer = setTimeout(() => {
           entry.reconnectTimer = null;
@@ -511,7 +520,7 @@ export class WebRTCManager {
             })
             .catch(() => {})
             .finally(() => { entry.makingOffer = false; });
-        }, 2000);
+        }, RECONNECT_DELAY_MS);
       } else if (pc.connectionState === "failed") {
         // Hard failure — restart ICE immediately (no timer needed here).
         if (entry.reconnectTimer !== null) {
