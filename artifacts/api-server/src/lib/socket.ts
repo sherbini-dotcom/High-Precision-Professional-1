@@ -590,14 +590,19 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
           let alreadyApproved =
             approvedMembers.get(roomCode)?.has(member.id) ?? false;
 
-          // FIX IOS-BG: العضو اللي بيعمل reconnect (موجود في الـ DB بـ session token صالح)
-          // سبق وتم قبوله — نعيد إضافته للـ approvedMembers تلقائياً
-          // عشان iOS بيقطع الـ socket بعد 2-3 دقيقة في الخلفية فيُفقد من الذاكرة
+          // FIX IOS-BG (reconnect only): لو العضو كان online قبل كده (isOnline=true في الـ cache)
+          // أو كان في الـ approvedMembers من جلسة سابقة، نتعامل معاه كـ reconnect ونوافق تلقائياً.
+          // لكن لو ده أول مرة يدخل (isOnline=false وماتش في الـ approvedMembers)
+          // → لازم يطلب موافقة الهوست عادي.
           if (accessControlOn && member.role === "guest" && !alreadyApproved) {
-            const roomApproved = approvedMembers.get(roomCode) ?? new Set<number>();
-            roomApproved.add(member.id);
-            approvedMembers.set(roomCode, roomApproved);
-            alreadyApproved = true;
+            const wasOnline = roomOnlineCache.get(roomCode)?.has(member.id) ?? false;
+            if (wasOnline) {
+              // reconnect بعد انقطاع — وافق تلقائياً بدون طلب الهوست
+              const roomApproved = approvedMembers.get(roomCode) ?? new Set<number>();
+              roomApproved.add(member.id);
+              approvedMembers.set(roomCode, roomApproved);
+              alreadyApproved = true;
+            }
           }
 
           const needsApproval =
