@@ -249,6 +249,11 @@ export class WebRTCManager {
   private onNetworkQuality: NetworkQualityCallback | null;
   // Cache remote video streams so stop→restart reuse the same stream object
   private remoteVideoStreams = new Map<number, MediaStream>();
+  // [FIX-ABR-WORST-QUALITY] Last computed NetworkQuality per peer, kept up to
+  // date every ABR tick. Needed so the worst-case calculation below can
+  // actually compare real values across peers instead of re-reading the same
+  // variable it's trying to compute.
+  private lastQualityByPeer = new Map<number, NetworkQuality>();
 
   constructor(
     sendSignal: SignalSender,
@@ -627,16 +632,23 @@ export class WebRTCManager {
         if (this.onNetworkQuality) {
           const quality: NetworkQuality =
             packetLoss > 0.10 ? "poor" : packetLoss > 0.05 ? "fair" : "good";
-          // نحسب الـ worst quality عبر كل الـ peers المتصلين
-          let worstQuality: NetworkQuality = quality;
+          // [FIX-ABR-WORST-QUALITY] خزّن جودة هذا الـ peer ثم احسب الـ worst-case
+          // الحقيقي من بين كل الـ peers المتصلين باستخدام آخر قيمة مخزّنة لكل
+          // واحد منهم. الكود القديم كان يعيد قراءة نفس المتغير (worstQuality)
+          // بدون أي مقارنة فعلية بقيم الـ peers الآخرين، فكانت النتيجة دايمًا
+          // تساوي جودة آخر peer شغّل الـ ABR loop بتاعه فقط.
+          this.lastQualityByPeer.set(memberId, quality);
+
+          const RANK: Record<NetworkQuality, number> = { good: 0, fair: 1, poor: 2, none: 0 };
+          let worstQuality: NetworkQuality = "good";
+          let sawConnectedPeer = false;
           for (const [pid, peer] of this.peers) {
-            if (pid === memberId || peer.pc.connectionState !== "connected") continue;
-            const prevP = (this as unknown as Record<string, { lost: number; recv: number }>)[`abr-prev-${pid}`];
-            if (!prevP) continue;
-            // نأخذ آخر قيمة محسوبة — الـ worst across peers
-            const q = worstQuality; // already updated in next loop iteration
-            if (q === "poor") break;
+            if (peer.pc.connectionState !== "connected") continue;
+            sawConnectedPeer = true;
+            const q = this.lastQualityByPeer.get(pid) ?? "good";
+            if (RANK[q] > RANK[worstQuality]) worstQuality = q;
           }
+          if (!sawConnectedPeer) worstQuality = "none";
           this.onNetworkQuality(worstQuality);
         }
       } catch { /* ignore — peer may be closing */ }
@@ -896,6 +908,7 @@ export class WebRTCManager {
     if (entry.audio.parentNode) entry.audio.parentNode.removeChild(entry.audio);
     this.peers.delete(memberId);
     this.remoteVideoStreams.delete(memberId);
+    this.lastQualityByPeer.delete(memberId);
     // لو مافيش اتصالات متبقية، نخبر الـ UI
     this.notifyNoPeers();
   }
