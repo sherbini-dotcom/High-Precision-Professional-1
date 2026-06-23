@@ -891,40 +891,57 @@ export default function Room() {
       }
 
       // 4. Mic recovery — restart if Android/iOS killed the media stream.
-      if (micEnabledRef.current) {
-        const stream = micStreamRef.current;
-        // [FIX-MIC-TRACK-ENDED] الكود القديم كان يفحص stream.active بس —
-        // لكن لما النت يقطع ويرجع، الـ stream تفضل active لكن الـ track
-        // نفسه بيبقى readyState === "ended" أو muted، فالصوت يقطع بدون
-        // ما الـ recovery تشتغل. الحل: نفحص التراكات نفسها كمان.
-        const trackDead = stream?.getAudioTracks().some(
-          t => t.readyState === "ended" || t.muted
-        ) ?? false;
-        if (!stream || !stream.active || trackDead) {
-          if (micIntervalRef.current) { clearInterval(micIntervalRef.current); micIntervalRef.current = null; }
-          stream?.getTracks().forEach(t => t.stop());
-          micStreamRef.current = null;
-          workletNodeRef.current?.port.close();
-          workletNodeRef.current?.disconnect();
-          workletNodeRef.current = null;
-          // [FIX-WEBRTC-PROCESSED-AUDIO] Drop the WebRTC-bound track explicitly too —
-          // the destination node belongs to the AudioContext we're about to close.
-          webrtcManagerRef.current?.setStream(null);
-          micDestRef.current?.stream.getTracks().forEach(t => t.stop());
-          micDestRef.current = null;
-          if (audioContextRef.current?.state !== "closed") audioContextRef.current?.close().catch(() => {});
-          audioContextRef.current = null;
-          analyserRef.current = null;
-          micEnabledRef.current = false;
-          setMicEnabled(false);
-          setTimeout(() => {
-            if (socketRef.current) {
-              setMicEnabled(prev => { if (!prev) document.dispatchEvent(new CustomEvent("wp:restartMic")); return prev; });
-              document.dispatchEvent(new CustomEvent("wp:restartMic"));
-            }
-          }, 500);
-        }
+      recoverDeadMicIfNeeded();
+    };
+
+    // [FIX-MIC-RECOVERY-SCOPE] Extracted from handleForeground so the SAME
+    // dead-track detection + rebuild also runs on the "online" event (network
+    // dropped and came back while the tab stayed in the foreground). Without
+    // this, handleOnline only re-attached the OLD micDestRef stream to the
+    // freshly recreated WebRTCManager — but micDestRef's track is a synthetic
+    // MediaStreamAudioDestinationNode output, which does NOT go "ended" when
+    // its upstream source (the real microphone track) dies. So the old,
+    // silently-dead audio kept getting reattached as if it were healthy,
+    // and the only way to actually recover was to manually toggle the mic
+    // off/on — which is exactly the symptom users were hitting after a
+    // network blip with the tab still open and focused.
+    // Returns true if a dead mic was detected and a rebuild was kicked off.
+    const recoverDeadMicIfNeeded = (): boolean => {
+      if (!micEnabledRef.current) return false;
+      const stream = micStreamRef.current;
+      // [FIX-MIC-TRACK-ENDED] الكود القديم كان يفحص stream.active بس —
+      // لكن لما النت يقطع ويرجع، الـ stream تفضل active لكن الـ track
+      // نفسه بيبقى readyState === "ended" أو muted، فالصوت يقطع بدون
+      // ما الـ recovery تشتغل. الحل: نفحص التراكات نفسها كمان.
+      const trackDead = stream?.getAudioTracks().some(
+        t => t.readyState === "ended" || t.muted
+      ) ?? false;
+      if (!stream || !stream.active || trackDead) {
+        if (micIntervalRef.current) { clearInterval(micIntervalRef.current); micIntervalRef.current = null; }
+        stream?.getTracks().forEach(t => t.stop());
+        micStreamRef.current = null;
+        workletNodeRef.current?.port.close();
+        workletNodeRef.current?.disconnect();
+        workletNodeRef.current = null;
+        // [FIX-WEBRTC-PROCESSED-AUDIO] Drop the WebRTC-bound track explicitly too —
+        // the destination node belongs to the AudioContext we're about to close.
+        webrtcManagerRef.current?.setStream(null);
+        micDestRef.current?.stream.getTracks().forEach(t => t.stop());
+        micDestRef.current = null;
+        if (audioContextRef.current?.state !== "closed") audioContextRef.current?.close().catch(() => {});
+        audioContextRef.current = null;
+        analyserRef.current = null;
+        micEnabledRef.current = false;
+        setMicEnabled(false);
+        setTimeout(() => {
+          if (socketRef.current) {
+            setMicEnabled(prev => { if (!prev) document.dispatchEvent(new CustomEvent("wp:restartMic")); return prev; });
+            document.dispatchEvent(new CustomEvent("wp:restartMic"));
+          }
+        }, 500);
+        return true;
       }
+      return false;
     };
 
     // visibilitychange: fires on tab switch + screen lock/unlock (most browsers).
@@ -960,6 +977,15 @@ export default function Room() {
         s.disconnect();
         setTimeout(() => s.connect(), 200);
       }
+
+      // [FIX-MIC-RECOVERY-ON-RECONNECT] Check the mic BEFORE deciding whether
+      // to reattach it to the recreated WebRTCManager below. If the real
+      // microphone track died during the network drop, recoverDeadMicIfNeeded
+      // tears the whole mic graph down and triggers a full rebuild via
+      // "wp:restartMic" — which will call WebRTCManager.setStream() itself
+      // once the new mic stream is ready. In that case we must NOT also
+      // reattach the old (now torn-down) micDestRef stream further below.
+      const micWasDead = recoverDeadMicIfNeeded();
 
       // FIX-WEBRTC-ICE-RESTART: network change invalidates existing ICE candidates.
       // Destroy and re-create the WebRTCManager so it gathers new candidates on
@@ -997,7 +1023,12 @@ export default function Room() {
           //    [FIX-WEBRTC-PROCESSED-AUDIO] Use micDestRef (post compressor/gain), not
           //    the raw micStreamRef, so re-negotiated peers keep the same processed
           //    audio quality instead of silently dropping back to an unprocessed track.
-          if (micEnabledRef.current && micDestRef.current) {
+          //    [FIX-MIC-RECOVERY-ON-RECONNECT] Skip this entirely if the mic was just
+          //    detected as dead above — micDestRef.current is null at this point anyway
+          //    (recoverDeadMicIfNeeded already tore it down), and the pending
+          //    "wp:restartMic" rebuild will call setStream() on this same manager once
+          //    a fresh mic stream exists.
+          if (!micWasDead && micEnabledRef.current && micDestRef.current) {
             newManager.setStream(micDestRef.current.stream);
           }
 
@@ -2749,50 +2780,100 @@ export default function Room() {
     if (micIntervalRef.current) { clearInterval(micIntervalRef.current); micIntervalRef.current = null; }
     micStreamRef.current?.getTracks().forEach(t => t.stop());
     micStreamRef.current = null;
-    // [FIX-FLUSH] Ask the worklet to flush any partial buffer before we shut down,
-    // so the last syllable of speech isn't silently dropped.
-    if (workletNodeRef.current) {
-      try { workletNodeRef.current.port.postMessage({ type: "flush" }); } catch { /* ignore */ }
-    }
+
+    const worklet = workletNodeRef.current;
+    const sampleRateAtStop = audioContextRef.current?.sampleRate ?? 48000;
+    const hadConnectedPeers = !!webrtcManagerRef.current?.hasConnectedPeers();
+
     // [FIX-CLEANUP] Explicitly disconnect all mic graph nodes before closing the
     // AudioContext. Skipping this step causes memory leaks on some Android browsers
     // because the nodes hold references to the (now-closed) context's internals.
-    // [FIX-SOCKET-FALLBACK] Clear the socket chunk drain timer attached to the worklet node.
-    const drainTimer = (workletNodeRef.current as unknown as { _drainTimer?: ReturnType<typeof setInterval> })?._drainTimer;
-    if (drainTimer !== undefined) clearInterval(drainTimer);
-    try { workletNodeRef.current?.port.close(); } catch { /* ignore */ }
-    try { workletNodeRef.current?.disconnect(); } catch { /* ignore */ }
-    workletNodeRef.current = null;
-    try { analyserRef.current?.disconnect(); } catch { /* ignore */ }
-    analyserRef.current = null;
-    // [FIX-WEBRTC-PROCESSED-AUDIO] Explicitly remove the audio track from every
-    // WebRTC sender AND stop the destination node's track. Previously the only
-    // thing silencing the WebRTC side was the raw getUserMedia track ending
-    // (which happened to also be the track attached to the sender); now that
-    // WebRTC is fed by a separate MediaStreamDestination track, both must be
-    // torn down explicitly. This also closes most of the gap where a mute
-    // ("forceMuted") only stopped the local capture but never told WebRTC
-    // peer connections to drop the track immediately.
-    webrtcManagerRef.current?.setStream(null);
-    micDestRef.current?.stream.getTracks().forEach(t => t.stop());
-    try { micDestRef.current?.disconnect(); } catch { /* ignore */ }
-    micDestRef.current = null;
-    try { micGainRef.current?.disconnect(); } catch { /* ignore */ }
-    micGainRef.current = null;
-    try { micCompressorRef.current?.disconnect(); } catch { /* ignore */ }
-    micCompressorRef.current = null;
-    try { micSourceRef.current?.disconnect(); } catch { /* ignore */ }
-    micSourceRef.current = null;
-    // [FIX-CTX-REUSE] Do NOT close audioContextRef here — it now points to the
-    // shared audioPlayerRef context which must stay alive for playback and future
-    // mic toggles. Only clear the ref so toggleMic knows no mic graph is active.
-    audioContextRef.current = null;
+    const finishTeardown = () => {
+      // [FIX-SOCKET-FALLBACK] Clear the socket chunk drain timer attached to the worklet node.
+      const drainTimer = (worklet as unknown as { _drainTimer?: ReturnType<typeof setInterval> })?._drainTimer;
+      if (drainTimer !== undefined) clearInterval(drainTimer);
+      try { worklet?.port.close(); } catch { /* ignore */ }
+      try { worklet?.disconnect(); } catch { /* ignore */ }
+      if (workletNodeRef.current === worklet) workletNodeRef.current = null;
+      try { analyserRef.current?.disconnect(); } catch { /* ignore */ }
+      analyserRef.current = null;
+      // [FIX-WEBRTC-PROCESSED-AUDIO] Explicitly remove the audio track from every
+      // WebRTC sender AND stop the destination node's track. Previously the only
+      // thing silencing the WebRTC side was the raw getUserMedia track ending
+      // (which happened to also be the track attached to the sender); now that
+      // WebRTC is fed by a separate MediaStreamDestination track, both must be
+      // torn down explicitly. This also closes most of the gap where a mute
+      // ("forceMuted") only stopped the local capture but never told WebRTC
+      // peer connections to drop the track immediately.
+      webrtcManagerRef.current?.setStream(null);
+      micDestRef.current?.stream.getTracks().forEach(t => t.stop());
+      try { micDestRef.current?.disconnect(); } catch { /* ignore */ }
+      micDestRef.current = null;
+      try { micGainRef.current?.disconnect(); } catch { /* ignore */ }
+      micGainRef.current = null;
+      try { micCompressorRef.current?.disconnect(); } catch { /* ignore */ }
+      micCompressorRef.current = null;
+      try { micSourceRef.current?.disconnect(); } catch { /* ignore */ }
+      micSourceRef.current = null;
+      // [FIX-CTX-REUSE] Do NOT close audioContextRef here — it now points to the
+      // shared audioPlayerRef context which must stay alive for playback and future
+      // mic toggles. Only clear the ref so toggleMic knows no mic graph is active.
+      audioContextRef.current = null;
+    };
+
+    if (worklet) {
+      // [FIX-FLUSH-RACE] Previously we posted "flush" then immediately called
+      // port.close()/disconnect() in the very next line, with no wait. The
+      // worklet processes "flush" on the audio thread and posts its response
+      // back asynchronously — closing the port right away could destroy it
+      // before that final ~170ms chunk ever arrived, silently dropping the
+      // last syllable of speech. Now we briefly hold a one-shot listener:
+      // if the flushed chunk arrives in time, we forward it immediately
+      // (the drain queue/timer is being torn down right after, so we can't
+      // rely on it); otherwise we time out after 60ms and tear down anyway
+      // so stopping the mic never feels sluggish.
+      const prevHandler = worklet.port.onmessage;
+      let settled = false;
+      let timeoutId: ReturnType<typeof setTimeout>;
+      const onFlushResponse = (e: MessageEvent<{ int16: Int16Array; seq: number }>) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutId);
+        worklet.port.onmessage = prevHandler;
+        if (!hadConnectedPeers) {
+          socketRef.current?.emit("audioChunk", {
+            sr: sampleRateAtStop,
+            buf: e.data.int16.buffer,
+            seq: e.data.seq,
+          });
+        }
+        finishTeardown();
+      };
+      worklet.port.onmessage = onFlushResponse;
+      timeoutId = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        worklet.port.onmessage = prevHandler;
+        finishTeardown();
+      }, 60);
+      try {
+        worklet.port.postMessage({ type: "flush" });
+      } catch {
+        clearTimeout(timeoutId);
+        settled = true;
+        finishTeardown();
+      }
+    } else {
+      finishTeardown();
+    }
+
     setMicEnabled(false);
     setSpeakingState(prev => ({ ...prev, [myMemberId]: 0 }));
     socketRef.current?.emit("micDisabled");
     // [FIX-MIC-PERSIST] لما المستخدم يوقف المايك يدوياً، نمسح الـ flag
     try { localStorage.removeItem(`wp_mic_${code}`); } catch { /* ignore */ }
   }, [myMemberId]);
+
 
   const toggleMic = async () => {
     if (micEnabled) { stopMic(); return; }
