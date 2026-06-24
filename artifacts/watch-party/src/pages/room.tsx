@@ -510,6 +510,14 @@ export default function Room() {
   const jitterQueuesRef = useRef<Map<number, SeqMinHeap>>(new Map());
   const jitterDrainTimersRef = useRef<Map<number, ReturnType<typeof setInterval>>>(new Map());
   const micEnabledRef = useRef(false);
+  // [FIX-ONLINE-DEBOUNCE] True while a handleOnline-triggered WebRTCManager
+  // destroy+rebuild is in progress. Flaky connections (weak Wi-Fi, cellular
+  // tower handoff) fire the browser's "online" event multiple times within a
+  // second or two — each call tears down and recreates every peer connection
+  // from scratch. Without this guard, a second "online" event mid-rebuild
+  // destroys the connections the first rebuild just finished negotiating,
+  // which is itself a source of audio stutter/drops on unstable networks.
+  const onlineRebuildPendingRef = useRef(false);
   // [FIX-BG-MIC] Set to true when we go to background with the mic ON.
   // On iOS/Android the mic track silently dies in background — readyState may
   // still say "live" and muted may already be cleared by the time visibilitychange
@@ -1105,6 +1113,16 @@ export default function Room() {
       // reattach the old (now torn-down) micDestRef stream further below.
       const micWasDead = recoverDeadMicIfNeeded();
 
+      // [FIX-ONLINE-DEBOUNCE] A flaky connection (weak Wi-Fi, cellular tower
+      // handoff) fires "online"/"offline" repeatedly within a second or two.
+      // Each call below destroys and rebuilds EVERY peer connection from
+      // scratch — necessary for one real network change, but a second call
+      // arriving mid-rebuild would destroy the connections the first rebuild
+      // just finished negotiating, producing more stutter, not less. Skip
+      // re-entrant rebuilds; the in-flight one already re-gathers fresh ICE
+      // candidates and will cover the same network change.
+      if (onlineRebuildPendingRef.current) return;
+
       // FIX-WEBRTC-ICE-RESTART: network change invalidates existing ICE candidates.
       // Destroy and re-create the WebRTCManager so it gathers new candidates on
       // the restored network interface (WiFi → mobile data, VPN change, etc.).
@@ -1112,6 +1130,12 @@ export default function Room() {
       // new webrtcSignal events have a live channel to travel through.
       const manager = webrtcManagerRef.current;
       if (manager) {
+        onlineRebuildPendingRef.current = true;
+        // Safety net: always release the guard after 5s even if something in
+        // the rebuild chain below throws or the peer list ends up empty in an
+        // unexpected way — a stuck flag must never permanently disable future
+        // reconnect attempts.
+        setTimeout(() => { onlineRebuildPendingRef.current = false; }, 5000);
         setTimeout(() => {
           manager.destroy();
           const newManager = new WebRTCManager(
@@ -1164,8 +1188,14 @@ export default function Room() {
           peers.forEach((m, i) => {
             setTimeout(() => {
               webrtcManagerRef.current?.initiateOffer(m.id);
+              // [FIX-ONLINE-DEBOUNCE] Release the guard once the last re-offer
+              // has been sent so a genuinely NEW network change afterwards can
+              // trigger its own rebuild immediately instead of waiting out the
+              // 5s safety net.
+              if (i === peers.length - 1) onlineRebuildPendingRef.current = false;
             }, i * 300);
           });
+          if (peers.length === 0) onlineRebuildPendingRef.current = false;
         }, 500);
       }
     };
@@ -3121,7 +3151,15 @@ export default function Room() {
       const prevHandler = worklet.port.onmessage;
       let settled = false;
       let timeoutId: ReturnType<typeof setTimeout>;
-      const onFlushResponse = (e: MessageEvent<{ int16: Int16Array; seq: number }>) => {
+      const onFlushResponse = (e: MessageEvent<{ int16?: Int16Array; seq?: number; type?: string }>) => {
+        // [FIX-FLUSH-CALIBRATION-RACE] Ignore any message that isn't the actual
+        // audio chunk — e.g. the one-time "calibrated" notification the worklet
+        // sends if noise-floor calibration finishes during this very flush call.
+        // Without this guard, that message arrives first (no `int16` field) and
+        // `e.data.int16.buffer` below throws, which aborts this handler BEFORE
+        // finishTeardown() runs — leaving the mic graph half torn-down (the bug
+        // behind the "mic freezes" symptom on real devices).
+        if (!e.data || e.data.int16 === undefined) return;
         if (settled) return;
         settled = true;
         clearTimeout(timeoutId);
