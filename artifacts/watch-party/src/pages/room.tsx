@@ -50,6 +50,173 @@ function formatTime(sec: number): string {
 }
 
 
+// ── FloatingMicButton ─────────────────────────────────────────────────────────
+interface FloatingMicProps {
+  micEnabled: boolean;
+  isMuted: boolean;
+  audioLevel: number;
+  onToggle: () => void;
+  onDismiss: () => void;
+}
+
+function FloatingMicButton({ micEnabled, isMuted, audioLevel, onToggle, onDismiss }: FloatingMicProps) {
+  const [pos, setPos] = useState({ x: 24, y: 0 });
+  const [dragging, setDragging] = useState(false);
+  const [overDelete, setOverDelete] = useState(false);
+  const dragRef = useRef({ px: 0, py: 0, bx: 0, by: 0, moved: false });
+  const BUTTON_SIZE = 64;
+
+  useEffect(() => {
+    setPos({ x: 24, y: window.innerHeight - 120 });
+  }, []);
+
+  // Re-clamp position when orientation/size changes so button never goes off-screen
+  useEffect(() => {
+    const clamp = () => {
+      setPos(prev => ({
+        x: Math.max(0, Math.min(window.innerWidth  - BUTTON_SIZE, prev.x)),
+        y: Math.max(0, Math.min(window.innerHeight - BUTTON_SIZE, prev.y)),
+      }));
+    };
+    window.addEventListener("resize", clamp);
+    window.addEventListener("orientationchange", clamp);
+    return () => {
+      window.removeEventListener("resize", clamp);
+      window.removeEventListener("orientationchange", clamp);
+    };
+  }, [BUTTON_SIZE]);
+
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    dragRef.current = { px: e.clientX, py: e.clientY, bx: pos.x, by: pos.y, moved: false };
+    setDragging(true);
+  };
+
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragging) return;
+    const dx = e.clientX - dragRef.current.px;
+    const dy = e.clientY - dragRef.current.py;
+    if (Math.abs(dx) > 6 || Math.abs(dy) > 6) dragRef.current.moved = true;
+    if (!dragRef.current.moved) return;
+    const nx = Math.max(0, Math.min(window.innerWidth  - BUTTON_SIZE, dragRef.current.bx + dx));
+    const ny = Math.max(0, Math.min(window.innerHeight - BUTTON_SIZE, dragRef.current.by + dy));
+    setPos({ x: nx, y: ny });
+    const distDelete = Math.sqrt((e.clientX - window.innerWidth / 2) ** 2 + (e.clientY - (window.innerHeight - 56)) ** 2);
+    setOverDelete(distDelete < 44);
+  };
+
+  const onPointerUp = () => {
+    setDragging(false);
+    if (overDelete) { onDismiss(); return; }
+    if (!dragRef.current.moved) onToggle();
+    setOverDelete(false);
+  };
+
+  // GREEN = mic on & not server-muted  |  RED = mic off OR server-muted
+  const isActive  = micEnabled && !isMuted;
+  const isRed     = !isActive;   // any "not talking" state = red
+  const btnBg     = isActive ? "#16a34a" : "#dc2626";
+  const borderClr = isActive ? "#22c55e" : "#ef4444";
+  const glow      = isActive
+    ? "0 0 0 3px rgba(34,197,94,0.35), 0 6px 24px rgba(34,197,94,0.45)"
+    : "0 0 0 3px rgba(220,38,38,0.25), 0 6px 24px rgba(220,38,38,0.45)";
+  const vol       = Math.min(audioLevel, 100);
+  const r1Scale   = isActive && vol > 8  ? 1 + (vol / 100) * 0.65 : 1;
+  const r2Scale   = isActive && vol > 8  ? 1 + (vol / 100) * 1.1  : 1;
+  const r1Opacity = isActive && vol > 8  ? (vol / 100) * 0.75 : 0;
+  const r2Opacity = isActive && vol > 8  ? (vol / 100) * 0.38 : 0;
+  void isRed; // used via btnBg/borderClr/glow derivation above
+
+  return (
+    <>
+      <style>{`
+        @keyframes fmb-pulse { 0%,100%{opacity:.7;} 50%{opacity:.3;} }
+      `}</style>
+
+      {/* Floating button wrapper */}
+      <div
+        style={{ position: "fixed", left: pos.x, top: pos.y, zIndex: 100002, touchAction: "none", userSelect: "none", width: BUTTON_SIZE, height: BUTTON_SIZE }}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+      >
+        {/* Outer ring 2 — softer, bigger */}
+        <div style={{
+          position: "absolute", inset: -18, borderRadius: "50%",
+          border: `2px solid ${isActive ? "#22c55e" : "transparent"}`,
+          opacity: r2Opacity, transform: `scale(${r2Scale})`,
+          transition: "transform 0.1s linear, opacity 0.1s linear",
+          pointerEvents: "none",
+        }} />
+        {/* Outer ring 1 — sharper */}
+        <div style={{
+          position: "absolute", inset: -10, borderRadius: "50%",
+          border: `2.5px solid ${isActive ? "#22c55e" : "transparent"}`,
+          opacity: r1Opacity, transform: `scale(${r1Scale})`,
+          transition: "transform 0.08s linear, opacity 0.08s linear",
+          pointerEvents: "none",
+        }} />
+        {/* Main button */}
+        <div style={{
+          width: BUTTON_SIZE, height: BUTTON_SIZE, borderRadius: "50%",
+          backgroundColor: btnBg,
+          border: `2.5px solid ${borderClr}`,
+          boxShadow: glow,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          color: "white",
+          cursor: dragging ? "grabbing" : "grab",
+          transition: "background-color 0.25s, box-shadow 0.25s, border-color 0.25s",
+          backdropFilter: "blur(12px)",
+          WebkitBackdropFilter: "blur(12px)",
+        }}>
+          {isMuted
+            ? <MicOff size={28} />
+            : micEnabled
+            ? <Mic size={28} />
+            : <Mic size={28} style={{ opacity: 0.5 }} />
+          }
+        </div>
+        {/* Volume label */}
+        {isActive && (
+          <div style={{
+            position: "absolute", bottom: -22, left: "50%", transform: "translateX(-50%)",
+            fontSize: 11, fontWeight: 700, color: "#22c55e",
+            textShadow: "0 1px 4px rgba(0,0,0,0.8)",
+            pointerEvents: "none", whiteSpace: "nowrap", letterSpacing: "0.04em",
+          }}>
+            {vol > 5 ? `${Math.round(vol)}%` : ""}
+          </div>
+        )}
+      </div>
+
+      {/* Delete drop zone */}
+      {dragging && (
+        <div style={{
+          position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)",
+          zIndex: 100001, pointerEvents: "none",
+          width: 72, height: 72, borderRadius: "50%",
+          backgroundColor: overDelete ? "rgba(220,38,38,0.9)" : "rgba(10,10,20,0.75)",
+          border: `2.5px solid ${overDelete ? "#f87171" : "rgba(255,255,255,0.22)"}`,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          backdropFilter: "blur(14px)", WebkitBackdropFilter: "blur(14px)",
+          boxShadow: overDelete ? "0 0 24px rgba(220,38,38,0.6)" : "0 4px 20px rgba(0,0,0,0.5)",
+          transition: "background-color 0.15s, border-color 0.15s, box-shadow 0.15s",
+        }}>
+          <X size={28} color="white" />
+          <div style={{
+            position: "absolute", bottom: -20, left: "50%", transform: "translateX(-50%)",
+            fontSize: 10, fontWeight: 700, color: "rgba(255,255,255,0.7)",
+            whiteSpace: "nowrap", letterSpacing: "0.05em",
+          }}>
+            {overDelete ? "RELEASE TO REMOVE" : "DRAG HERE TO REMOVE"}
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
 export default function Room() {
   const [, params] = useRoute("/room/:code");
   const code = params?.code?.toUpperCase() ?? "";
@@ -92,6 +259,7 @@ export default function Room() {
   const [duration, setDuration] = useState(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isBrowserFullscreen, setIsBrowserFullscreen] = useState(false);
+  const [floatMicVisible, setFloatMicVisible] = useState(false);
   const [iosFullscreenControlsVisible, setIOSFullscreenControlsVisible] = useState(true);
   const iosFullscreenTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isIOSDevice = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
@@ -1894,6 +2062,13 @@ export default function Room() {
     isBrowserFullscreenRef.current = isBrowserFullscreen;
   }, [isBrowserFullscreen]);
 
+  // Show floating mic whenever entering fullscreen browser mode
+  useEffect(() => {
+    if (isBrowserFullscreen && mode === "browser" && hyperbeamEmbed) {
+      setFloatMicVisible(true);
+    }
+  }, [isBrowserFullscreen, mode, hyperbeamEmbed]);
+
   useEffect(() => {
     const mq = window.matchMedia("(orientation: landscape)");
     const handler = (e: MediaQueryListEvent) => {
@@ -3639,6 +3814,17 @@ export default function Room() {
         </div>
       </div>
     )}
+    {/* ── Floating Mic Button — fullscreen browser mode only ── */}
+    {isBrowserFullscreen && mode === "browser" && hyperbeamEmbed && floatMicVisible && (
+      <FloatingMicButton
+        micEnabled={micEnabled}
+        isMuted={!!members.find(m => m.id === myMemberId)?.isMuted}
+        audioLevel={speakingState[myMemberId] ?? 0}
+        onToggle={() => { void toggleMic(); }}
+        onDismiss={() => setFloatMicVisible(false)}
+      />
+    )}
+
     <div className="bg-background flex flex-col overflow-hidden" style={{ height: "100%" }}>
       {/* Top bar — 2-row layout */}
       <div ref={headerRef} className="border-b border-border bg-card/50 backdrop-blur-sm flex-shrink-0" style={{ paddingTop: "env(safe-area-inset-top)" }}>
