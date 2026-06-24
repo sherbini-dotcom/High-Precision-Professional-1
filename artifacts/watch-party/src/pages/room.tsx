@@ -229,12 +229,6 @@ export default function Room() {
           if (!AudioCtxClass) return;
           const newCtx = new AudioCtxClass();
           audioPlayerRef.current = newCtx;
-          // [FIX-WORKLET-PRELOAD-RESUME] Also preload the worklet on the recreated
-          // context so the next mic toggle doesn't hit the 50-200ms addModule delay.
-          newCtx.audioWorklet
-            .addModule("/audio-processor.js")
-            .then(() => { workletModuleLoadedForCtxRef.current = audioPlayerRef.current; })
-            .catch(() => { /* non-fatal — toggleMic will retry */ });
           try {
             const buf = newCtx.createBuffer(1, newCtx.sampleRate, newCtx.sampleRate);
             const ch2 = buf.getChannelData(0);
@@ -418,97 +412,11 @@ export default function Room() {
   // Tracks the last play() promise so safePause can wait for it before pausing,
   // preventing "play() interrupted by pause()" AbortErrors in the console.
   const playPromiseRef = useRef<Promise<void> | null>(null);
-  // [FIX] workletNodeRef replaces the deprecated ScriptProcessorNode.
-  // AudioWorkletNode runs in a dedicated audio thread — never blocked by React
-  // renders or network I/O — giving glitch-free capture on weak connections.
-  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
-  // [FIX-CLEANUP] Keep refs to all mic graph nodes so stopMic() can disconnect
-  // them explicitly before closing the context — prevents memory leaks on Android.
-  const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const micCompressorRef = useRef<DynamicsCompressorNode | null>(null);
-  const micGainRef = useRef<GainNode | null>(null);
-  // [FIX-WEBRTC-PROCESSED-AUDIO] Destination node that receives the PROCESSED
-  // signal (compressor + makeup gain) and is what we actually hand to WebRTC.
-  // Previously WebRTCManager.setStream() was given the raw getUserMedia stream
-  // directly, so the entire compressor/gain chain built below only ever fed the
-  // volume meter and the Socket.IO fallback worklet — the common-case WebRTC
-  // path carried completely unprocessed audio (no AGC, since we disabled the
-  // browser's own AGC to avoid double-AGC with a compressor that, in practice,
-  // never reached that path). Now both paths hear the same processed signal.
-  const micDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
-  // [FIX-WORKLET-CACHE] Track which AudioContext instance already had the worklet
-  // module registered. addModule() is idempotent on the same context but still
-  // fires a network request every call — causing 50-200ms of startup delay on
-  // every mic toggle after the first. Skipping it when the module is already
-  // registered makes subsequent mic opens feel instant.
-  const workletModuleLoadedForCtxRef = useRef<AudioContext | null>(null);
+  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const audioPlayerRef = useRef<AudioContext | null>(null);
   const silentKeepAliveRef = useRef<AudioBufferSourceNode | null>(null);
   const wasPlayingBeforeHiddenRef = useRef(false);
   const nextAudioTimeRef = useRef<Map<number, number>>(new Map());
-  // [FIX-SEQ] Per-speaker last-received sequence number — used to detect and
-  // discard out-of-order audio packets on lossy connections.
-  const lastAudioSeqRef = useRef<Map<number, number>>(new Map());
-  // [FIX-CLICK] One persistent DynamicsCompressor per speaker.
-  // Creating a new compressor for every 170ms chunk made it start from zero each
-  // time → abrupt gain-reduction jumps → audible clicking. A persistent node
-  // keeps the compressor's gain-reduction history between chunks → smooth audio.
-  const speakerCompressorsRef = useRef<Map<number, DynamicsCompressorNode>>(new Map());
-  // [FIX-ADAPTIVE-JITTER] Per-speaker adaptive cushion (seconds). Starts at 120ms,
-  // grows when bursts are detected (Socket.IO TCP stalls), shrinks when network is clean.
-  const jitterCushionRef = useRef<Map<number, number>>(new Map());
-
-  // ── [FIX-1-JITTER-QUEUE] Per-speaker MinHeap ordered by seq ───────────────
-  // Replaces the old "schedule immediately on arrival" approach.
-  // Incoming chunks are pushed into a per-speaker heap; a scheduler loop drains
-  // them in seq order at the correct audioContext time, preventing burst-induced
-  // out-of-order playback and the silence gaps that followed.
-  type JitterChunk = {
-    seq: number;
-    audioBuf: AudioBuffer;
-    // audioTime from the worklet clock at the moment the chunk was produced.
-    // Used for scheduling even when the main-thread Date.now() has drifted.
-    audioTime: number | undefined;
-  };
-  // MinHeap keyed by seq so the lowest seq is always at index 0.
-  class SeqMinHeap {
-    private h: JitterChunk[] = [];
-    push(c: JitterChunk) {
-      this.h.push(c);
-      let i = this.h.length - 1;
-      while (i > 0) {
-        const p = (i - 1) >> 1;
-        if (this.h[p].seq <= this.h[i].seq) break;
-        [this.h[p], this.h[i]] = [this.h[i], this.h[p]];
-        i = p;
-      }
-    }
-    pop(): JitterChunk | undefined {
-      if (!this.h.length) return undefined;
-      const top = this.h[0];
-      const last = this.h.pop()!;
-      if (this.h.length) {
-        this.h[0] = last;
-        let i = 0;
-        for (;;) {
-          const l = 2 * i + 1, r = 2 * i + 2;
-          let s = i;
-          if (l < this.h.length && this.h[l].seq < this.h[s].seq) s = l;
-          if (r < this.h.length && this.h[r].seq < this.h[s].seq) s = r;
-          if (s === i) break;
-          [this.h[i], this.h[s]] = [this.h[s], this.h[i]];
-          i = s;
-        }
-      }
-      return top;
-    }
-    peek(): JitterChunk | undefined { return this.h[0]; }
-    get size() { return this.h.length; }
-    clear() { this.h = []; }
-  }
-  // Per-speaker jitter heaps and their drain-loop interval handles.
-  const jitterQueuesRef = useRef<Map<number, SeqMinHeap>>(new Map());
-  const jitterDrainTimersRef = useRef<Map<number, ReturnType<typeof setInterval>>>(new Map());
   const micEnabledRef = useRef(false);
   // [FIX-ONLINE-DEBOUNCE] True while a handleOnline-triggered WebRTCManager
   // destroy+rebuild is in progress. Flaky connections (weak Wi-Fi, cellular
@@ -781,16 +689,6 @@ export default function Room() {
         // Default (no hint) keeps the "music" session type that iOS allows in background.
         audioPlayerRef.current = new AudioCtxClass();
 
-        // [FIX-WORKLET-PRELOAD] Pre-load the worklet module right after context
-        // creation so it's cached by the time the user first presses the mic button.
-        // Without this, addModule() runs AFTER the mic press (50-200ms delay) and
-        // the opening syllable of the first sentence is silently dropped.
-        // toggleMic() guards with workletModuleLoadedForCtxRef so it won't reload.
-        audioPlayerRef.current.audioWorklet
-          .addModule("/audio-processor.js")
-          .then(() => { workletModuleLoadedForCtxRef.current = audioPlayerRef.current; })
-          .catch(() => { /* non-fatal — toggleMic will retry */ });
-
         // iOS keep-alive: loop a buffer with imperceptible low-level noise so iOS
         // detects a real audio signal and keeps the audio session alive on lock screen.
         // An all-zeros buffer (gain 0.0001) is indistinguishable from silence to iOS
@@ -1025,26 +923,10 @@ export default function Room() {
         if (micIntervalRef.current) { clearInterval(micIntervalRef.current); micIntervalRef.current = null; }
         stream?.getTracks().forEach(t => t.stop());
         micStreamRef.current = null;
-        workletNodeRef.current?.port.close();
-        workletNodeRef.current?.disconnect();
-        workletNodeRef.current = null;
-        // [FIX-WEBRTC-PROCESSED-AUDIO] Drop the WebRTC-bound track explicitly too —
-        // the destination node belongs to the AudioContext we're about to close.
-        webrtcManagerRef.current?.setStream(null);
-        micDestRef.current?.stream.getTracks().forEach(t => t.stop());
-        try { micDestRef.current?.disconnect(); } catch { /* ignore */ }
-        micDestRef.current = null;
-        try { micGainRef.current?.disconnect(); } catch { /* ignore */ }
-        micGainRef.current = null;
-        try { micCompressorRef.current?.disconnect(); } catch { /* ignore */ }
-        micCompressorRef.current = null;
-        try { micSourceRef.current?.disconnect(); } catch { /* ignore */ }
-        micSourceRef.current = null;
-        // [FIX-SHARED-CTX] Do NOT close audioContextRef here — after FIX-CTX-REUSE,
-        // audioContextRef.current === audioPlayerRef.current (the same shared context
-        // used for BOTH mic capture AND incoming audio playback). Closing it would
-        // silence all received audio until the room is reloaded. Just null the ref
-        // so the next toggleMic() picks up the still-running shared context.
+        scriptProcessorRef.current?.disconnect();
+        scriptProcessorRef.current = null;
+        void webrtcManagerRef.current?.setStream(null);
+        if (audioContextRef.current?.state !== "closed") audioContextRef.current?.close().catch(() => {});
         audioContextRef.current = null;
         analyserRef.current = null;
         micEnabledRef.current = false;
@@ -1162,18 +1044,12 @@ export default function Room() {
           //    localStream = null, so any peer it creates would carry no audio —
           //    the exact same bug as the original missing setStream() call, just
           //    triggered by manager recreation instead of by toggleMic never being wired up.
-          //    [FIX-WEBRTC-PROCESSED-AUDIO] Use micDestRef (post compressor/gain), not
-          //    the raw micStreamRef, so re-negotiated peers keep the same processed
-          //    audio quality instead of silently dropping back to an unprocessed track.
-          //    [FIX-MIC-RECOVERY-ON-RECONNECT] Skip this entirely if the mic was just
-          //    detected as dead above — micDestRef.current is null at this point anyway
-          //    (recoverDeadMicIfNeeded already tore it down), and the pending
-          //    "wp:restartMic" rebuild will call setStream() on this same manager once
-          //    a fresh mic stream exists.
-          if (!micWasDead && micEnabledRef.current && micDestRef.current) {
-            // [FIX-P2] void — this runs inside a socket event handler (sync context).
-            // The Promise resolves asynchronously; we don't need to wait for it here.
-            void newManager.setStream(micDestRef.current.stream);
+          //    Skip this entirely if the mic was just detected as dead above —
+          //    micStreamRef.current is null at this point anyway (recoverDeadMicIfNeeded
+          //    already tore it down), and the pending "wp:restartMic" rebuild will call
+          //    setStream() on this same manager once a fresh mic stream exists.
+          if (!micWasDead && micEnabledRef.current && micStreamRef.current) {
+            void newManager.setStream(micStreamRef.current);
           }
 
           // 2. Re-initiate offers to existing online peers. webrtcInitiatedRef is
@@ -1587,185 +1463,36 @@ export default function Room() {
       webrtcManagerRef.current?.resumeAllAudio();
       // Force reset next-play-time for this member so first chunk plays immediately
       nextAudioTimeRef.current.delete(memberId);
-      // [FIX-1-JITTER-QUEUE] Reset the jitter heap so stale chunks from the
-      // previous mic session are not replayed when the member re-enables.
-      jitterQueuesRef.current.get(memberId)?.clear();
     });
     socket.on("peerMicDisabled", ({ memberId }: { memberId: number }) => {
       nextAudioTimeRef.current.delete(memberId);
-      lastAudioSeqRef.current.delete(memberId);
-      jitterCushionRef.current.delete(memberId);
-      // [FIX-1-JITTER-QUEUE] Stop the drain loop and clear the heap for this speaker.
-      const drainTimer = jitterDrainTimersRef.current.get(memberId);
-      if (drainTimer) { clearInterval(drainTimer); jitterDrainTimersRef.current.delete(memberId); }
-      jitterQueuesRef.current.get(memberId)?.clear();
-      jitterQueuesRef.current.delete(memberId);
-      // [FIX-3] Disconnect and discard persistent compressor when mic is disabled.
-      // Next time the speaker enables mic a fresh compressor is created.
-      speakerCompressorsRef.current.get(memberId)?.disconnect();
-      speakerCompressorsRef.current.delete(memberId);
       setSpeakingState(prev => ({ ...prev, [memberId]: 0 }));
     });
-    socket.on("audioChunk", ({ fromMemberId, sr, buf, seq, audioTime }: { fromMemberId: number; sr: number; buf: ArrayBuffer; seq?: number; audioTime?: number }) => {
+    socket.on("audioChunk", ({ fromMemberId, sr, buf }: { fromMemberId: number; sr: number; buf: ArrayBuffer }) => {
       const ctx = audioPlayerRef.current;
       if (!ctx) return;
       if (fromMemberId === myMemberId) return;
-      // [FIX-MULTIROOM] If we have a live WebRTC P2P connection with this sender,
-      // their audio is already arriving via the WebRTC audio element — ignore the
-      // Socket.IO copy to prevent double-audio. Peers without WebRTC will NOT match
-      // this check and will correctly receive via the jitter buffer below.
-      if (webrtcManagerRef.current?.hasConnectedPeer(fromMemberId)) return;
       if (ctx.state === "suspended") ctx.resume().catch(() => {});
-
-      // [FIX-SEQ] Discard out-of-order packets. seq is optional for older server
-      // versions — when present we only drop TRUE duplicates / extreme reorders
-      // (seq <= lastSeq - 3). Mild reordering (e.g. seq = lastSeq + 1 arriving
-      // after seq = lastSeq + 2) is handled correctly by the MinHeap below.
-      const resolvedSeq = seq ?? Date.now(); // fallback: wall-clock as tiebreaker
-      if (seq !== undefined) {
-        const lastSeq = lastAudioSeqRef.current.get(fromMemberId) ?? -1;
-        if (seq <= lastSeq - 3) return; // extreme reorder / duplicate — drop silently
-      }
-
       try {
         const int16 = new Int16Array(buf);
         const float32 = new Float32Array(int16.length);
         for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32767;
         const audioBuf = ctx.createBuffer(1, float32.length, sr);
         audioBuf.getChannelData(0).set(float32);
-
-        // ── [FIX-1-JITTER-QUEUE] Push into MinHeap; drain loop schedules playback ──
-        // Previously chunks were scheduled immediately on arrival. When a TCP burst
-        // delivered 3-4 chunks at once they were all scheduled at ~(now+cushion),
-        // overlapping each other → audible glitches. The MinHeap ensures seq-ordered
-        // drain regardless of arrival order.
-        let heap = jitterQueuesRef.current.get(fromMemberId);
-        if (!heap) {
-          heap = new SeqMinHeap();
-          jitterQueuesRef.current.set(fromMemberId, heap);
-        }
-        heap.push({ seq: resolvedSeq, audioBuf, audioTime });
-
-        // Ensure a drain loop is running for this speaker.
-        if (!jitterDrainTimersRef.current.has(fromMemberId)) {
-          // ── Per-speaker persistent compressor ─────────────────────────────
-          // [FIX-CLICK] Create ONCE per speaker; keeps gain-reduction history
-          // across chunks → no abrupt jumps → no inter-chunk clicks.
-          let compressor = speakerCompressorsRef.current.get(fromMemberId);
-          if (!compressor) {
-            compressor = ctx.createDynamicsCompressor();
-            compressor.threshold.value = -24;
-            compressor.knee.value = 10;
-            compressor.ratio.value = 3;
-            compressor.attack.value = 0.003;
-            compressor.release.value = 0.25;
-            compressor.connect(ctx.destination);
-            speakerCompressorsRef.current.set(fromMemberId, compressor);
-          }
-
-          // Drain loop: runs every 20 ms, schedules the next chunk from the heap
-          // when it is within a 300ms lookahead window of the audio clock.
-          // 20ms is small enough to schedule before the chunk's deadline and
-          // large enough to avoid waking the event loop too aggressively.
-          const LOOKAHEAD_S = 0.3; // schedule chunks up to 300ms ahead
-          const FADE_S = 0.003;    // 3ms fade-in only — no fade-out (see below)
-
-          // [FIX-DRAIN-GAP] Grace counter: keep the drain loop alive for up to
-          // 150ms of empty heap (7 × 20ms ticks) before stopping. Without this,
-          // any momentary pause in speech (even 1 TCP packet gap) stops the loop
-          // and the next chunk restarts it with a forced now+cushion delay, creating
-          // an audible ~60ms gap at the start of every resumed utterance.
-          let emptyTicks = 0;
-          const MAX_EMPTY_TICKS = 7; // 7 × 20ms = 140ms grace
-
-          const drainTimer = setInterval(() => {
-            const heap = jitterQueuesRef.current.get(fromMemberId);
-            const comp = speakerCompressorsRef.current.get(fromMemberId);
-            const audioCtx = audioPlayerRef.current;
-            if (!heap || !comp || !audioCtx) return;
-            if (audioCtx.state === "suspended") return;
-
-            const now = audioCtx.currentTime;
-            const jitterMap = jitterCushionRef.current;
-            const prevCushion = jitterMap.get(fromMemberId) ?? 0.06;
-
-            // Drain all chunks that should be scheduled within the lookahead window.
-            while (heap.size > 0) {
-              const chunk = heap.peek()!;
-              const CHUNK_DUR = chunk.audioBuf.duration;
-
-              // [FIX-2-AUDIOTIME] Compute adaptive cushion using the worklet's
-              // audioTime to avoid main-thread Date.now() drift under CPU load.
-              const prev = nextAudioTimeRef.current.get(fromMemberId) ?? 0;
-              const arrivalGap = prev > 0 ? Math.max(0, prev - now) : 0;
-              const newCushion = arrivalGap > CHUNK_DUR * 1.5
-                ? Math.min(prevCushion + 0.02, 0.3)   // bursty → grow up to 300ms
-                : Math.max(prevCushion - 0.005, 0.04); // smooth → decay to 40ms
-              jitterMap.set(fromMemberId, newCushion);
-
-              // Compute ideal start time for the next chunk.
-              const maxDrift = CHUNK_DUR + newCushion;
-              const startAt = (prev > now + maxDrift)
-                ? now + newCushion
-                : Math.max(now + newCushion, prev);
-
-              // Only schedule chunks that fall within the lookahead window.
-              if (startAt > now + LOOKAHEAD_S) break;
-
-              // Consume from heap and update seq tracking.
-              heap.pop();
-              if (seq !== undefined) {
-                const lastSeq = lastAudioSeqRef.current.get(fromMemberId) ?? -1;
-                if (chunk.seq > lastSeq) lastAudioSeqRef.current.set(fromMemberId, chunk.seq);
-              }
-
-              const endAt = startAt + chunk.audioBuf.duration;
-
-              // Schedule playback through the persistent compressor.
-              const src = audioCtx.createBufferSource();
-              src.buffer = chunk.audioBuf;
-              const fadeGain = audioCtx.createGain();
-              src.connect(fadeGain);
-              fadeGain.connect(comp);
-              // [FIX-LEAK] Disconnect fadeGain after playback ends — prevents
-              // zombie GainNodes accumulating on the compressor over long calls.
-              src.addEventListener("ended", () => {
-                try { fadeGain.disconnect(); } catch { /* ignore */ }
-              }, { once: true });
-
-              // [FIX-FADE-DIP] Fade-in ONLY — no fade-out.
-              // The old approach faded gain to 0 at endAt and the next chunk faded
-              // in from 0 at the same instant → amplitude dip to 0 at every 85ms
-              // boundary, audible as a 12Hz tremolo / robotic flutter in continuous
-              // speech. Fix: ramp in from 0 on start, then hold at 1.0 for the full
-              // buffer duration. The AudioBufferSourceNode stops automatically when
-              // the buffer finishes (= endAt), so no explicit src.stop() is needed.
-              // With no fade-out, consecutive chunk boundaries are seamless.
-              fadeGain.gain.setValueAtTime(0, startAt);
-              fadeGain.gain.linearRampToValueAtTime(1.0, startAt + FADE_S);
-
-              src.start(startAt);
-              // No src.stop() — buffer plays to natural end (= endAt implicitly).
-              nextAudioTimeRef.current.set(fromMemberId, endAt);
-            }
-
-            // [FIX-DRAIN-GAP] Grace-period stop: only stop after MAX_EMPTY_TICKS
-            // consecutive empty-heap ticks. A single empty tick (heap momentarily
-            // drained between two network packets) no longer kills the loop,
-            // preventing the now+cushion restart-gap on the next chunk.
-            if (heap.size === 0) {
-              emptyTicks++;
-              if (emptyTicks >= MAX_EMPTY_TICKS) {
-                clearInterval(drainTimer);
-                jitterDrainTimersRef.current.delete(fromMemberId);
-              }
-            } else {
-              emptyTicks = 0;
-            }
-          }, 20);
-
-          jitterDrainTimersRef.current.set(fromMemberId, drainTimer);
-        }
+        const src = ctx.createBufferSource();
+        src.buffer = audioBuf;
+        const playGain = ctx.createGain();
+        playGain.gain.value = 2.0;
+        src.connect(playGain);
+        playGain.connect(ctx.destination);
+        const now = ctx.currentTime;
+        const prev = nextAudioTimeRef.current.get(fromMemberId) ?? 0;
+        const maxDrift = 0.3;
+        const startAt = (prev > now + maxDrift)
+          ? now + 0.02
+          : Math.max(now + 0.02, prev);
+        src.start(startAt);
+        nextAudioTimeRef.current.set(fromMemberId, startAt + audioBuf.duration);
       } catch { /* ignore decode errors */ }
     });
     socket.on("modeChange", ({ mode: m }: { mode: "video" | "browser" | "screenshare" | "movies" }) => {
@@ -1904,16 +1631,6 @@ export default function Room() {
         // this member joins and enables mic a fresh compressor is created.
         for (const id of batch) {
           nextAudioTimeRef.current.delete(id);
-          lastAudioSeqRef.current.delete(id);
-          jitterCushionRef.current.delete(id);
-          // [FIX-1-JITTER-QUEUE] + [FIX-3] Clean up heap and drain timer for
-          // members who left abruptly without sending "micDisabled".
-          const dt = jitterDrainTimersRef.current.get(id);
-          if (dt) { clearInterval(dt); jitterDrainTimersRef.current.delete(id); }
-          jitterQueuesRef.current.get(id)?.clear();
-          jitterQueuesRef.current.delete(id);
-          speakerCompressorsRef.current.get(id)?.disconnect();
-          speakerCompressorsRef.current.delete(id);
           webrtcManagerRef.current?.removePeer(id);
         }
       }, 100); // 100 ms debounce — batches mass-exit cascade into one update
@@ -1952,16 +1669,6 @@ export default function Room() {
       if (audioPlayerRef.current?.state !== "closed") audioPlayerRef.current?.close().catch(() => {});
       audioPlayerRef.current = null;
       nextAudioTimeRef.current.clear();
-      lastAudioSeqRef.current.clear();
-      jitterCushionRef.current.clear();
-      // [FIX-1-JITTER-QUEUE] Stop all drain loops and clear heaps on room exit.
-      jitterDrainTimersRef.current.forEach(t => clearInterval(t));
-      jitterDrainTimersRef.current.clear();
-      jitterQueuesRef.current.forEach(h => h.clear());
-      jitterQueuesRef.current.clear();
-      // [FIX-3] Discard all persistent speaker compressors on room exit.
-      speakerCompressorsRef.current.forEach(c => { try { c.disconnect(); } catch { /* already closed */ } });
-      speakerCompressorsRef.current.clear();
     };
   }, [code, sessionToken]);
 
@@ -3065,143 +2772,19 @@ export default function Room() {
   }, [isConnected]);
 
   const stopMic = useCallback(() => {
-    // [FIX-REF-SYNC] Set the ref to false synchronously BEFORE any async work.
-    // stopMic() calls setMicEnabled(false) which is a React state update — the
-    // corresponding useEffect that syncs micEnabledRef only runs after the next
-    // render. If finishTeardown() fires (60ms later) before that render, the ref
-    // still reads true and the setStream(null) guard is skipped, leaving a dead
-    // track attached to every WebRTC peer connection. Setting it here closes the gap.
     micEnabledRef.current = false;
     if (micIntervalRef.current) { clearInterval(micIntervalRef.current); micIntervalRef.current = null; }
     micStreamRef.current?.getTracks().forEach(t => t.stop());
     micStreamRef.current = null;
-
-    const worklet = workletNodeRef.current;
-    const sampleRateAtStop = audioContextRef.current?.sampleRate ?? 48000;
-    const hadConnectedPeers = !!webrtcManagerRef.current?.hasConnectedPeers();
-
-    // [FIX-RACE-TOGGLE] Capture all audio-graph node refs NOW (synchronously),
-    // before any async delay. If the user reopens the mic within the 60ms flush
-    // window, toggleMic() will overwrite every ref (micDestRef, micGainRef, etc.)
-    // with the NEW session's nodes. Without this capture, finishTeardown would
-    // then destroy the brand-new session instead of the old one — leaving the
-    // user with micEnabled=true but no audio reaching peers.
-    const capturedAnalyser   = analyserRef.current;
-    const capturedMicDest    = micDestRef.current;
-    const capturedMicGain    = micGainRef.current;
-    const capturedMicComp    = micCompressorRef.current;
-    const capturedMicSource  = micSourceRef.current;
-
-    // [FIX-CLEANUP] Explicitly disconnect all mic graph nodes before closing the
-    // AudioContext. Skipping this step causes memory leaks on some Android browsers
-    // because the nodes hold references to the (now-closed) context's internals.
-    const finishTeardown = () => {
-      // [FIX-SOCKET-FALLBACK] Clear the socket chunk drain timer attached to the worklet node.
-      const drainTimer = (worklet as unknown as { _drainTimer?: ReturnType<typeof setInterval> })?._drainTimer;
-      if (drainTimer !== undefined) clearInterval(drainTimer);
-      try { worklet?.port.close(); } catch { /* ignore */ }
-      try { worklet?.disconnect(); } catch { /* ignore */ }
-      if (workletNodeRef.current === worklet) workletNodeRef.current = null;
-      try { capturedAnalyser?.disconnect(); } catch { /* ignore */ }
-      if (analyserRef.current === capturedAnalyser) analyserRef.current = null;
-      // [FIX-WEBRTC-PROCESSED-AUDIO] Explicitly remove the audio track from every
-      // WebRTC sender AND stop the destination node's track. Previously the only
-      // thing silencing the WebRTC side was the raw getUserMedia track ending
-      // (which happened to also be the track attached to the sender); now that
-      // WebRTC is fed by a separate MediaStreamDestination track, both must be
-      // torn down explicitly. This also closes most of the gap where a mute
-      // ("forceMuted") only stopped the local capture but never told WebRTC
-      // peer connections to drop the track immediately.
-      //
-      // [FIX-RACE-TOGGLE] Guard: only null WebRTC stream if the mic is still OFF.
-      // If the user reopened the mic before this timer fired, the new
-      // setStream(micDest.stream) call in toggleMic is already active — calling
-      // setStream(null) here would silence that freshly-started session.
-      // [FIX-P2] void the promise — finishTeardown is a sync callback inside a
-      // setTimeout; awaiting would not help since we're not in an async function.
-      if (!micEnabledRef.current) {
-        void webrtcManagerRef.current?.setStream(null);
-      }
-      capturedMicDest?.stream.getTracks().forEach(t => t.stop());
-      try { capturedMicDest?.disconnect(); } catch { /* ignore */ }
-      if (micDestRef.current === capturedMicDest) micDestRef.current = null;
-      try { capturedMicGain?.disconnect(); } catch { /* ignore */ }
-      if (micGainRef.current === capturedMicGain) micGainRef.current = null;
-      try { capturedMicComp?.disconnect(); } catch { /* ignore */ }
-      if (micCompressorRef.current === capturedMicComp) micCompressorRef.current = null;
-      try { capturedMicSource?.disconnect(); } catch { /* ignore */ }
-      if (micSourceRef.current === capturedMicSource) micSourceRef.current = null;
-      // [FIX-CTX-REUSE] Do NOT close audioContextRef here — it now points to the
-      // shared audioPlayerRef context which must stay alive for playback and future
-      // mic toggles. Only clear the ref so toggleMic knows no mic graph is active.
-      if (!micEnabledRef.current) audioContextRef.current = null;
-    };
-
-    if (worklet) {
-      // [FIX-FLUSH-RACE] Previously we posted "flush" then immediately called
-      // port.close()/disconnect() in the very next line, with no wait. The
-      // worklet processes "flush" on the audio thread and posts its response
-      // back asynchronously — closing the port right away could destroy it
-      // before that final ~170ms chunk ever arrived, silently dropping the
-      // last syllable of speech. Now we briefly hold a one-shot listener:
-      // if the flushed chunk arrives in time, we forward it immediately
-      // (the drain queue/timer is being torn down right after, so we can't
-      // rely on it); otherwise we time out after 60ms and tear down anyway
-      // so stopping the mic never feels sluggish.
-      const prevHandler = worklet.port.onmessage;
-      let settled = false;
-      let timeoutId: ReturnType<typeof setTimeout>;
-      const onFlushResponse = (e: MessageEvent<{ int16?: Int16Array; seq?: number; type?: string }>) => {
-        // [FIX-FLUSH-CALIBRATION-RACE] Ignore any message that isn't the actual
-        // audio chunk — e.g. the one-time "calibrated" notification the worklet
-        // sends if noise-floor calibration finishes during this very flush call.
-        // Without this guard, that message arrives first (no `int16` field) and
-        // `e.data.int16.buffer` below throws, which aborts this handler BEFORE
-        // finishTeardown() runs — leaving the mic graph half torn-down (the bug
-        // behind the "mic freezes" symptom on real devices).
-        if (!e.data || e.data.int16 === undefined) return;
-        if (settled) return;
-        settled = true;
-        clearTimeout(timeoutId);
-        worklet.port.onmessage = prevHandler;
-        // [FIX-MULTIROOM-FLUSH] Always emit the final flush chunk via Socket.IO,
-        // even when WebRTC peers are connected. The drain loop (every 83ms) was
-        // already updated by [FIX-MULTIROOM] to remove the hadConnectedPeers guard
-        // so non-WebRTC peers in 3+ member rooms receive audio. The flush path
-        // must use the same rule — otherwise the last partial speech buffer (the
-        // last syllable before the user presses mute) is silently dropped for any
-        // peer on the Socket.IO fallback path whenever WebRTC peers exist.
-        // Receiver-side filtering (hasConnectedPeer) correctly ignores the copy
-        // for peers who already have the audio via WebRTC.
-        socketRef.current?.emit("audioChunk", {
-          sr: sampleRateAtStop,
-          buf: e.data.int16.buffer,
-          seq: e.data.seq,
-        });
-        finishTeardown();
-      };
-      worklet.port.onmessage = onFlushResponse;
-      timeoutId = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        worklet.port.onmessage = prevHandler;
-        finishTeardown();
-      }, 60);
-      try {
-        worklet.port.postMessage({ type: "flush" });
-      } catch {
-        clearTimeout(timeoutId);
-        settled = true;
-        finishTeardown();
-      }
-    } else {
-      finishTeardown();
-    }
-
+    scriptProcessorRef.current?.disconnect();
+    scriptProcessorRef.current = null;
+    if (audioContextRef.current?.state !== "closed") audioContextRef.current?.close().catch(() => {});
+    audioContextRef.current = null;
+    analyserRef.current = null;
+    void webrtcManagerRef.current?.setStream(null);
     setMicEnabled(false);
     setSpeakingState(prev => ({ ...prev, [myMemberId]: 0 }));
     socketRef.current?.emit("micDisabled");
-    // [FIX-MIC-PERSIST] لما المستخدم يوقف المايك يدوياً، نمسح الـ flag
     try { localStorage.removeItem(`wp_mic_${code}`); } catch { /* ignore */ }
   }, [myMemberId]);
 
@@ -3210,259 +2793,70 @@ export default function Room() {
     if (micEnabled) { stopMic(); return; }
     const myMember = membersRef.current.find(m => m.id === myMemberId);
     if (myMember?.isMuted) return;
-    // [FIX-RACE-TOGGLE-ENABLE] Reserve the "mic is on" slot synchronously BEFORE
-    // any await. Without this, a rapid off→on toggle within the 60ms flush window
-    // leaves micEnabledRef.current = false while async work (addModule: 50-200ms)
-    // is still in flight. When finishTeardown() fires at t=60ms, it sees the ref
-    // as false and calls setStream(null) — silencing the brand-new mic session
-    // AFTER setStream(micDest.stream) was already called. The UI's analyser keeps
-    // running (driven by the local RMS interval) so the volume bar appears active
-    // for all participants, but no audio actually reaches any peer — the exact
-    // symptom reported: "مؤشر الصوت شغّال بس الكل مش بيسمع".
-    micEnabledRef.current = true;
     try {
-      // [FIX-MIC-FALLBACK] Use the shared getMicStream() helper (3-tier constraint
-      // fallback: full constraints → relaxed → audio:true). Previously this called
-      // getUserMedia directly with ONE fixed constraint set, so any device/browser
-      // that rejected sampleRate/sampleSize (some Android WebViews) failed entirely
-      // and showed a misleading "Microphone access denied" even though the
-      // permission itself was fine.
       const stream = await getMicStream();
       micStreamRef.current = stream;
       socketRef.current?.emit("micEnabled");
 
-      // [FIX-CTX-REUSE] Reuse the shared audioPlayerRef AudioContext for mic capture
-      // instead of creating a new one each time the mic is toggled.
-      // Android caps simultaneous AudioContexts at ~6 — toggle 6 times and the app
-      // silently breaks. We share the already-running playback context; if it's closed
-      // or missing we create ONE new context and keep it alive for future toggles.
-      // Note: stopMic() must NO LONGER close audioContextRef — only the room teardown
-      // (component unmount) should close the shared playback context.
       const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      let ctx = audioPlayerRef.current;
-      if (!ctx || ctx.state === "closed") {
-        // NOTE: No latencyHint — keeps iOS background audio permission intact.
-        ctx = new AudioCtx({ sampleRate: 48000 });
-        audioPlayerRef.current = ctx;
-      }
+      const ctx = new AudioCtx({ sampleRate: 48000 });
       if (ctx.state === "suspended") { try { await ctx.resume(); } catch { /* ignore */ } }
       audioContextRef.current = ctx;
       const source = ctx.createMediaStreamSource(stream);
-      micSourceRef.current = source;
 
-      // ── Signal chain: source → compressor → makeup gain → analyser/worklet/WebRTC ──
-      // [FIX-CHAIN] OLD order was: source → gain(1.5) → compressor → analyser/worklet
-      //   Problem: feeding gain BEFORE the compressor means loud transients (>-20dBFS)
-      //   hit the compressor 1.5× hotter. The 3ms attack can't catch fast consonants
-      //   ("p", "t", "k") → brief pre-compression clipping → distortion/clicks.
-      // NEW order: source → compressor → makeup gain
-      //   Compressor sees the raw mic level, tames peaks, THEN we apply gentle makeup
-      //   gain to restore perceived loudness. This is the standard dynamics chain.
-
-      // ── Dynamics compressor: tame peaks BEFORE any gain ───────────────────
-      const compressor = ctx.createDynamicsCompressor();
-      compressor.threshold.value = -24; // start compressing at -24 dBFS (more headroom)
-      compressor.knee.value = 8;        // smooth transition into compression
-      compressor.ratio.value = 4;       // 4:1 — effective for voice
-      compressor.attack.value = 0.002;  // 2ms — faster, catches consonant transients
-      compressor.release.value = 0.15;  // 150ms — natural decay
-      micCompressorRef.current = compressor;
-
-      // ── Makeup gain: restore loudness post-compression (subtle boost) ──────
-      // Applied AFTER compression — this is safe because the compressor has
-      // already tamed any peaks. 1.3× (≈ +2.3dB) is gentler than the old 1.5×.
       const micGain = ctx.createGain();
-      micGain.gain.value = 1.3;
-      micGainRef.current = micGain;
+      micGain.gain.value = 3.0;
 
-      // ── Analyser for RMS volume meter (post-compression, pre-gain) ──────────
-      // Placed after compressor so the meter shows compressed levels —
-      // more representative of what the receiver actually hears.
-      // [FIX-GC] fftSize=512 is enough for time-domain RMS — we never read
-      // frequency bins here. Smaller fftSize → smaller Float32Array allocation
-      // → less GC pressure in the 200ms polling interval.
+      const compressor = ctx.createDynamicsCompressor();
+      compressor.threshold.value = -20;
+      compressor.knee.value = 6;
+      compressor.ratio.value = 4;
+      compressor.attack.value = 0.003;
+      compressor.release.value = 0.15;
+
+      source.connect(micGain);
+      micGain.connect(compressor);
+
       const analyser = ctx.createAnalyser();
-      analyser.fftSize = 512;
+      analyser.fftSize = 2048;
+      compressor.connect(analyser);
       analyserRef.current = analyser;
 
-      // ── Connect: source → compressor → gain → analyser ───────────────────
-      source.connect(compressor);
-      compressor.connect(micGain);
-      micGain.connect(analyser);
+      const processor = ctx.createScriptProcessor(4096, 1, 1);
+      compressor.connect(processor);
+      const silentGain = ctx.createGain();
+      silentGain.gain.value = 0;
+      processor.connect(silentGain);
+      silentGain.connect(ctx.destination);
 
-      // [FIX-WEBRTC-PROCESSED-AUDIO] Feed the PROCESSED (compressor + makeup gain)
-      // signal into WebRTC instead of the raw getUserMedia track. Previously
-      // webrtcManagerRef.setStream(stream) was called with the raw stream — the
-      // compressor/gain chain above only ever reached the volume meter and the
-      // Socket.IO fallback worklet below, so on a healthy connection (WebRTC,
-      // the common case) peers heard completely unprocessed audio with no AGC
-      // (browser AGC is deliberately off — see getMicStream) and no replacement
-      // gain control, while the WEAK-network fallback path got the nicer,
-      // boosted signal. That's backwards: the common case should get the
-      // processed audio, not the fallback. createMediaStreamDestination() lets
-      // a Web Audio graph hand a real MediaStreamTrack to WebRTC.
-      const micDest = ctx.createMediaStreamDestination();
-      micGain.connect(micDest);
-      micDestRef.current = micDest;
-
-      // ── PCM capture via AudioWorklet ──────────────────────────────────────
-      // Worklet runs in a dedicated audio thread — isolated from React/network.
-      // The worklet posts { int16: Int16Array, seq: number, audioTime: number }.
-      //
-      // [FIX-WORKLET-CACHE] Only call addModule() when the context hasn't loaded
-      // it yet. addModule() is idempotent on repeat calls, but the browser still
-      // fires a network/cache fetch every time — adding 50-200ms of silence before
-      // the worklet node can be created. Since we share one AudioContext for the
-      // room lifetime (FIX-CTX-REUSE), we only need to register the module once.
-      if (workletModuleLoadedForCtxRef.current !== ctx) {
-        await ctx.audioWorklet.addModule("/audio-processor.js");
-        workletModuleLoadedForCtxRef.current = ctx;
-      }
-      const workletNode = new AudioWorkletNode(ctx, "mic-processor");
-      // Connect from the gain node (post-compression) so the worklet captures
-      // the same signal level that the analyser and WebRTC destination see.
-      micGain.connect(workletNode);
-
-      // [FIX-4-ORDERING] Connect the worklet to the graph BEFORE awaiting
-      // setStream. Previously setStream was awaited first, then the worklet was
-      // connected. On iOS Safari, replaceTrack() can take 50-200ms; during that
-      // window the worklet was not yet in the graph, silently dropping the first
-      // 1-2 chunks (the opening consonant of the first word was lost).
-      // Connecting the worklet first ensures capture starts immediately —
-      // chunks are queued in socketChunkQueue and sent once the mic is live.
-      // setStream is still awaited so WebRTC track replacement is confirmed
-      // before we proceed, but now it runs concurrently with early capture.
-      await webrtcManagerRef.current?.setStream(micDest.stream);
-
-      // [FIX-SOCKET-FALLBACK] Socket.IO is TCP-based — under congestion it queues
-      // chunks and delivers them in a burst. Receiving 5 chunks at once overwhelms
-      // the jitter buffer (it resets to now+cushion for each), producing a fast burst
-      // of audio followed by silence. Fix: enqueue outgoing chunks with timestamps;
-      // a throttled drain loop sends ≤6/sec (server cap is 10/sec) and discards
-      // chunks older than 500ms so stale audio from a TCP stall is silently dropped.
-      // [FIX-AUDIOTIME-FWD] audioTime from the worklet's audio-rendering clock is
-      // more accurate than Date.now() for jitter-buffer scheduling on the receiver.
-      // Previously it was received here but immediately discarded — never forwarded.
-      type ChunkQueueItem = { int16: Int16Array; seq: number; ts: number; audioTime?: number };
-      const socketChunkQueue: ChunkQueueItem[] = [];
-      // [FIX-LATENCY] Chunks are ~85ms (4096 samples at 48kHz) → ~12 chunks/sec.
-      // Drain at ~12/sec (83ms interval) to keep pace with production rate.
-      // Server cap is 15/sec so no chunks are dropped server-side.
-      // [FIX-WEAK-NET] SOCKET_MAX_AGE_MS raised 300ms → 500ms → 800ms.
-      // On genuinely weak connections (3G, congested Wi-Fi, high-latency VPN),
-      // a chunk can be legitimately delayed 300-400ms in the TCP send buffer before
-      // the kernel flushes it — not due to stall, just slow path RTT. At 500ms we
-      // were still silently discarding valid audio on lossy mobile connections.
-      // 800ms gives real-world slow links enough headroom while still dropping
-      // truly stale burst backlogs from multi-second TCP stalls.
-      const SOCKET_DRAIN_MS = 83; // ~12/sec — matches worklet production rate
-      const SOCKET_MAX_AGE_MS = 800;
-      const socketDrainTimer = setInterval(() => {
+      processor.onaudioprocess = (e: AudioProcessingEvent) => {
         if (!micEnabledRef.current) return;
-        // [FIX-MULTIROOM] Do NOT skip Socket.IO when WebRTC peers exist.
-        // In a 3+ member room, some peers may be connected via WebRTC (P2P) while
-        // others are not. The old hasConnectedPeers() guard blocked Socket.IO for
-        // EVERYONE as soon as ONE peer had WebRTC — meaning non-WebRTC peers went
-        // permanently silent. Fix: always send via Socket.IO so the server can relay
-        // to all non-WebRTC members. Peers that DO have a live WebRTC connection with
-        // us will skip the Socket.IO chunk on their receiver side (hasConnectedPeer check).
-        const now = Date.now();
-        // Discard chunks that have been waiting too long (TCP stall backlog)
-        while (socketChunkQueue.length > 0 && now - socketChunkQueue[0].ts > SOCKET_MAX_AGE_MS) {
-          socketChunkQueue.shift();
+        const input = e.inputBuffer.getChannelData(0);
+        const int16 = new Int16Array(input.length);
+        for (let i = 0; i < input.length; i++) {
+          int16[i] = Math.round(Math.max(-1, Math.min(1, input[i])) * 32767);
         }
-        const item = socketChunkQueue.shift();
-        if (!item) return;
-        socketRef.current?.emit("audioChunk", { sr: ctx.sampleRate, buf: item.int16.buffer, seq: item.seq, audioTime: item.audioTime });
-      }, SOCKET_DRAIN_MS);
-      // Attach to workletNode so stopMic can find and clear it
-      (workletNode as unknown as { _drainTimer: ReturnType<typeof setInterval> })._drainTimer = socketDrainTimer;
-
-      workletNode.port.onmessage = (e: MessageEvent<{ int16?: Int16Array; seq?: number; audioTime?: number; type?: string; threshold?: number }>) => {
-        if (!micEnabledRef.current) return;
-        // [FIX-5-DYNAMIC-VAD] The worklet sends a "calibrated" message once the
-        // 2-second noise-floor calibration completes. Log it for debugging.
-        if (e.data?.type === "calibrated") {
-          if (process.env.NODE_ENV !== "production") {
-            console.debug("[MicProcessor] VAD auto-calibrated threshold:", e.data.threshold?.toFixed(5));
-          }
-          return;
-        }
-        if (!e.data.int16 || e.data.seq === undefined) return;
-        // [FIX-MULTIROOM] Always push to queue so Socket.IO reaches non-WebRTC peers.
-        // WebRTC peers who have a live P2P connection to us will ignore our Socket.IO
-        // chunks on their side (hasConnectedPeer check in audioChunk handler).
-        // Push to queue; drain loop handles rate-limiting and age-based discard.
-        // [FIX-AUDIOTIME-FWD] Forward audioTime so the receiver can use the
-        // worklet's precise audio-rendering clock for jitter-buffer scheduling.
-        socketChunkQueue.push({ int16: e.data.int16, seq: e.data.seq, ts: Date.now(), audioTime: e.data.audioTime });
+        socketRef.current?.volatile.emit("audioChunk", { sr: ctx.sampleRate, buf: int16.buffer });
       };
-      workletNodeRef.current = workletNode;
+      scriptProcessorRef.current = processor;
+
+      void webrtcManagerRef.current?.setStream(stream);
 
       setMicEnabled(true);
       setMicError(null);
-      // [FIX-MIC-PERSIST] نحفظ إن المايك كان شغّال عشان لو الصفحة اترفرشت
-      // نرجعه تلقائياً بدون ما المستخدم يعمل حاجة.
       try { localStorage.setItem(`wp_mic_${code}`, "1"); } catch { /* ignore */ }
 
-      // ── RMS volume detection — more accurate than FFT byte average ──────────
-      // [FIX-SPEAKING-RATE] Was 100ms (10 events/sec) but the server rate-limits
-      // "speaking" to 5/sec — half of every update was silently dropped, making
-      // the speaking/volume indicator less smooth than intended. 200ms (5/sec)
-      // now matches the server limit exactly.
-      // [FIX-GC] Allocate the time-domain buffer ONCE outside the interval callback.
-      // Previously `new Float32Array(fftSize)` ran 5× per second, generating GC
-      // pressure proportional to fftSize. With fftSize=512, the buffer is 512×4=2KB
-      // allocated once and reused for the room lifetime.
-      const rmsBuffer = new Float32Array(analyser.fftSize);
       micIntervalRef.current = setInterval(() => {
         const an = analyserRef.current;
         if (!an) return;
-        an.getFloatTimeDomainData(rmsBuffer);
-        let sumSq = 0;
-        for (let i = 0; i < rmsBuffer.length; i++) sumSq += rmsBuffer[i] * rmsBuffer[i];
-        const rms = Math.sqrt(sumSq / rmsBuffer.length);
+        const timeData = new Float32Array(an.fftSize);
+        an.getFloatTimeDomainData(timeData);
+        const rms = Math.sqrt(timeData.reduce((s, v) => s + v * v, 0) / timeData.length);
         const vol = Math.min(100, Math.round(rms * 400));
         socketRef.current?.emit("speaking", { volume: vol });
         setSpeakingState(prev => ({ ...prev, [myMemberId]: vol }));
-      }, 200);
+      }, 100);
     } catch {
-      // [FIX-REF-RESET] Reset micEnabledRef synchronously before any cleanup so
-      // all guards below evaluate correctly. micEnabledRef.current was set to true
-      // at the top of toggleMic() as a pre-async reservation (FIX-RACE-TOGGLE-ENABLE).
-      // If any await in the try block throws, we never reach setMicEnabled(true),
-      // so the ref must return to false to match the React state. Without this reset:
-      //   • setStream(null) is guarded by `!micEnabledRef.current` → evaluates false
-      //     → SKIPPED → WebRTC peers keep streaming from the now-dead micDest track
-      //     (tracks stopped below, but senders still attached) until the next
-      //     successful mic enable. Every connected peer receives dead/silent audio.
-      //   • audioContextRef guard also evaluates false → skipped (safe but misleading).
-      micEnabledRef.current = false;
-      // [FIX-CATCH-CLEANUP] Clean up any audio graph nodes that were already set
-      // up before the failure. Previously, if addModule() threw (e.g. worklet file
-      // not served, network blip), WebRTC was already sending audio via the
-      // micDest stream (setStream was called before addModule), the audio graph
-      // nodes were live, and micStreamRef still held the getUserMedia track — all
-      // leaking silently while micEnabled stayed false. Now we explicitly tear
-      // everything down so the next toggle starts from a clean state.
-      micStreamRef.current?.getTracks().forEach(t => t.stop());
-      micStreamRef.current = null;
-      // [FIX-P2] void the promise — catch block is sync-style cleanup, awaiting
-      // here would delay the error feedback. setStream is async but the track switch
-      // failure is not critical during teardown.
-      if (!micEnabledRef.current) void webrtcManagerRef.current?.setStream(null);
-      micDestRef.current?.stream.getTracks().forEach(t => t.stop());
-      try { micDestRef.current?.disconnect(); } catch { /* ignore */ }
-      micDestRef.current = null;
-      try { micGainRef.current?.disconnect(); } catch { /* ignore */ }
-      micGainRef.current = null;
-      try { micCompressorRef.current?.disconnect(); } catch { /* ignore */ }
-      micCompressorRef.current = null;
-      try { micSourceRef.current?.disconnect(); } catch { /* ignore */ }
-      micSourceRef.current = null;
-      try { analyserRef.current?.disconnect(); } catch { /* ignore */ }
-      analyserRef.current = null;
-      if (!micEnabledRef.current) audioContextRef.current = null;
       setMicError("Microphone access denied");
     }
   };

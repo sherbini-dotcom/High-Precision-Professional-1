@@ -444,12 +444,6 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
     // الحل: 60s + 90s = يصمد لـ 2.5 دقيقة في الخلفية قبل ما ينقطع
     pingInterval: 60000,
     pingTimeout: 90000,
-    // [FIX-BUFFER-SIZE] Reduced from 2MB → 100KB.
-    // Each audio chunk is ~8 KB (4096 samples × 2 bytes at 16-bit).
-    // 100 KB is ~12× a single chunk — plenty of headroom for burst delivery
-    // without allowing a malicious client to send 2 MB payloads that would
-    // force the server to relay 2 MB to every other member in the room.
-    maxHttpBufferSize: 1e5,
   });
 
   ioInstance = io;
@@ -584,10 +578,6 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
           socket.data.memberId = member.id;
           socket.data.role = member.role;
           socket.data.roomCode = roomCode;
-          // [FIX-MUTE-ENFORCE] Track mute state server-side so audioChunk can be
-          // rejected at the source instead of relying purely on the client to stop
-          // sending after receiving "forceMuted".
-          socket.data.isMuted = member.isMuted ?? false;
 
           const roomKickedIPs = kickedIPs.get(roomCode);
           const accessControlOn = roomAccessControl.get(roomCode) ?? false;
@@ -943,18 +933,7 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
           const sockets = await io.in(currentRoomCode!).fetchSockets();
           for (const s of sockets) {
             if (s.data.memberId === memberId) {
-              // [FIX-MUTE-ENFORCE] Update server-side flag so audioChunk is rejected
-              // immediately, even if the client ignores/ delays "forceMuted".
-              s.data.isMuted = true;
               s.emit("forceMuted");
-              break;
-            }
-          }
-        } else {
-          const sockets = await io.in(currentRoomCode!).fetchSockets();
-          for (const s of sockets) {
-            if (s.data.memberId === memberId) {
-              s.data.isMuted = false;
               break;
             }
           }
@@ -1245,32 +1224,9 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
 
     socket.on("audioChunk", (payload: { sr: number; buf: ArrayBuffer; seq?: number; audioTime?: number }) => {
       if (!currentRoomCode || !currentMemberId) return;
-      // [FIX-MUTE-ENFORCE] Reject audio from a member the host/admin has muted,
-      // even if a modified/misbehaving client keeps emitting "audioChunk" after
-      // ignoring the "forceMuted" event. Previously this was enforced only on the
-      // client, so a tampered client could bypass a host mute entirely.
-      if (socket.data.isMuted) return;
-      // [FIX-RATELIMIT] Raised from 10/s → 15/s to match the new worklet chunk
-      // rate (~12 chunks/sec at 4096 samples / 48kHz). The old 10/s cap was set
-      // when chunks were 170ms (6/sec) — it silently dropped ~2 of every 12 new
-      // chunks on the Socket.IO fallback path, causing choppy audio.
-      // 15/s gives 25% headroom above the 12/sec nominal rate for TCP catch-up
-      // bursts while still blocking real abuse / runaway clients.
-      if (isSocketRateLimited(socket.id, "audio", 15)) return;
-      // [FIX-BUFFER-VALIDATION] Reject oversized or missing audio buffers.
-      // A legitimate chunk is ≤8 KB (4096 samples × 2 bytes). We allow up to
-      // 65 536 bytes (~680 ms at 48 kHz) as a generous upper bound to tolerate
-      // future worklet tuning, while blocking a malicious client from sending
-      // megabyte-scale payloads that the server would blindly relay to all members.
-      if (!payload.buf || payload.buf.byteLength === 0 || payload.buf.byteLength > 65_536) return;
-      // FIX AUDIO-03: إزالة socket.volatile
-      // volatile كان يعني "لو الـ socket مشغول، اتجاهل الـ chunk" → أكبر سبب للتقطع
-      // الآن كل chunk يُرسل بموثوقية كاملة
-      // [FIX-SEQ] Forward the sequence number so receivers can detect out-of-order delivery.
-      // [FIX-AUDIOTIME-FWD] Forward audioTime from the sender's worklet audio-rendering
-      // clock. Receivers use it for accurate jitter-buffer scheduling instead of
-      // arrival wall-clock time which drifts under main-thread CPU load.
-      socket.to(currentRoomCode).emit("audioChunk", {
+      // نظام المايك من النسخة البسيطة: volatile يمنع تراكم الـ chunks في الـ buffer
+      // لو المقبس مشغول، يتجاهل الـ chunk بدل ما يبنيلك delay
+      socket.volatile.to(currentRoomCode).emit("audioChunk", {
         fromMemberId: currentMemberId,
         sr: payload.sr,
         buf: payload.buf,
