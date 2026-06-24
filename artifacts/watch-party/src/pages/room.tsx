@@ -57,14 +57,16 @@ interface FloatingMicProps {
   audioLevel: number;
   onToggle: () => void;
   onDismiss: () => void;
+  controlsVisible: boolean;
+  buttonSize?: number;
 }
 
-function FloatingMicButton({ micEnabled, isMuted, audioLevel, onToggle, onDismiss }: FloatingMicProps) {
+function FloatingMicButton({ micEnabled, isMuted, audioLevel, onToggle, onDismiss, controlsVisible, buttonSize = 64 }: FloatingMicProps) {
   const [pos, setPos] = useState({ x: 24, y: 0 });
   const [dragging, setDragging] = useState(false);
   const [overDelete, setOverDelete] = useState(false);
   const dragRef = useRef({ px: 0, py: 0, bx: 0, by: 0, moved: false });
-  const BUTTON_SIZE = 64;
+  const BUTTON_SIZE = buttonSize;
 
   useEffect(() => {
     setPos({ x: 24, y: window.innerHeight - 120 });
@@ -97,7 +99,7 @@ function FloatingMicButton({ micEnabled, isMuted, audioLevel, onToggle, onDismis
     if (!dragging) return;
     const dx = e.clientX - dragRef.current.px;
     const dy = e.clientY - dragRef.current.py;
-    if (Math.abs(dx) > 6 || Math.abs(dy) > 6) dragRef.current.moved = true;
+    if (Math.abs(dx) > 12 || Math.abs(dy) > 12) dragRef.current.moved = true;
     if (!dragRef.current.moved) return;
     const nx = Math.max(0, Math.min(window.innerWidth  - BUTTON_SIZE, dragRef.current.bx + dx));
     const ny = Math.max(0, Math.min(window.innerHeight - BUTTON_SIZE, dragRef.current.by + dy));
@@ -136,7 +138,7 @@ function FloatingMicButton({ micEnabled, isMuted, audioLevel, onToggle, onDismis
 
       {/* Floating button wrapper */}
       <div
-        style={{ position: "fixed", left: pos.x, top: pos.y, zIndex: 100002, touchAction: "none", userSelect: "none", width: BUTTON_SIZE, height: BUTTON_SIZE }}
+        style={{ position: "fixed", left: pos.x, top: pos.y, zIndex: 100002, touchAction: "none", userSelect: "none", width: BUTTON_SIZE, height: BUTTON_SIZE, opacity: (controlsVisible || dragging || vol > 8) ? 1 : 0.40, transition: "opacity 0.4s ease" }}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
@@ -2317,6 +2319,7 @@ export default function Room() {
         iosFullscreenTimerRef.current = setTimeout(() => setIOSFullscreenControlsVisible(false), 3000);
         return;
       }
+      setFloatMicVisible(true);
       const el = browserContainerRef.current as HTMLElement & { webkitRequestFullscreen?: () => void };
       if (!el) { setIsBrowserFullscreen(true); return; }
       if (el.requestFullscreen) {
@@ -3814,14 +3817,15 @@ export default function Room() {
         </div>
       </div>
     )}
-    {/* ── Floating Mic Button — fullscreen browser mode only ── */}
-    {isBrowserFullscreen && mode === "browser" && hyperbeamEmbed && floatMicVisible && (
+    {/* ── Floating Mic Button — iOS only (CSS fullscreen, not native) ── */}
+    {isBrowserFullscreen && isIOSDevice && mode === "browser" && hyperbeamEmbed && floatMicVisible && (
       <FloatingMicButton
         micEnabled={micEnabled}
         isMuted={!!members.find(m => m.id === myMemberId)?.isMuted}
         audioLevel={speakingState[myMemberId] ?? 0}
         onToggle={() => { void toggleMic(); }}
         onDismiss={() => setFloatMicVisible(false)}
+        controlsVisible={iosFullscreenControlsVisible}
       />
     )}
 
@@ -4488,6 +4492,18 @@ export default function Room() {
                     onMouseMove={showBrowserControls}
                     onTouchStart={showBrowserControls}
                   />
+                  {/* Floating Mic — PC/Android native fullscreen (must render inside fullscreen element) */}
+                  {isBrowserFullscreen && floatMicVisible && (
+                    <FloatingMicButton
+                      micEnabled={micEnabled}
+                      isMuted={!!members.find(m => m.id === myMemberId)?.isMuted}
+                      audioLevel={speakingState[myMemberId] ?? 0}
+                      onToggle={() => { void toggleMic(); }}
+                      onDismiss={() => setFloatMicVisible(false)}
+                      controlsVisible={browserControlsVisible}
+                      buttonSize={isMobileDevice ? 64 : 76}
+                    />
+                  )}
                   <div
                     className="absolute bottom-4 right-4 flex items-center gap-2 transition-opacity duration-300"
                     style={{ zIndex: 10, opacity: browserControlsVisible ? 1 : 0, pointerEvents: browserControlsVisible ? "auto" : "none" }}
