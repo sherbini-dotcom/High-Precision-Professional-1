@@ -65,8 +65,18 @@ function FloatingMicButton({ micEnabled, isMuted, audioLevel, onToggle, onDismis
   const [pos, setPos] = useState({ x: 24, y: 0 });
   const [dragging, setDragging] = useState(false);
   const [overDelete, setOverDelete] = useState(false);
-  const dragRef = useRef({ px: 0, py: 0, bx: 0, by: 0, moved: false });
+  const [dismissing, setDismissing] = useState(false);
+  const [burst, setBurst] = useState(false);
+  const dragRef = useRef({ px: 0, py: 0, bx: 0, by: 0, moved: false, startTime: 0, pointerType: "mouse" });
   const BUTTON_SIZE = buttonSize;
+
+  // X drop zone center (bottom-center of screen)
+  const ZONE_SIZE = 72;
+  const ZONE_BOTTOM = 24;
+  const getZoneCenter = () => ({
+    x: window.innerWidth / 2 - BUTTON_SIZE / 2,
+    y: window.innerHeight - ZONE_BOTTOM - ZONE_SIZE / 2 - BUTTON_SIZE / 2,
+  });
 
   useEffect(() => {
     setPos({ x: 24, y: window.innerHeight - 120 });
@@ -89,35 +99,65 @@ function FloatingMicButton({ micEnabled, isMuted, audioLevel, onToggle, onDismis
   }, [BUTTON_SIZE]);
 
   const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (dismissing) return;
     e.preventDefault();
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    dragRef.current = { px: e.clientX, py: e.clientY, bx: pos.x, by: pos.y, moved: false };
+    dragRef.current = { px: e.clientX, py: e.clientY, bx: pos.x, by: pos.y, moved: false, startTime: Date.now(), pointerType: e.pointerType };
     setDragging(true);
   };
 
   const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!dragging) return;
+    if (!dragging || dismissing) return;
     const dx = e.clientX - dragRef.current.px;
     const dy = e.clientY - dragRef.current.py;
-    if (Math.abs(dx) > 12 || Math.abs(dy) > 12) dragRef.current.moved = true;
+    // touch أكبر threshold عشان الإصبع بيتحرك أكتر من الماوس عند الضغط العادي
+    const moveThreshold = dragRef.current.pointerType === "touch" ? 9 : 4;
+    if (Math.abs(dx) > moveThreshold || Math.abs(dy) > moveThreshold) dragRef.current.moved = true;
     if (!dragRef.current.moved) return;
     const nx = Math.max(0, Math.min(window.innerWidth  - BUTTON_SIZE, dragRef.current.bx + dx));
     const ny = Math.max(0, Math.min(window.innerHeight - BUTTON_SIZE, dragRef.current.by + dy));
-    setPos({ x: nx, y: ny });
-    const distDelete = Math.sqrt((e.clientX - window.innerWidth / 2) ** 2 + (e.clientY - (window.innerHeight - 56)) ** 2);
-    setOverDelete(distDelete < 44);
+
+    // Magnetic pull: when very close to zone, lerp button toward zone center
+    const zoneCx = window.innerWidth / 2;
+    const zoneCy = window.innerHeight - ZONE_BOTTOM - ZONE_SIZE / 2;
+    const dist = Math.sqrt((e.clientX - zoneCx) ** 2 + (e.clientY - zoneCy) ** 2);
+    const over = dist < 52;
+    setOverDelete(over);
+
+    if (over) {
+      // Snap button toward zone center (magnetic feel)
+      const zc = getZoneCenter();
+      const t = Math.max(0, 1 - dist / 52); // 0→1 as dist→0
+      setPos({
+        x: nx + (zc.x - nx) * t * 0.55,
+        y: ny + (zc.y - ny) * t * 0.55,
+      });
+    } else {
+      setPos({ x: nx, y: ny });
+    }
   };
 
   const onPointerUp = () => {
     setDragging(false);
-    if (overDelete) { onDismiss(); return; }
-    if (!dragRef.current.moved) onToggle();
+    if (overDelete) {
+      // Fly mic button into X zone then call onDismiss
+      const zc = getZoneCenter();
+      setPos(zc);
+      setDismissing(true);
+      setBurst(true);
+      setTimeout(() => onDismiss(), 400);
+      return;
+    }
+    // يعتبر كليك فقط لو: ما اتحرك + ضغطة سريعة (touch أطول عشان long-press مش drag)
+    const elapsed = Date.now() - dragRef.current.startTime;
+    const timeLimit = dragRef.current.pointerType === "touch" ? 300 : 220;
+    if (!dragRef.current.moved && elapsed < timeLimit) onToggle();
     setOverDelete(false);
   };
 
   // GREEN = mic on & not server-muted  |  RED = mic off OR server-muted
   const isActive  = micEnabled && !isMuted;
-  const isRed     = !isActive;   // any "not talking" state = red
+  const isRed     = !isActive;
   const btnBg     = isActive ? "#16a34a" : "#dc2626";
   const borderClr = isActive ? "#22c55e" : "#ef4444";
   const glow      = isActive
@@ -128,17 +168,49 @@ function FloatingMicButton({ micEnabled, isMuted, audioLevel, onToggle, onDismis
   const r2Scale   = isActive && vol > 8  ? 1 + (vol / 100) * 1.1  : 1;
   const r1Opacity = isActive && vol > 8  ? (vol / 100) * 0.75 : 0;
   const r2Opacity = isActive && vol > 8  ? (vol / 100) * 0.38 : 0;
-  void isRed; // used via btnBg/borderClr/glow derivation above
+  void isRed;
+
+  // Button scale: shrink when near zone, collapse to 0 when dismissing
+  const btnScale = dismissing ? 0 : overDelete ? 0.7 : 1;
+  const btnTransition = dismissing
+    ? "left 0.3s cubic-bezier(.4,0,.2,1), top 0.3s cubic-bezier(.4,0,.2,1), transform 0.28s cubic-bezier(.6,0,.8,1), opacity 0.25s ease"
+    : dragging
+    ? "transform 0.12s ease, opacity 0.4s ease"
+    : "transform 0.25s ease, opacity 0.4s ease";
 
   return (
     <>
       <style>{`
         @keyframes fmb-pulse { 0%,100%{opacity:.7;} 50%{opacity:.3;} }
+        @keyframes fmb-burst {
+          0%   { transform: translateX(-50%) scale(1); opacity: 1; }
+          40%  { transform: translateX(-50%) scale(1.55); opacity: 0.9; }
+          100% { transform: translateX(-50%) scale(0.2); opacity: 0; }
+        }
+        @keyframes fmb-zone-absorb {
+          0%   { transform: translateX(-50%) scale(1); }
+          30%  { transform: translateX(-50%) scale(1.3); }
+          60%  { transform: translateX(-50%) scale(0.85); }
+          100% { transform: translateX(-50%) scale(1); }
+        }
       `}</style>
 
       {/* Floating button wrapper */}
       <div
-        style={{ position: "fixed", left: pos.x, top: pos.y, zIndex: 100002, touchAction: "none", userSelect: "none", width: BUTTON_SIZE, height: BUTTON_SIZE, opacity: (controlsVisible || dragging || vol > 8) ? 1 : 0.40, transition: "opacity 0.4s ease" }}
+        style={{
+          position: "fixed",
+          left: pos.x,
+          top: pos.y,
+          zIndex: 100002,
+          touchAction: "none",
+          userSelect: "none",
+          width: BUTTON_SIZE,
+          height: BUTTON_SIZE,
+          opacity: dismissing ? 0 : (controlsVisible || dragging || vol > 8) ? 1 : 0.40,
+          transform: `scale(${btnScale})`,
+          transformOrigin: "center center",
+          transition: btnTransition,
+        }}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
@@ -162,17 +234,19 @@ function FloatingMicButton({ micEnabled, isMuted, audioLevel, onToggle, onDismis
         {/* Main button */}
         <div style={{
           width: BUTTON_SIZE, height: BUTTON_SIZE, borderRadius: "50%",
-          backgroundColor: btnBg,
-          border: `2.5px solid ${borderClr}`,
-          boxShadow: glow,
+          backgroundColor: overDelete ? "rgba(220,38,38,0.9)" : btnBg,
+          border: `2.5px solid ${overDelete ? "#f87171" : borderClr}`,
+          boxShadow: overDelete ? "0 0 28px rgba(220,38,38,0.7)" : glow,
           display: "flex", alignItems: "center", justifyContent: "center",
           color: "white",
           cursor: dragging ? "grabbing" : "grab",
-          transition: "background-color 0.25s, box-shadow 0.25s, border-color 0.25s",
+          transition: "background-color 0.2s, box-shadow 0.2s, border-color 0.2s",
           backdropFilter: "blur(12px)",
           WebkitBackdropFilter: "blur(12px)",
         }}>
-          {isMuted
+          {overDelete
+            ? <X size={28} />
+            : isMuted
             ? <MicOff size={28} />
             : micEnabled
             ? <Mic size={28} />
@@ -180,7 +254,7 @@ function FloatingMicButton({ micEnabled, isMuted, audioLevel, onToggle, onDismis
           }
         </div>
         {/* Volume label */}
-        {isActive && (
+        {isActive && !overDelete && (
           <div style={{
             position: "absolute", bottom: -22, left: "50%", transform: "translateX(-50%)",
             fontSize: 11, fontWeight: 700, color: "#22c55e",
@@ -193,26 +267,23 @@ function FloatingMicButton({ micEnabled, isMuted, audioLevel, onToggle, onDismis
       </div>
 
       {/* Delete drop zone */}
-      {dragging && (
+      {(dragging || burst) && (
         <div style={{
-          position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)",
+          position: "fixed", bottom: ZONE_BOTTOM, left: "50%",
+          transform: "translateX(-50%)",
           zIndex: 100001, pointerEvents: "none",
-          width: 72, height: 72, borderRadius: "50%",
-          backgroundColor: overDelete ? "rgba(220,38,38,0.9)" : "rgba(10,10,20,0.75)",
+          width: ZONE_SIZE, height: ZONE_SIZE, borderRadius: "50%",
+          backgroundColor: overDelete ? "rgba(220,38,38,0.92)" : "rgba(10,10,20,0.75)",
           border: `2.5px solid ${overDelete ? "#f87171" : "rgba(255,255,255,0.22)"}`,
           display: "flex", alignItems: "center", justifyContent: "center",
           backdropFilter: "blur(14px)", WebkitBackdropFilter: "blur(14px)",
-          boxShadow: overDelete ? "0 0 24px rgba(220,38,38,0.6)" : "0 4px 20px rgba(0,0,0,0.5)",
+          boxShadow: overDelete
+            ? "0 0 0 8px rgba(220,38,38,0.18), 0 0 32px rgba(220,38,38,0.65)"
+            : "0 4px 20px rgba(0,0,0,0.5)",
           transition: "background-color 0.15s, border-color 0.15s, box-shadow 0.15s",
+          animation: burst ? "fmb-zone-absorb 0.38s cubic-bezier(.4,0,.2,1) forwards" : undefined,
         }}>
           <X size={28} color="white" />
-          <div style={{
-            position: "absolute", bottom: -20, left: "50%", transform: "translateX(-50%)",
-            fontSize: 10, fontWeight: 700, color: "rgba(255,255,255,0.7)",
-            whiteSpace: "nowrap", letterSpacing: "0.05em",
-          }}>
-            {overDelete ? "RELEASE TO REMOVE" : "DRAG HERE TO REMOVE"}
-          </div>
         </div>
       )}
     </>
@@ -273,6 +344,7 @@ export default function Room() {
   const iosBrowserFullscreen = isIOSDevice ? isBrowserFullscreen : null;
   const [isLandscape, setIsLandscape] = useState(() => window.matchMedia("(orientation: landscape)").matches);
   const [browserWidened, setBrowserWidened] = useState(false);
+  const [screenWidened, setScreenWidened] = useState(false);
   const [iosViewport, setIosViewport] = useState({ w: window.innerWidth, h: window.innerHeight, t: 0 });
   const browserContainerRef = useRef<HTMLDivElement>(null);
   const [controlsVisible, setControlsVisible] = useState(true);
@@ -295,6 +367,8 @@ export default function Room() {
   const hbInstanceRef     = useRef<{ destroy?: () => void } | null>(null);
   // FIX-FULLSCREEN: ref يتابع isBrowserFullscreen عشان socket handlers تقدر تقراه بدون stale closure
   const isBrowserFullscreenRef = useRef(false);
+  // FIX-IOS-FREEZE: مفتاح re-mount لما نرجع من الخلفية على iOS وكنا في browser fullscreen
+  const [hbIOSRemountKey, setHbIOSRemountKey] = useState(0);
 
   // Screen Share state
   const [isScreenSharing, setIsScreenSharing] = useState(false);
@@ -2015,6 +2089,28 @@ export default function Room() {
   //   - على iOS:     iosBrowserFullscreen === isBrowserFullscreen → يتعمل re-mount لتبديل الـ container
   //   - على desktop: iosBrowserFullscreen === null دايماً → الـ effect مش بيشتغل لما fullscreen يتغير
   //                  فالـ SDK يفضل موجود والـ native fullscreen يملا الشاشة بدون انقطاع.
+  // FIX-IOS-FREEZE: لما ترجع من الخلفية على iOS وانت في browser fullscreen،
+  // الـ Hyperbeam iframe بيتجمد. الحل: نعمل re-mount للـ SDK تلقائياً.
+  useEffect(() => {
+    if (!isIOSDevice) return;
+    const onVisibility = () => {
+      if (document.visibilityState === "visible" && isBrowserFullscreenRef.current && mode === "browser") {
+        setHbIOSRemountKey(k => k + 1);
+      }
+    };
+    const onPageShow = (e: PageTransitionEvent) => {
+      if (e.persisted && isBrowserFullscreenRef.current && mode === "browser") {
+        setHbIOSRemountKey(k => k + 1);
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pageshow", onPageShow);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pageshow", onPageShow);
+    };
+  }, [isIOSDevice, mode]);
+
   useEffect(() => {
     if (!hyperbeamEmbed) {
       hbInstanceRef.current?.destroy?.();
@@ -2039,7 +2135,7 @@ export default function Room() {
       hbInstanceRef.current?.destroy?.();
       hbInstanceRef.current = null;
     };
-  }, [hyperbeamEmbed, iosBrowserFullscreen, isIOSDevice, mode]);
+  }, [hyperbeamEmbed, iosBrowserFullscreen, isIOSDevice, mode, hbIOSRemountKey]);
 
   useEffect(() => {
     const onFsChange = () => {
@@ -2071,11 +2167,18 @@ export default function Room() {
     }
   }, [isBrowserFullscreen, mode, hyperbeamEmbed]);
 
+  // Show floating mic whenever entering fullscreen screenshare mode
+  useEffect(() => {
+    if ((isFullscreen || isSSIOSFullscreen) && mode === "screenshare") {
+      setFloatMicVisible(true);
+    }
+  }, [isFullscreen, isSSIOSFullscreen, mode]);
+
   useEffect(() => {
     const mq = window.matchMedia("(orientation: landscape)");
     const handler = (e: MediaQueryListEvent) => {
       setIsLandscape(e.matches);
-      if (!e.matches) setBrowserWidened(false);
+      if (!e.matches) { setBrowserWidened(false); setScreenWidened(false); }
     };
     mq.addEventListener("change", handler);
     return () => mq.removeEventListener("change", handler);
@@ -2335,14 +2438,21 @@ export default function Room() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      // تجاهل لو في أي عنصر contentEditable (زي chat)
+      if ((e.target as HTMLElement)?.isContentEditable) return;
       if (e.code === "Space") { e.preventDefault(); handlePlayPause(); }
       else if (e.code === "ArrowRight") handleSkip(10);
       else if (e.code === "ArrowLeft") handleSkip(-10);
-      else if (e.code === "KeyF") handleFullscreen();
+      else if (e.code === "KeyF") {
+        // F يفتح الـ fullscreen الصح بناءً على الوضع الحالي
+        if (mode === "browser") handleBrowserFullscreen();
+        else if (mode === "screenshare") handleScreenShareFullscreen();
+        else handleFullscreen(); // video / movies
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [handlePlayPause, handleSkip, handleFullscreen]);
+  }, [handlePlayPause, handleSkip, handleFullscreen, handleBrowserFullscreen, handleScreenShareFullscreen, mode]);
 
   const handleVideoPlay = () => {
     setIsPlaying(true); isPlayingRef.current = true;
@@ -2964,6 +3074,24 @@ export default function Room() {
     setSpeakingState(prev => ({ ...prev, [myMemberId]: 0 }));
     socketRef.current?.emit("micDisabled");
     try { localStorage.removeItem(`wp_mic_${code}`); } catch { /* ignore */ }
+
+    // FIX-IOS-DUCKING: لما المايك بيتوقف، نرجّع الـ audio session لـ playback
+    // عشان iOS يوقف الـ ducking ويرجع صوت الفيديو/المتصفح لحجمه الأصلي.
+    try {
+      const nav = navigator as unknown as { audioSession?: { type: string } };
+      if (nav.audioSession) nav.audioSession.type = "playback";
+    } catch { /* ignore */ }
+
+    // Fallback لـ iOS القديم: إعادة ضبط صوت الفيديو يدوياً بعد 200ms
+    // (بعد ما iOS يخلص ducking transition)
+    setTimeout(() => {
+      const v = videoRef.current;
+      if (v && !v.muted) {
+        const savedVol = v.volume;
+        v.volume = 0;
+        requestAnimationFrame(() => { v.volume = savedVol; });
+      }
+    }, 200);
   }, [myMemberId]);
 
 
@@ -3760,11 +3888,24 @@ export default function Room() {
           controls={false}
           disablePictureInPicture
           {...{ "webkit-playsinline": "true", "x-webkit-airplay": "deny", "disableremoteplayback": "" } as Record<string, string>}
-          className="w-full h-full object-contain"
+          className={`w-full h-full ${screenWidened ? "object-fill" : "object-contain"}`}
           style={{ pointerEvents: "none" }}
         />
         {/* Controls — تظهر عند اللمس وتختفي بعد 3 ثواني */}
         <div className={`absolute inset-0 pointer-events-none transition-opacity duration-300 ${ssIOSControlsVisible ? "opacity-100" : "opacity-0"}`}>
+          {/* Widen button — mobile landscape only */}
+          {isMobileDevice && isLandscape && (
+            <button
+              onClick={() => setScreenWidened(w => !w)}
+              className="absolute bottom-10 right-20 w-12 h-12 rounded-full bg-black/60 backdrop-blur-md border border-white/20 flex items-center justify-center pointer-events-auto active:scale-90 transition-all"
+              title={screenWidened ? "Reset width" : "Widen to full screen"}
+            >
+              <span className="flex items-center gap-0.5">
+                <ArrowLeft className="w-4 h-4 text-white" />
+                <ArrowRight className="w-4 h-4 text-white" />
+              </span>
+            </button>
+          )}
           <button
             onClick={closeSSIOSFullscreen}
             className="absolute bottom-10 right-5 w-12 h-12 rounded-full bg-black/60 backdrop-blur-md border border-white/20 flex items-center justify-center pointer-events-auto active:scale-90 transition-all"
@@ -3783,6 +3924,7 @@ export default function Room() {
         onMouseMove={showIOSFullscreenControls}
       >
         <div
+          key={hbIOSRemountKey}
           ref={hbIOSContainerRef}
           style={{
             border: "none",
@@ -3818,6 +3960,17 @@ export default function Room() {
       </div>
     )}
     {/* ── Floating Mic Button — iOS only (CSS fullscreen, not native) ── */}
+    {/* ── Floating Mic Button — iOS screenshare fullscreen ── */}
+    {isSSIOSFullscreen && isIOSDevice && mode === "screenshare" && floatMicVisible && (
+      <FloatingMicButton
+        micEnabled={micEnabled}
+        isMuted={!!members.find(m => m.id === myMemberId)?.isMuted}
+        audioLevel={speakingState[myMemberId] ?? 0}
+        onToggle={() => { void toggleMic(); }}
+        onDismiss={() => setFloatMicVisible(false)}
+        controlsVisible={ssIOSControlsVisible}
+      />
+    )}
     {isBrowserFullscreen && isIOSDevice && mode === "browser" && hyperbeamEmbed && floatMicVisible && (
       <FloatingMicButton
         micEnabled={micEnabled}
@@ -4316,7 +4469,7 @@ export default function Room() {
                     disablePictureInPicture
                     disableRemotePlayback
                     {...{ "webkit-playsinline": "true", "x-webkit-airplay": "deny" } as Record<string, string>}
-                    className="w-full h-full object-contain"
+                    className={`w-full h-full ${screenWidened ? "object-fill" : "object-contain"}`}
                     style={{ WebkitUserSelect: "none" }}
                     onCanPlay={(e) => {
                       const v = e.currentTarget;
@@ -4401,11 +4554,37 @@ export default function Room() {
                   </div>
                 )}
 
+                {/* Floating Mic — PC/Android native fullscreen in screenshare mode */}
+                {isFullscreen && floatMicVisible && (
+                  <FloatingMicButton
+                    micEnabled={micEnabled}
+                    isMuted={!!members.find(m => m.id === myMemberId)?.isMuted}
+                    audioLevel={speakingState[myMemberId] ?? 0}
+                    onToggle={() => { void toggleMic(); }}
+                    onDismiss={() => setFloatMicVisible(false)}
+                    controlsVisible={controlsVisible}
+                    buttonSize={isMobileDevice ? 64 : 76}
+                  />
+                )}
+
                 {/* Controls overlay — fullscreen only */}
                 {(isScreenSharing || remoteScreenStream) && (
                   <div className={`absolute inset-0 flex flex-col justify-end transition-opacity duration-300 ${controlsVisible ? "opacity-100" : "opacity-0 pointer-events-none"}`}>
                     <div className="absolute inset-0 bg-gradient-to-t from-black/50 via-transparent to-transparent pointer-events-none" />
-                    <div className="relative z-10 px-4 pb-4 pt-2 flex justify-end">
+                    <div className="relative z-10 px-4 pb-4 pt-2 flex items-center justify-end gap-2">
+                      {/* Widen button — mobile landscape fullscreen only */}
+                      {isMobileDevice && isLandscape && (isFullscreen || isSSIOSFullscreen) && (
+                        <button
+                          onClick={() => setScreenWidened(w => !w)}
+                          className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/25 flex items-center justify-center transition-all active:scale-95"
+                          title={screenWidened ? "Reset width" : "Widen to full screen"}
+                        >
+                          <span className="flex items-center gap-0.5">
+                            <ArrowLeft className="w-3 h-3 text-white" />
+                            <ArrowRight className="w-3 h-3 text-white" />
+                          </span>
+                        </button>
+                      )}
                       <button
                         onClick={handleScreenShareFullscreen}
                         className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/25 flex items-center justify-center transition-all active:scale-95"
@@ -4469,7 +4648,10 @@ export default function Room() {
               display: mode === "browser" ? undefined : "none",
               ...(isBrowserFullscreen && isIOSDevice ? { position: "fixed", top: 0, left: 0, width: iosViewport.w, height: iosViewport.h, zIndex: 9999 } : undefined),
               touchAction: "pan-x pan-y",
+              cursor: "default",
+              userSelect: "none",
             }}
+            onMouseMove={hyperbeamEmbed ? showBrowserControls : undefined}
             onTouchStart={hyperbeamEmbed ? showBrowserControls : undefined}
           >
               {hyperbeamEmbed ? (
@@ -4486,9 +4668,15 @@ export default function Room() {
                       height: "100%",
                     }}
                   />
+                  {/* overlay: لما الكنترولز مخبية → pointer-events:auto + cursor:none لإخفاء الكرسر
+                      لما الكنترولز ظاهرة → pointer-events:none عشان الكليك يوصل للـ Hyperbeam */}
                   <div
                     className="absolute inset-0"
-                    style={{ zIndex: 5, pointerEvents: browserControlsVisible ? "none" : "auto" }}
+                    style={{
+                      zIndex: 5,
+                      pointerEvents: browserControlsVisible ? "none" : "auto",
+                      cursor: (!browserControlsVisible && isBrowserFullscreen && !isIOSDevice) ? "none" : "default",
+                    }}
                     onMouseMove={showBrowserControls}
                     onTouchStart={showBrowserControls}
                   />

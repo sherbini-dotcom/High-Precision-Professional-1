@@ -102,6 +102,15 @@ async function getIceServers(): Promise<RTCIceServer[]> {
 // on Android (browser AGC fighting our compressor → unstable volume / distortion).
 // Tier 3 still passes audio: true as a last resort for unsupported browsers.
 export async function getMicStream(): Promise<MediaStream> {
+  // FIX-IOS-DUCKING: على iOS لما getUserMedia بتشتغل، النظام بيغير الـ audio session
+  // ويعمل ducking (يخفّض) صوت الفيديو/المتصفح تلقائياً.
+  // الحل: نحدد audioSession type لـ "play-and-record" قبل getUserMedia
+  // عشان iOS ما يعملش ducking للصوت التاني.
+  try {
+    const nav = navigator as unknown as { audioSession?: { type: string } };
+    if (nav.audioSession) nav.audioSession.type = "play-and-record";
+  } catch { /* ignore — API not supported */ }
+
   // Tier 1: full high-quality constraints
   try {
     return await navigator.mediaDevices.getUserMedia({
