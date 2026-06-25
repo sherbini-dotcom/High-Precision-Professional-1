@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, useCallback } from "react";
 import { useRoute, useLocation } from "wouter";
 import { useGetRoom, useGetVideoStatus, useListBans, useUnbanMember, getListBansQueryKey, useSetRoomPrivacy } from "@workspace/api-client-react";
 import { useQueryClient } from "@tanstack/react-query";
@@ -417,6 +417,8 @@ export default function Room() {
   const imageInputRef = useRef<HTMLInputElement>(null);
   const [unreadCount, setUnreadCount] = useState(0);
   const chatBottomRef = useRef<HTMLDivElement>(null);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
+  const savedScrollRef = useRef<number>(0);
   // Floating notification toast (chat message or member join)
   const [chatToast, setChatToast] = useState<{ name: string; text: string; tab: "chat" | "members" | "joinApproved" | "joinRejected" | "joinRequest"; memberId?: number } | null>(null);
   const chatToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -438,6 +440,7 @@ export default function Room() {
   // [FIX-PICKER-FIXED] موضع الـ picker على الشاشة (position:fixed) — بيمنع القطع بالـ overflow ويحسّب الإيموجي صح
   const [pickerFixedPos, setPickerFixedPos] = useState<{ x: number; y: number } | null>(null);
   const pickerFixedPosRef = useRef<{ x: number; y: number } | null>(null);
+  const prevMsgCountRef = useRef(0);
   // Toast swipe-to-dismiss
   const [toastSwipe, setToastSwipe] = useState({ x: 0, y: 0 });
   const toastTouchRef = useRef({ x: 0, y: 0 });
@@ -853,10 +856,12 @@ export default function Room() {
   }, []);
 
   // When a new message arrives while already on the chat tab → smooth scroll
+  // بنـ scroll بس لما عدد الرسائل يزيد (رسالة جديدة) — مش لما رياكشن أو حذف يحدّث الـ state
   useEffect(() => {
-    if (activeTab === "chat" && panelOpen) {
+    if (activeTab === "chat" && panelOpen && chatMessages.length > prevMsgCountRef.current) {
       chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
     }
+    prevMsgCountRef.current = chatMessages.length;
   }, [chatMessages]);
 
   // When the user opens the chat tab (or panel opens on chat) → instant jump to bottom
@@ -866,6 +871,13 @@ export default function Room() {
       setUnreadCount(0);
     }
   }, [activeTab, panelOpen]);
+
+  // [FIX-SCROLL-LOCK] لما الـ reply bar يظهر/يختفي، احفظ موضع الـ scroll وأرجّعه بعد الـ layout
+  useLayoutEffect(() => {
+    if (chatScrollRef.current) {
+      chatScrollRef.current.scrollTop = savedScrollRef.current;
+    }
+  }, [replyingTo]);
 
   useEffect(() => {
     if (!sessionToken || !code) {
@@ -1890,6 +1902,9 @@ export default function Room() {
     });
     socket.on("messageReaction", ({ messageId, reactions }: { messageId: string; reactions: Record<string, number[]> }) => {
       setChatMessages(prev => prev.map(m => (m.id === messageId ? { ...m, reactions } : m)));
+    });
+    socket.on("messageDeleted", ({ messageId }: { messageId: string }) => {
+      setChatMessages(prev => prev.filter(m => m.id !== messageId));
     });
     // Batch rapid memberRemoved events (e.g. 20 users closing at once) into a single
     // React state update instead of 20 separate setMembers calls. Without batching,
@@ -3555,6 +3570,10 @@ export default function Room() {
     setReactionPickerFor(null);
   };
 
+  const deleteMessage = (messageId: string) => {
+    socketRef.current?.emit("deleteMessage", { messageId });
+  };
+
   const sendStickerMessage = (sticker: string) => {
     setShowStickerPanel(false);
     socketRef.current?.emit("chatMessage", {
@@ -5118,7 +5137,7 @@ export default function Room() {
             {/* Chat tab */}
             {activeTab === "chat" && (
               <div className="flex-1 flex flex-col overflow-hidden">
-                <div className="flex-1 overflow-y-auto px-3 py-2 space-y-2" style={{ touchAction: "pan-y", overscrollBehavior: "none" }}>
+                <div ref={chatScrollRef} className="flex-1 overflow-y-auto px-3 py-2 space-y-2" style={{ touchAction: "pan-y", overscrollBehavior: "none" }}>
                   {chatMessages.length === 0 && (
                     <div className="flex flex-col items-center justify-center py-8 text-center">
                       <MessageSquare className="w-8 h-8 text-muted-foreground/30 mb-2" />
@@ -5261,24 +5280,45 @@ export default function Room() {
                           </div>
                         )}
                         <div className="relative flex items-end gap-1.5">
+                          {/* أزرار رسائل الآخرين — قبل الـ bubble */}
                           {!isMe && (
-                            <button
-                              onClick={() => setReplyingTo(msg)}
-                              className={`p-1 rounded-full transition-all ${triggered ? "text-primary scale-125" : "text-muted-foreground/50 hover:text-foreground"}`}
-                              title="Reply"
-                            >
-                              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>
-                            </button>
+                            <>
+                              <button
+                                onClick={() => { savedScrollRef.current = chatScrollRef.current?.scrollTop ?? 0; setReplyingTo(msg); }}
+                                className={`p-1 rounded-full transition-all ${triggered ? "text-primary scale-125" : "text-muted-foreground/50 hover:text-foreground"}`}
+                                title="رد"
+                              >
+                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>
+                              </button>
+                              {msg.id && (
+                                <button
+                                  onClick={(e) => {
+                                    if (reactionPickerFor === msg.id) {
+                                      setReactionPickerFor(null);
+                                      setPickerFixedPos(null);
+                                      pickerFixedPosRef.current = null;
+                                    } else {
+                                      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                                      const PICKER_W = 280;
+                                      const sw = window.innerWidth;
+                                      const px = Math.max(8, Math.min(sw - PICKER_W - 8, rect.left - PICKER_W / 2));
+                                      const py = Math.max(60, rect.top - 70);
+                                      const pos = { x: px, y: py };
+                                      pickerFixedPosRef.current = pos;
+                                      setPickerFixedPos(pos);
+                                      setReactionPickerFor(msg.id);
+                                    }
+                                  }}
+                                  className={`p-1 rounded-full transition-all ${reactionPickerFor === msg.id ? "text-primary scale-125" : "text-muted-foreground/50 hover:text-foreground"}`}
+                                  title="رياكشن"
+                                >
+                                  <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" x2="9.01" y1="9" y2="9"/><line x1="15" x2="15.01" y1="9" y2="9"/></svg>
+                                </button>
+                              )}
+                            </>
                           )}
-                          {!isMe && msg.id && (
-                            <button
-                              onClick={() => setReactionPickerFor(p => (p === msg.id ? null : msg.id))}
-                              className={`p-1 rounded-full transition-all ${reactionPickerFor === msg.id ? "text-primary scale-125" : "text-muted-foreground/50 hover:text-foreground"}`}
-                              title="React"
-                            >
-                              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" x2="9.01" y1="9" y2="9"/><line x1="15" x2="15.01" y1="9" y2="9"/></svg>
-                            </button>
-                          )}
+
+                          {/* الـ bubble */}
                           <div style={{ overflowWrap: "anywhere", wordBreak: "break-word" }} className={`max-w-[85%] rounded-2xl text-base leading-snug min-w-0 overflow-hidden ${msg.imageData || msg.message.startsWith("__sticker__") ? "bg-transparent p-0" : `px-3 py-2 ${isMe ? "bg-primary text-primary-foreground rounded-tr-sm" : "bg-muted text-foreground rounded-tl-sm"}`}`}>
                             {msg.imageData && msg.imageData.startsWith("data:image/") ? (
                               <img src={msg.imageData} alt="image" className="max-w-[200px] max-h-[200px] rounded-xl object-cover cursor-pointer" onClick={() => safeOpenImage(msg.imageData)} />
@@ -5286,23 +5326,52 @@ export default function Room() {
                               <span className="text-5xl leading-none select-none">{msg.message.replace("__sticker__", "")}</span>
                             ) : msg.message}
                           </div>
-                          {isMe && msg.id && (
-                            <button
-                              onClick={() => setReactionPickerFor(p => (p === msg.id ? null : msg.id))}
-                              className={`p-1 rounded-full transition-all ${reactionPickerFor === msg.id ? "text-primary scale-125" : "text-muted-foreground/50 hover:text-foreground"}`}
-                              title="React"
-                            >
-                              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" x2="9.01" y1="9" y2="9"/><line x1="15" x2="15.01" y1="9" y2="9"/></svg>
-                            </button>
-                          )}
+
+                          {/* أزرار رسائلي — بعد الـ bubble */}
                           {isMe && (
-                            <button
-                              onClick={() => setReplyingTo(msg)}
-                              className={`p-1 rounded-full transition-all ${triggered ? "text-primary scale-125" : "text-muted-foreground/50 hover:text-foreground"}`}
-                              title="Reply"
-                            >
-                              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>
-                            </button>
+                            <>
+                              {msg.id && (
+                                <button
+                                  onClick={(e) => {
+                                    if (reactionPickerFor === msg.id) {
+                                      setReactionPickerFor(null);
+                                      setPickerFixedPos(null);
+                                      pickerFixedPosRef.current = null;
+                                    } else {
+                                      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                                      const PICKER_W = 280;
+                                      const sw = window.innerWidth;
+                                      const px = Math.max(8, Math.min(sw - PICKER_W - 8, rect.left - PICKER_W / 2));
+                                      const py = Math.max(60, rect.top - 70);
+                                      const pos = { x: px, y: py };
+                                      pickerFixedPosRef.current = pos;
+                                      setPickerFixedPos(pos);
+                                      setReactionPickerFor(msg.id);
+                                    }
+                                  }}
+                                  className={`p-1 rounded-full transition-all ${reactionPickerFor === msg.id ? "text-primary scale-125" : "text-muted-foreground/50 hover:text-foreground"}`}
+                                  title="رياكشن"
+                                >
+                                  <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" x2="9.01" y1="9" y2="9"/><line x1="15" x2="15.01" y1="9" y2="9"/></svg>
+                                </button>
+                              )}
+                              <button
+                                onClick={() => { savedScrollRef.current = chatScrollRef.current?.scrollTop ?? 0; setReplyingTo(msg); }}
+                                className={`p-1 rounded-full transition-all ${triggered ? "text-primary scale-125" : "text-muted-foreground/50 hover:text-foreground"}`}
+                                title="رد"
+                              >
+                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>
+                              </button>
+                              {msg.id && (
+                                <button
+                                  onClick={() => deleteMessage(msg.id)}
+                                  className="p-1 rounded-full transition-all text-muted-foreground/50 hover:text-red-500"
+                                  title="حذف"
+                                >
+                                  <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+                                </button>
+                              )}
+                            </>
                           )}
 
                           {/* [FIX-PICKER-FIXED] الـ picker انتقل لـ fixed overlay خارج الـ scroll container — راجع أسفل الـ return */}
@@ -5317,10 +5386,10 @@ export default function Room() {
                                 <button
                                   key={emoji}
                                   onClick={() => toggleReaction(msg.id, emoji)}
-                                  className={`flex items-center gap-1 px-1.5 py-0.5 rounded-full text-xs border transition-all ${reactedByMe ? "bg-primary/15 border-primary/50 text-primary" : "bg-muted/60 border-border/50 text-muted-foreground hover:bg-muted"}`}
+                                  className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-sm border transition-all ${reactedByMe ? "bg-primary/15 border-primary/50 text-primary" : "bg-muted/60 border-border/50 text-muted-foreground hover:bg-muted"}`}
                                 >
-                                  <span>{emoji}</span>
-                                  <span className="font-medium">{memberIds.length}</span>
+                                  <span className="text-base leading-none">{emoji}</span>
+                                  <span className="font-semibold">{memberIds.length}</span>
                                 </button>
                               );
                             })}
@@ -5337,7 +5406,7 @@ export default function Room() {
                       <p className="text-xs text-primary/80 font-medium">Replying to {replyingTo.name}</p>
                       <p className="text-xs text-muted-foreground truncate">{replyingTo.message}</p>
                     </div>
-                    <button onClick={() => setReplyingTo(null)} className="p-1 rounded text-muted-foreground hover:text-foreground flex-shrink-0">
+                    <button onClick={() => { savedScrollRef.current = chatScrollRef.current?.scrollTop ?? 0; setReplyingTo(null); }} className="p-1 rounded text-muted-foreground hover:text-foreground flex-shrink-0">
                       <X className="w-4 h-4" />
                     </button>
                   </div>
@@ -5371,7 +5440,7 @@ export default function Room() {
                       className="p-1 rounded-lg text-muted-foreground hover:text-foreground transition-all flex-shrink-0"
                       title="Send image"
                     >
-                      <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>
+                      <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="16" height="16" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>
                     </button>
                     <button
                       onClick={() => setShowStickerPanel(v => !v)}

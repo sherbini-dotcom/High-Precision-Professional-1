@@ -1534,6 +1534,30 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
       },
     );
 
+    // حذف رسالة — بس صاحب الرسالة يقدر يحذفها
+    socket.on(
+      "deleteMessage",
+      ({ messageId }: { messageId: string }) => {
+        if (!currentRoomCode || !currentMemberId) return;
+        if (isSocketRateLimited(socket.id, "deleteMessage", 10)) return;
+        if (typeof messageId !== "string") return;
+
+        const history = roomChatHistory.get(currentRoomCode);
+        if (!history) return;
+
+        const idx = history.findIndex(e => e.id === messageId);
+        if (idx === -1) return;
+
+        // بس صاحب الرسالة يقدر يحذفها
+        if (history[idx].memberId !== currentMemberId) return;
+
+        history.splice(idx, 1);
+        roomChatHistory.set(currentRoomCode, history);
+
+        io.to(currentRoomCode).emit("messageDeleted", { messageId });
+      },
+    );
+
     socket.on("closeRoom", async () => {
       if (!currentRoomCode || socket.data.role !== "host") return;
       const closeCode = currentRoomCode;
