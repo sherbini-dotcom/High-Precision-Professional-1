@@ -67,6 +67,8 @@ function FloatingMicButton({ micEnabled, isMuted, audioLevel, onToggle, onDismis
   const [overDelete, setOverDelete] = useState(false);
   const [dismissing, setDismissing] = useState(false);
   const [burst, setBurst] = useState(false);
+  const [justToggled, setJustToggled] = useState(false);
+  const justToggledTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dragRef = useRef({ px: 0, py: 0, bx: 0, by: 0, moved: false, startTime: 0, pointerType: "mouse" });
   const BUTTON_SIZE = buttonSize;
 
@@ -151,7 +153,16 @@ function FloatingMicButton({ micEnabled, isMuted, audioLevel, onToggle, onDismis
     // يعتبر كليك فقط لو: ما اتحرك + ضغطة سريعة (touch أطول عشان long-press مش drag)
     const elapsed = Date.now() - dragRef.current.startTime;
     const timeLimit = dragRef.current.pointerType === "touch" ? 300 : 220;
-    if (!dragRef.current.moved && elapsed < timeLimit) onToggle();
+    if (!dragRef.current.moved && elapsed < timeLimit) {
+      onToggle();
+      // [FLASH] اظهر الزرار 100% لمدة 1.5 ثانية بعد الضغط ثم ارجع للشفافية
+      if (justToggledTimerRef.current) clearTimeout(justToggledTimerRef.current);
+      setJustToggled(true);
+      justToggledTimerRef.current = setTimeout(() => {
+        setJustToggled(false);
+        justToggledTimerRef.current = null;
+      }, 1500);
+    }
     setOverDelete(false);
   };
 
@@ -206,7 +217,7 @@ function FloatingMicButton({ micEnabled, isMuted, audioLevel, onToggle, onDismis
           userSelect: "none",
           width: BUTTON_SIZE,
           height: BUTTON_SIZE,
-          opacity: dismissing ? 0 : (controlsVisible || dragging || vol > 8) ? 1 : 0.40,
+          opacity: dismissing ? 0 : (controlsVisible || dragging || vol > 8 || justToggled) ? 1 : 0.40,
           transform: `scale(${btnScale})`,
           transformOrigin: "center center",
           transition: btnTransition,
@@ -1167,7 +1178,7 @@ export default function Room() {
         if (micIntervalRef.current) { clearInterval(micIntervalRef.current); micIntervalRef.current = null; }
         stream?.getTracks().forEach(t => t.stop());
         micStreamRef.current = null;
-        scriptProcessorRef.current?.disconnect();
+        try { scriptProcessorRef.current?.disconnect(); } catch { /* AudioWorkletNode disconnect is safe */ }
         scriptProcessorRef.current = null;
         void webrtcManagerRef.current?.setStream(null);
         if (audioContextRef.current?.state !== "closed") audioContextRef.current?.close().catch(() => {});
@@ -1341,6 +1352,15 @@ export default function Room() {
       }
       prevOnlineMembersRef.current = new Set(updated.filter(m => m.isOnline).map(m => m.id));
       setMembers(updated);
+      // [FIX-NEW-PEER-MIC] لما حد جديد يدخل الروم وأنا فاتح المايك،
+      // اعمل setStream تاني عشان الـ track يوصله
+      if (newlyJoined.length > 0 && micEnabledRef.current && micStreamRef.current) {
+        setTimeout(() => {
+          if (micEnabledRef.current && micStreamRef.current) {
+            void webrtcManagerRef.current?.setStream(micStreamRef.current);
+          }
+        }, 800);
+      }
       // [FIX-IOS-PREEXIST] On iOS/Android, <audio> elements need an explicit .play()
       // after a user gesture. peerMicEnabled only fires when a peer TOGGLES their
       // mic — if someone was already speaking when we joined, we miss that event
@@ -1726,15 +1746,26 @@ export default function Room() {
         const src = ctx.createBufferSource();
         src.buffer = audioBuf;
         const playGain = ctx.createGain();
-        playGain.gain.value = 2.0;
+        playGain.gain.value = 1.0; // [FIX-RECV-GAIN] 2.0 كانت تسبب clipping عند الاستقبال
         src.connect(playGain);
         playGain.connect(ctx.destination);
         const now = ctx.currentTime;
         const prev = nextAudioTimeRef.current.get(fromMemberId) ?? 0;
-        const maxDrift = 0.3;
-        const startAt = (prev > now + maxDrift)
-          ? now + 0.02
-          : Math.max(now + 0.02, prev);
+        // [FIX-JITTER] Adaptive jitter buffer:
+        //   • prev in the past → start immediately (small lookahead for smooth decode)
+        //   • prev within 400ms → schedule seamlessly (no gap between chunks)
+        //   • prev >400ms ahead → reset (network burst recovery, avoid long delay)
+        const LOOKAHEAD  = 0.04;   // 40ms decode headroom
+        const MAX_AHEAD  = 0.40;   // reset if buffer grows beyond 400ms
+        let startAt: number;
+        if (prev <= now) {
+          startAt = now + LOOKAHEAD;                       // behind → play now
+        } else if (prev - now <= MAX_AHEAD) {
+          startAt = prev;                                  // on-track → seamless
+        } else {
+          startAt = now + LOOKAHEAD;                       // too far ahead → reset
+          nextAudioTimeRef.current.delete(fromMemberId);
+        }
         src.start(startAt);
         nextAudioTimeRef.current.set(fromMemberId, startAt + audioBuf.duration);
       } catch { /* ignore decode errors */ }
@@ -2443,16 +2474,10 @@ export default function Room() {
       if (e.code === "Space") { e.preventDefault(); handlePlayPause(); }
       else if (e.code === "ArrowRight") handleSkip(10);
       else if (e.code === "ArrowLeft") handleSkip(-10);
-      else if (e.code === "KeyF") {
-        // F يفتح الـ fullscreen الصح بناءً على الوضع الحالي
-        if (mode === "browser") handleBrowserFullscreen();
-        else if (mode === "screenshare") handleScreenShareFullscreen();
-        else handleFullscreen(); // video / movies
-      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [handlePlayPause, handleSkip, handleFullscreen, handleBrowserFullscreen, handleScreenShareFullscreen, mode]);
+  }, [handlePlayPause, handleSkip]);
 
   const handleVideoPlay = () => {
     setIsPlaying(true); isPlayingRef.current = true;
@@ -3064,7 +3089,7 @@ export default function Room() {
     if (micIntervalRef.current) { clearInterval(micIntervalRef.current); micIntervalRef.current = null; }
     micStreamRef.current?.getTracks().forEach(t => t.stop());
     micStreamRef.current = null;
-    scriptProcessorRef.current?.disconnect();
+    try { scriptProcessorRef.current?.disconnect(); } catch { /* AudioWorkletNode disconnect is safe */ }
     scriptProcessorRef.current = null;
     if (audioContextRef.current?.state !== "closed") audioContextRef.current?.close().catch(() => {});
     audioContextRef.current = null;
@@ -3075,23 +3100,58 @@ export default function Room() {
     socketRef.current?.emit("micDisabled");
     try { localStorage.removeItem(`wp_mic_${code}`); } catch { /* ignore */ }
 
-    // FIX-IOS-DUCKING: لما المايك بيتوقف، نرجّع الـ audio session لـ playback
-    // عشان iOS يوقف الـ ducking ويرجع صوت الفيديو/المتصفح لحجمه الأصلي.
+    // [FIX-IOS-DUCKING-V2] Comprehensive audio session restoration after mic stops.
+    // iOS changes the audio session to "play-and-record" when getUserMedia runs,
+    // which ducks/interrupts all other audio (video, peers, HyperBeam iframe).
+    // After stopping the mic we must: (1) restore the session, then (2) revive
+    // every audio source we manage, because iOS won't un-duck them automatically.
+
+    // Step 1 — restore session immediately (Safari 17+ audioSession API)
     try {
       const nav = navigator as unknown as { audioSession?: { type: string } };
       if (nav.audioSession) nav.audioSession.type = "playback";
     } catch { /* ignore */ }
 
-    // Fallback لـ iOS القديم: إعادة ضبط صوت الفيديو يدوياً بعد 200ms
-    // (بعد ما iOS يخلص ducking transition)
+    // Step 2 — wait 300ms for iOS to finish releasing the audio session,
+    // then revive every audio source we own.
     setTimeout(() => {
+      // 2a. Peer audio WebAudio context (receives remote participants' audio).
+      //     getUserMedia can suspend it as a side-effect on some iOS versions.
+      if (audioPlayerRef.current?.state === "suspended") {
+        audioPlayerRef.current.resume().catch(() => {});
+      }
+
+      // 2b. Local video element — volume bounce forces iOS to un-duck,
+      //     then call play() so it resumes if iOS had paused it.
       const v = videoRef.current;
       if (v && !v.muted) {
         const savedVol = v.volume;
         v.volume = 0;
-        requestAnimationFrame(() => { v.volume = savedVol; });
+        requestAnimationFrame(() => {
+          v.volume = savedVol;
+          if (!v.paused) v.play().catch(() => {});
+        });
       }
-    }, 200);
+
+      // 2c. All <audio> elements in the document (WebRTC peer tracks injected
+      //     by webrtc.ts). iOS may have paused them during the mic session.
+      document.querySelectorAll<HTMLAudioElement>("audio").forEach(el => {
+        if (el.paused && (el.src || el.srcObject)) {
+          el.play().catch(() => {});
+        }
+      });
+
+      // 2d. HyperBeam iframe — we can't reach inside a cross-origin iframe,
+      //     but dispatching a synthetic click on the container restores iOS
+      //     audio focus for that browsing context in some Safari versions.
+      try {
+        const hbEl = hbContainerRef.current;
+        if (hbEl) {
+          const iframe = hbEl.querySelector("iframe") ?? hbEl;
+          iframe.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+        }
+      } catch { /* cross-origin — best effort only */ }
+    }, 300);
   }, [myMemberId]);
 
 
@@ -3111,14 +3171,14 @@ export default function Room() {
       const source = ctx.createMediaStreamSource(stream);
 
       const micGain = ctx.createGain();
-      micGain.gain.value = 3.0;
+      micGain.gain.value = 1.5; // [FIX-MIC-STABILITY] 3.0 كانت تسبب clipping
 
       const compressor = ctx.createDynamicsCompressor();
-      compressor.threshold.value = -20;
-      compressor.knee.value = 6;
-      compressor.ratio.value = 4;
-      compressor.attack.value = 0.003;
-      compressor.release.value = 0.15;
+      compressor.threshold.value = -26; // [FIX-MIC-COMPRESSOR] أعمق threshold
+      compressor.knee.value = 10;       // soft knee أوسع
+      compressor.ratio.value = 3;       // ضغط أهدأ
+      compressor.attack.value = 0.005;
+      compressor.release.value = 0.25;
 
       source.connect(micGain);
       micGain.connect(compressor);
@@ -3128,29 +3188,90 @@ export default function Room() {
       compressor.connect(analyser);
       analyserRef.current = analyser;
 
-      const processor = ctx.createScriptProcessor(4096, 1, 1);
-      compressor.connect(processor);
+      // ── Keep graph alive so analyser stays active ──────────────────────────
       const silentGain = ctx.createGain();
       silentGain.gain.value = 0;
-      processor.connect(silentGain);
+      analyser.connect(silentGain);
       silentGain.connect(ctx.destination);
 
-      processor.onaudioprocess = (e: AudioProcessingEvent) => {
+      // ── Audio sender: AudioWorklet (dedicated audio thread) ──────────────
+      // Falls back to ScriptProcessor on old browsers.
+      const sendChunk = (int16buf: ArrayBuffer) => {
         if (!micEnabledRef.current) return;
-        const input = e.inputBuffer.getChannelData(0);
-        const int16 = new Int16Array(input.length);
-        for (let i = 0; i < input.length; i++) {
-          int16[i] = Math.round(Math.max(-1, Math.min(1, input[i])) * 32767);
-        }
-        socketRef.current?.volatile.emit("audioChunk", { sr: ctx.sampleRate, buf: int16.buffer });
+        if (webrtcManagerRef.current?.hasConnectedPeers()) return;
+        socketRef.current?.volatile.emit("audioChunk", { sr: ctx.sampleRate, buf: int16buf });
       };
-      scriptProcessorRef.current = processor;
+
+      const workletCode = [
+        "class MicChunkProcessor extends AudioWorkletProcessor {",
+        "  constructor() { super(); this._buf = []; this._sz = 2048; } // [FIX-LATENCY] 4096→2048 (~43ms latency)",
+        "  process(inputs) {",
+        "    var ch = inputs[0] && inputs[0][0];",
+        "    if (!ch) return true;",
+        "    for (var i = 0; i < ch.length; i++) this._buf.push(ch[i]);",
+        "    while (this._buf.length >= this._sz) {",
+        "      var slice = this._buf.splice(0, this._sz);",
+        "      var out = new Int16Array(this._sz);",
+        "      for (var j = 0; j < this._sz; j++) {",
+        "        out[j] = Math.round(Math.max(-1, Math.min(1, slice[j])) * 32767);",
+        "      }",
+        "      this.port.postMessage(out.buffer, [out.buffer]);",
+        "    }",
+        "    return true;",
+        "  }",
+        "}",
+        "registerProcessor('mic-chunk-processor', MicChunkProcessor);"
+      ].join("\n");
+
+      let usedWorklet = false;
+      try {
+        const blob = new Blob([workletCode], { type: "application/javascript" });
+        const blobUrl = URL.createObjectURL(blob);
+        await ctx.audioWorklet.addModule(blobUrl);
+        URL.revokeObjectURL(blobUrl);
+        const workletNode = new AudioWorkletNode(ctx, "mic-chunk-processor");
+        compressor.connect(workletNode);
+        // WorkletNode needs a destination to stay in the active graph
+        const wSilent = ctx.createGain();
+        wSilent.gain.value = 0;
+        workletNode.connect(wSilent);
+        wSilent.connect(ctx.destination);
+        workletNode.port.onmessage = (ev: MessageEvent<ArrayBuffer>) => sendChunk(ev.data);
+        scriptProcessorRef.current = workletNode as unknown as ScriptProcessorNode;
+        usedWorklet = true;
+      } catch {
+        /* AudioWorklet not supported — fall through to ScriptProcessor */
+      }
+
+      if (!usedWorklet) {
+        // Fallback: ScriptProcessor (deprecated, main-thread — only for very old browsers)
+        const processor = ctx.createScriptProcessor(4096, 1, 1);
+        compressor.connect(processor);
+        processor.connect(silentGain);
+        processor.onaudioprocess = (e: AudioProcessingEvent) => {
+          const input = e.inputBuffer.getChannelData(0);
+          const int16 = new Int16Array(input.length);
+          for (let i = 0; i < input.length; i++) {
+            int16[i] = Math.round(Math.max(-1, Math.min(1, input[i])) * 32767);
+          }
+          sendChunk(int16.buffer);
+        };
+        scriptProcessorRef.current = processor;
+      }
 
       void webrtcManagerRef.current?.setStream(stream);
 
       setMicEnabled(true);
       setMicError(null);
       try { localStorage.setItem(`wp_mic_${code}`, "1"); } catch { /* ignore */ }
+
+      // [FIX-STREAM-RETRY] لو replaceTrack اشتغل بس الـ ICE مكنش جاهز بعد،
+      // إعادة setStream بعد 1.5 ثانية تضمن وصول الصوت بدون refresh
+      setTimeout(() => {
+        if (micEnabledRef.current && micStreamRef.current) {
+          void webrtcManagerRef.current?.setStream(micStreamRef.current);
+        }
+      }, 1500);
 
       micIntervalRef.current = setInterval(() => {
         const an = analyserRef.current;
