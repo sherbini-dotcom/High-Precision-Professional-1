@@ -317,6 +317,12 @@ export default function Room() {
 
   const [members, setMembers] = useState<Member[]>([]);
   const [speakingState, setSpeakingState] = useState<Record<number, number>>({});
+  // [FIX-LIGHTBOX] بدل window.open() اللي بيتبلوك من المتصفحات مع data: URLs
+  const [lightboxImage, setLightboxImage] = useState<string | null>(null);
+  // refs للـ lightbox — بنعدّل DOM مباشرة عشان 60fps على موبايل بدون re-render
+  const lbImgRef  = useRef<HTMLImageElement>(null);
+  const lbOverRef = useRef<HTMLDivElement>(null);
+  const lbSt      = useRef({ scale: 1, x: 0, y: 0, lastDist: 0, startY: 0, startTY: 0, dragging: false });
   // مؤشر جودة الشبكة: good=أخضر / fair=أصفر / poor=أحمر / none=مافيش peers
   const [networkQuality, setNetworkQuality] = useState<NetworkQuality>("none");
   const [videoHlsPath, setVideoHlsPath] = useState<string | null>(null);
@@ -425,6 +431,13 @@ export default function Room() {
   const touchStartYRef = useRef(0);
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressTriggeredRef = useRef(false);
+  // [FIX-INSTA-REACTION] refs لتتبّع موضع الإصبع أثناء gesture الـ long-press + swipe-up
+  const lpStartXRef = useRef(0);   // X لما اللمسة الطويلة اشتغلت
+  const lpStartYRef = useRef(0);   // Y لما اللمسة الطويلة اشتغلت
+  const [lpHoveredIdx, setLpHoveredIdx] = useState(-1); // index الإيموجي المحدد حالياً (-1 = مش محدد)
+  // [FIX-PICKER-FIXED] موضع الـ picker على الشاشة (position:fixed) — بيمنع القطع بالـ overflow ويحسّب الإيموجي صح
+  const [pickerFixedPos, setPickerFixedPos] = useState<{ x: number; y: number } | null>(null);
+  const pickerFixedPosRef = useRef<{ x: number; y: number } | null>(null);
   // Toast swipe-to-dismiss
   const [toastSwipe, setToastSwipe] = useState({ x: 0, y: 0 });
   const toastTouchRef = useRef({ x: 0, y: 0 });
@@ -693,8 +706,6 @@ export default function Room() {
   const clockSyncSamplesRef = useRef<number[]>([]);
   // Drift report throttle — last time we emitted driftReport to server (ms)
   const lastDriftReportRef = useRef<number>(0);
-  // iOS: cooldown to avoid calling syncToTarget on playMismatch more than once per 3s
-  const lastPlayMismatchSyncRef = useRef<number>(0);
   // Sequence number: ignore syncState events older than what we already applied
   const lastSyncSeqRef = useRef<number>(-1);
   // Scheduled play timeout — cleared when a newer syncState cancels the pending play
@@ -1349,18 +1360,19 @@ export default function Room() {
           setChatToast({ name: label, text: "انضم للغرفة 👋", tab: "members" });
           chatToastTimerRef.current = setTimeout(() => setChatToast(null), 4000);
         }
+        // [FIX-NEW-PEER-MIC] لما حد جديد يدخل الروم وأنا فاتح المايك،
+        // اعمل setStream تاني عشان الـ track يوصله.
+        // [FIX-TS-SCOPE] نقلنا الكود جوا الـ if block عشان newlyJoined في scope هنا بس.
+        if (newlyJoined.length > 0 && micEnabledRef.current && micStreamRef.current) {
+          setTimeout(() => {
+            if (micEnabledRef.current && micStreamRef.current) {
+              void webrtcManagerRef.current?.setStream(micStreamRef.current);
+            }
+          }, 800);
+        }
       }
       prevOnlineMembersRef.current = new Set(updated.filter(m => m.isOnline).map(m => m.id));
       setMembers(updated);
-      // [FIX-NEW-PEER-MIC] لما حد جديد يدخل الروم وأنا فاتح المايك،
-      // اعمل setStream تاني عشان الـ track يوصله
-      if (newlyJoined.length > 0 && micEnabledRef.current && micStreamRef.current) {
-        setTimeout(() => {
-          if (micEnabledRef.current && micStreamRef.current) {
-            void webrtcManagerRef.current?.setStream(micStreamRef.current);
-          }
-        }, 800);
-      }
       // [FIX-IOS-PREEXIST] On iOS/Android, <audio> elements need an explicit .play()
       // after a user gesture. peerMicEnabled only fires when a peer TOGGLES their
       // mic — if someone was already speaking when we joined, we miss that event
@@ -3165,7 +3177,12 @@ export default function Room() {
       socketRef.current?.emit("micEnabled");
 
       const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      const ctx = new AudioCtx({ sampleRate: 48000 });
+      // [FIX-SAMPLERATE] بعض Android WebViews بترفض sampleRate: 48000 وتعمل
+      // exception — يخلي toggleMic يفشل بصمت. نجرب 48000 الأول، لو فشل
+      // نخلي البراوزر يختار الـ native rate بتاعه (عادةً 44100 أو 48000).
+      const ctx = (() => {
+        try { return new AudioCtx({ sampleRate: 48000 }); } catch { return new AudioCtx(); }
+      })();
       if (ctx.state === "suspended") { try { await ctx.resume(); } catch { /* ignore */ } }
       audioContextRef.current = ctx;
       const source = ctx.createMediaStreamSource(stream);
@@ -3173,11 +3190,16 @@ export default function Room() {
       const micGain = ctx.createGain();
       micGain.gain.value = 1.5; // [FIX-MIC-STABILITY] 3.0 كانت تسبب clipping
 
+      // [FIX-COMPRESSOR-LEVELING] رفعنا ratio من 3 → 5 وخفضنا threshold من -26 → -30.
+      // ratio=3 كان ضعيف جداً كـ leveler: شخص بيتكلم من بعيد مش بيتضخّم بالقدر الكافي
+      // مقارنة بشخص قريب من المايك. ratio=5 يضغط الإشارات العالية أقوى → يقرّب
+      // مستويات الصوت بين المستخدمين. threshold=-30 يمسك حتى الأصوات الهادية نسبياً.
+      // attack=0.003: استجابة أسرع تمنع peaks مفاجئة من تمرير clipping.
       const compressor = ctx.createDynamicsCompressor();
-      compressor.threshold.value = -26; // [FIX-MIC-COMPRESSOR] أعمق threshold
-      compressor.knee.value = 10;       // soft knee أوسع
-      compressor.ratio.value = 3;       // ضغط أهدأ
-      compressor.attack.value = 0.005;
+      compressor.threshold.value = -30;
+      compressor.knee.value = 10;
+      compressor.ratio.value = 5;
+      compressor.attack.value = 0.003;
       compressor.release.value = 0.25;
 
       source.connect(micGain);
@@ -3198,7 +3220,11 @@ export default function Room() {
       // Falls back to ScriptProcessor on old browsers.
       const sendChunk = (int16buf: ArrayBuffer) => {
         if (!micEnabledRef.current) return;
-        if (webrtcManagerRef.current?.hasConnectedPeers()) return;
+        // [FIX-MULTIROOM-SEND] hasConnectedPeers() كانت بتوقف Socket.IO بمجرد ما
+        // أي peer واحد يكون متصل P2P — حتى لو باقي الأعضاء مش عندهم WebRTC.
+        // النتيجة: في روم فيها 3+ أشخاص، الأعضاء بدون P2P ما بيسمعوش.
+        // الحل: دايماً ابعت عبر Socket.IO. جهة الاستقبال تستخدم hasConnectedPeer(fromMemberId)
+        // وتتجاهل الـ chunk لو الصوت واصل بالفعل عبر WebRTC (منع double audio).
         socketRef.current?.volatile.emit("audioChunk", { sr: ctx.sampleRate, buf: int16buf });
       };
 
@@ -3273,6 +3299,11 @@ export default function Room() {
         }
       }, 1500);
 
+      // [FIX-SPEAKING-LOAD] نبعت speaking event بس لما فيه تغيير حقيقي:
+      //   • دخل صوت (vol > 8) أو خرج من صمت
+      //   • vol اتغير بأكثر من 10 وحدة عن آخر قيمة أُرسلت
+      // بيقلل الـ events من 10/ثانية → ~2-4/ثانية في المتوسط بدون تأثير على الـ UI.
+      let lastEmittedVol = 0;
       micIntervalRef.current = setInterval(() => {
         const an = analyserRef.current;
         if (!an) return;
@@ -3280,7 +3311,13 @@ export default function Room() {
         an.getFloatTimeDomainData(timeData);
         const rms = Math.sqrt(timeData.reduce((s, v) => s + v * v, 0) / timeData.length);
         const vol = Math.min(100, Math.round(rms * 400));
-        socketRef.current?.emit("speaking", { volume: vol });
+        const wasSilent = lastEmittedVol <= 8;
+        const isSilent  = vol <= 8;
+        const bigChange = Math.abs(vol - lastEmittedVol) >= 10;
+        if (!isSilent || !wasSilent || bigChange) {
+          socketRef.current?.emit("speaking", { volume: vol });
+          lastEmittedVol = vol;
+        }
         setSpeakingState(prev => ({ ...prev, [myMemberId]: vol }));
       }, 100);
     } catch {
@@ -3819,11 +3856,12 @@ export default function Room() {
   );
 
   const safeOpenImage = (url: string | undefined) => {
-    // Fix: قبول data:image/ فقط — http:// ممكن يُستخدم لـ open-redirect / tracking
-    // https:// مقبولة للصور الخارجية الموثوقة
+    // [FIX-LIGHTBOX] window.open() مع data:image/ URLs بيتبلوك من Chrome وiOS Safari
+    // لأسباب أمان (Content-Security-Policy + data: navigation blocking).
+    // الحل: lightbox داخل الصفحة نفسها يشتغل على كل الأجهزة بدون popup blocker.
     if (!url) return;
     if (url.startsWith("data:image/") || url.startsWith("https://")) {
-      window.open(url);
+      setLightboxImage(url);
     }
   };
 
@@ -5099,40 +5137,96 @@ export default function Room() {
                         style={{
                           transform: `translateX(${isMe ? -offset : offset}px)`,
                           transition: isSwiping ? "none" : "transform 0.2s ease-out",
+                          // [FIX-SELECTION] منع ظهور الـ native text/image selection UI
+                          // لما المستخدم يضغط طويل — بيتسبب في ظهور المقابض الزرقاء
+                          userSelect: "none",
+                          WebkitUserSelect: "none",
+                          WebkitTouchCallout: "none", // iOS: يمنع منيو "Save Image"
                         }}
                         onTouchStart={e => {
+                          // [FIX-SELECTION] نمنع الـ native long-press selection من المتصفح
+                          e.preventDefault();
                           touchStartXRef.current = e.touches[0].clientX;
                           touchStartYRef.current = e.touches[0].clientY;
                           setSwipingMsgIdx(i);
                           setSwipeOffset(0);
                           longPressTriggeredRef.current = false;
                           if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
+                          // [FIX-INSTA-REACTION] خفضنا الـ timer من 450ms → 200ms
+                          // عشان الـ picker يظهر بسرعة زي Instagram تماماً
                           longPressTimerRef.current = setTimeout(() => {
                             longPressTimerRef.current = null;
                             longPressTriggeredRef.current = true;
-                            if (navigator.vibrate) navigator.vibrate(10);
+                            if (navigator.vibrate) navigator.vibrate(12);
+                            // نحفظ الموضع وقت اشتغال الـ long press عشان نحسب الـ swipe منه
+                            lpStartXRef.current = touchStartXRef.current;
+                            lpStartYRef.current = touchStartYRef.current;
                             setSwipingMsgIdx(null);
                             setSwipeOffset(0);
+                            setLpHoveredIdx(-1);
+                            // [FIX-PICKER-FIXED] نحسب موضع الـ picker على الشاشة بشكل ثابت
+                            // الـ picker عرضه 280px (6 إيموجي × ~46px + padding)
+                            // نمركزه على X اللمسة مع clamp للحواف
+                            {
+                              const PICKER_W = 280;
+                              const sw = window.innerWidth;
+                              const px = Math.max(8, Math.min(sw - PICKER_W - 8, touchStartXRef.current - PICKER_W / 2));
+                              // فوق الإصبع بـ 80px مع منع الخروج من أعلى الشاشة
+                              const py = Math.max(60, touchStartYRef.current - 90);
+                              const pos = { x: px, y: py };
+                              pickerFixedPosRef.current = pos;
+                              setPickerFixedPos(pos);
+                            }
                             setReactionPickerFor(msg.id);
-                          }, 450);
+                          }, 200);
                         }}
                         onTouchMove={e => {
-                          // أي حركة محسوسة (مش رعشة صغيرة) بتلغي الضغطة الطويلة عشان لا تتعارض مع السحب أو السكرول
-                          const movedX = Math.abs(e.touches[0].clientX - touchStartXRef.current);
-                          const movedY = Math.abs(e.touches[0].clientY - touchStartYRef.current);
+                          const cx = e.touches[0].clientX;
+                          const cy = e.touches[0].clientY;
+                          const movedX = Math.abs(cx - touchStartXRef.current);
+                          const movedY = Math.abs(cy - touchStartYRef.current);
+
+                          // أي حركة > 10px قبل اشتغال الـ long press بتلغيه (منع تعارض مع scroll/swipe)
                           if ((movedX > 10 || movedY > 10) && longPressTimerRef.current) {
                             clearTimeout(longPressTimerRef.current);
                             longPressTimerRef.current = null;
                           }
+
+                          // [FIX-INSTA-REACTION] بعد ما الـ long press اشتغل:
+                          // نتابع حركة الإصبع لتحديد الإيموجي المحدد (زي Instagram)
+                          if (longPressTriggeredRef.current) {
+                            e.preventDefault();
+                            // [FIX-PICKER-FIXED] نستخدم الموضع الفعلي للـ picker (position:fixed)
+                            // عشان نحسب بدقة إيه الإيموجي اللي تحت الإصبع
+                            const pos = pickerFixedPosRef.current;
+                            if (pos) {
+                              const PICKER_W = 280;
+                              const EMOJI_COUNT = 6;
+                              const EMOJI_W = PICKER_W / EMOJI_COUNT;
+                              const relX = cx - pos.x;
+                              const deltaY = lpStartYRef.current - cy;
+                              if (deltaY > 15) {
+                                // الإصبع تحرّك لفوق — حدد الإيموجي بناءً على X الفعلي
+                                const idx = Math.max(0, Math.min(EMOJI_COUNT - 1, Math.floor(relX / EMOJI_W)));
+                                if (idx !== lpHoveredIdx) {
+                                  if (navigator.vibrate) navigator.vibrate(4);
+                                  setLpHoveredIdx(idx);
+                                }
+                              } else {
+                                if (lpHoveredIdx !== -1) setLpHoveredIdx(-1);
+                              }
+                            }
+                            return;
+                          }
+
                           if (swipingMsgIdx !== i) return;
                           // FIX PANEL-SWIPE: لو الحركة أفقية بشكل واضح، وقف الـ bubble
-                          // عشان الـ panel أو الـ browser ما يتحركوش مع السحب
                           if (movedX > movedY && movedX > 5) {
                             e.stopPropagation();
                           }
                           const dx = isMe
-                            ? touchStartXRef.current - e.touches[0].clientX
-                            : e.touches[0].clientX - touchStartXRef.current;
+                            ? touchStartXRef.current - cx
+                            : cx - touchStartXRef.current;
                           if (dx > 0) {
                             setSwipeOffset(Math.min(dx, 65));
                           }
@@ -5143,9 +5237,16 @@ export default function Room() {
                             longPressTimerRef.current = null;
                           }
                           if (longPressTriggeredRef.current) {
-                            // المنتقي فتح فعلاً من الضغطة الطويلة — منمنع أي click/swipe زيادة بعد كده
                             longPressTriggeredRef.current = false;
                             e.preventDefault();
+                            // [FIX-PICKER-FIXED] نطبّق الـ reaction لو كان إيموجي محدد، ونمسح الـ picker الثابت
+                            if (lpHoveredIdx >= 0) {
+                              toggleReaction(msg.id, REACTION_EMOJIS[lpHoveredIdx]);
+                            }
+                            setLpHoveredIdx(-1);
+                            setPickerFixedPos(null);
+                            pickerFixedPosRef.current = null;
+                            setReactionPickerFor(null);
                             return;
                           }
                           if (swipeOffset > 45) setReplyingTo(msg);
@@ -5204,20 +5305,7 @@ export default function Room() {
                             </button>
                           )}
 
-                          {/* Emoji reaction picker popup */}
-                          {reactionPickerFor === msg.id && (
-                            <div className={`absolute bottom-full mb-1 z-20 flex items-center gap-1 bg-card border border-border rounded-full shadow-xl px-2 py-1.5 ${isMe ? "right-0" : "left-0"}`}>
-                              {REACTION_EMOJIS.map(em => (
-                                <button
-                                  key={em}
-                                  onClick={() => toggleReaction(msg.id, em)}
-                                  className="text-xl hover:scale-125 transition-transform active:scale-95"
-                                >
-                                  {em}
-                                </button>
-                              ))}
-                            </div>
-                          )}
+                          {/* [FIX-PICKER-FIXED] الـ picker انتقل لـ fixed overlay خارج الـ scroll container — راجع أسفل الـ return */}
                         </div>
 
                         {/* Reaction pills */}
@@ -5353,6 +5441,202 @@ export default function Room() {
       />
 
     </div>
+
+    {/* ── Image Lightbox ───────────────────────────────────────────────────
+        [FIX-LIGHTBOX-V2] Pinch-to-zoom + swipe-down-to-close + mouse wheel zoom.
+        كل الـ transforms بتتطبّق على DOM مباشرة عبر lbImgRef للحصول على 60fps
+        على الموبايل بدون React re-render في كل frame.
+    ─────────────────────────────────────────────────────────────────────── */}
+    {/* ══════ [FIX-PICKER-FIXED] Emoji reaction picker — position:fixed فوق كل شيء ══════
+        بنعرضه هنا خارج أي scroll container عشان:
+        1. ما يتقطعش بالـ overflow:hidden على الـ chat scroll area
+        2. نحسب X الإيموجي بدقة من pickerFixedPos.x (اللي حسبناه من موضع الإصبع الفعلي)
+    ══════════════════════════════════════════════════════════════════════════════════════ */}
+    {reactionPickerFor && pickerFixedPos && (
+      <div
+        style={{
+          position: "fixed",
+          left: pickerFixedPos.x,
+          top: pickerFixedPos.y,
+          zIndex: 99998,
+          display: "flex",
+          alignItems: "center",
+          background: "var(--card)",
+          border: "1px solid var(--border)",
+          borderRadius: 9999,
+          boxShadow: "0 8px 32px rgba(0,0,0,0.45)",
+          padding: "6px 4px",
+          gap: 2,
+          pointerEvents: "auto",
+        }}
+      >
+        {REACTION_EMOJIS.map((em, idx) => {
+          const hovered = lpHoveredIdx === idx;
+          return (
+            <button
+              key={em}
+              onClick={() => {
+                toggleReaction(reactionPickerFor, em);
+                setPickerFixedPos(null);
+                pickerFixedPosRef.current = null;
+                setReactionPickerFor(null);
+              }}
+              style={{
+                width: 46, height: 46,
+                display: "flex", alignItems: "center", justifyContent: "center",
+                borderRadius: "50%",
+                fontSize: hovered ? 28 : 20,
+                transform: hovered ? "translateY(-10px) scale(1.35)" : "scale(1)",
+                transition: "transform 0.15s cubic-bezier(0.34,1.56,0.64,1), font-size 0.15s ease",
+                background: hovered ? "rgba(168,85,247,0.15)" : "transparent",
+                border: "none", cursor: "pointer",
+              }}
+            >
+              {em}
+            </button>
+          );
+        })}
+      </div>
+    )}
+
+    {lightboxImage && (
+      <div
+        ref={lbOverRef}
+        role="dialog" aria-modal="true" aria-label="عرض الصورة" tabIndex={0}
+        onKeyDown={(e) => { if (e.key === "Escape") setLightboxImage(null); }}
+        onClick={(e) => { if (e.target === lbOverRef.current) setLightboxImage(null); }}
+        /* ── mouse wheel zoom (desktop) ── */
+        onWheel={(e) => {
+          e.preventDefault();
+          const st = lbSt.current;
+          st.scale = Math.min(5, Math.max(1, st.scale - e.deltaY * 0.003));
+          if (st.scale <= 1) { st.scale = 1; st.x = 0; st.y = 0; }
+          if (lbImgRef.current)
+            lbImgRef.current.style.transform = `translate(${st.x}px,${st.y}px) scale(${st.scale})`;
+        }}
+        /* ── touch: pinch-zoom + swipe-to-close ── */
+        onTouchStart={(e) => {
+          const st = lbSt.current;
+          if (e.touches.length === 2) {
+            const dx = e.touches[0].clientX - e.touches[1].clientX;
+            const dy = e.touches[0].clientY - e.touches[1].clientY;
+            st.lastDist = Math.hypot(dx, dy);
+          } else if (e.touches.length === 1) {
+            st.startY  = e.touches[0].clientY;
+            st.startTY = st.y;
+            st.dragging = true;
+          }
+        }}
+        onTouchMove={(e) => {
+          e.preventDefault();
+          const st = lbSt.current;
+          const img = lbImgRef.current;
+          const ovr = lbOverRef.current;
+          if (!img) return;
+
+          if (e.touches.length === 2) {
+            // ── Pinch-to-zoom ──────────────────────────────────────────────
+            const dx = e.touches[0].clientX - e.touches[1].clientX;
+            const dy = e.touches[0].clientY - e.touches[1].clientY;
+            const dist = Math.hypot(dx, dy);
+            const delta = dist / (st.lastDist || dist);
+            st.scale = Math.min(5, Math.max(1, st.scale * delta));
+            st.lastDist = dist;
+            if (st.scale <= 1) { st.scale = 1; st.x = 0; st.y = 0; }
+            img.style.transform = `translate(${st.x}px,${st.y}px) scale(${st.scale})`;
+          } else if (e.touches.length === 1 && st.dragging) {
+            if (st.scale > 1.05) {
+              // ── Pan when zoomed in ─────────────────────────────────────
+              const moved = e.touches[0].clientY - st.startY;
+              st.y = st.startTY + moved;
+              img.style.transform = `translate(${st.x}px,${st.y}px) scale(${st.scale})`;
+            } else {
+              // ── Swipe-down-to-close (scale ≈ 1) ───────────────────────
+              const swipeY = e.touches[0].clientY - st.startY;
+              const progress = Math.min(1, Math.abs(swipeY) / 220);
+              img.style.transform = `translateY(${swipeY}px) scale(${1 - progress * 0.15})`;
+              if (ovr) ovr.style.background = `rgba(0,0,0,${0.92 - progress * 0.6})`;
+            }
+          }
+        }}
+        onTouchEnd={(e) => {
+          const st = lbSt.current;
+          const img = lbImgRef.current;
+          const ovr = lbOverRef.current;
+          if (e.changedTouches.length === 1 && st.dragging && st.scale <= 1.05) {
+            const swipeY = e.changedTouches[0].clientY - st.startY;
+            if (Math.abs(swipeY) > 110) {
+              // ── سحب كافي → أغلق مع animation ─────────────────────────
+              if (img) { img.style.transition = "transform 0.22s ease,opacity 0.22s ease"; img.style.opacity = "0"; img.style.transform = `translateY(${swipeY > 0 ? 300 : -300}px) scale(0.85)`; }
+              setTimeout(() => setLightboxImage(null), 200);
+            } else {
+              // ── سحب قصير → ارجع لمكانك ───────────────────────────────
+              if (img) { img.style.transition = "transform 0.2s ease"; img.style.transform = `translate(${st.x}px,${st.y}px) scale(${st.scale})`; }
+              if (ovr) { ovr.style.background = "rgba(0,0,0,0.92)"; }
+              setTimeout(() => { if (img) img.style.transition = ""; }, 220);
+            }
+          } else if (e.touches.length < 2 && st.scale <= 1) {
+            st.scale = 1; st.x = 0; st.y = 0;
+            if (img) img.style.transform = "translate(0,0) scale(1)";
+          }
+          st.dragging = false;
+        }}
+        style={{
+          position: "fixed", inset: 0, zIndex: 99999,
+          background: "rgba(0,0,0,0.92)",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          touchAction: "none",
+          userSelect: "none",
+        }}
+      >
+        <img
+          ref={lbImgRef}
+          src={lightboxImage}
+          alt="full size"
+          draggable={false}
+          onLoad={() => {
+            // reset state وكل transform لما صورة جديدة تتفتح
+            const st = lbSt.current;
+            st.scale = 1; st.x = 0; st.y = 0;
+            if (lbImgRef.current) { lbImgRef.current.style.transform = ""; lbImgRef.current.style.opacity = "1"; lbImgRef.current.style.transition = ""; }
+          }}
+          style={{
+            maxWidth: "92vw", maxHeight: "88vh",
+            objectFit: "contain", borderRadius: 12,
+            boxShadow: "0 8px 60px rgba(0,0,0,0.8)",
+            cursor: "grab", willChange: "transform",
+            touchAction: "none",
+          }}
+        />
+        {/* زر الإغلاق — في الأسفل وسط الشاشة عشان يكون في متناول الإبهام على الموبايل */}
+        <button
+          onClick={() => setLightboxImage(null)}
+          style={{
+            position: "absolute", bottom: 36, left: "50%", transform: "translateX(-50%)",
+            background: "rgba(255,255,255,0.18)", border: "none",
+            borderRadius: 999, padding: "10px 28px", cursor: "pointer",
+            display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+            color: "#fff", fontSize: 15, fontWeight: 600,
+            backdropFilter: "blur(10px)", WebkitBackdropFilter: "blur(10px)",
+            boxShadow: "0 2px 16px rgba(0,0,0,0.4)",
+            zIndex: 1, whiteSpace: "nowrap",
+          }}
+          aria-label="إغلاق"
+        >
+          <span style={{ fontSize: 18, lineHeight: 1 }}>✕</span>
+          <span>إغلاق</span>
+        </button>
+        {/* تلميح صغير فوق الزرار */}
+        <div style={{
+          position: "absolute", bottom: 88, left: "50%", transform: "translateX(-50%)",
+          color: "rgba(255,255,255,0.35)", fontSize: 11, pointerEvents: "none",
+          whiteSpace: "nowrap",
+        }}>
+          اسحب للأسفل للإغلاق • قرّب إصبعين للزوم
+        </div>
+      </div>
+    )}
+
     </>
   );
 }

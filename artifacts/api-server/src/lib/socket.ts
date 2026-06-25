@@ -695,7 +695,19 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
           const history = roomChatHistory.get(roomCode) ?? [];
           const large = isLargeRoom(roomCode);
           const historyCapped = large ? history.slice(-LARGE_ROOM_HISTORY_CAP) : history;
-          const historyStripped = historyCapped.map(({ voiceData: _v, imageData: _i, ...rest }) => rest);
+          // [FIX-IMAGE-HISTORY] نحتفظ بآخر 10 صور في تاريخ الشات للأعضاء الجدد.
+          // الكود القديم كان بيشيل imageData كلها من التاريخ — الصور بتختفي عند refresh أو join.
+          // الصور مضغوطة على الـ client (~200KB الواحدة) فـ 10 صور ≈ 2MB أقصى payload — مقبول.
+          // voiceData لسه مشالة (رسائل صوتية مؤقتة وحجمها أكبر بكثير).
+          const IMAGE_HISTORY_CAP = 10;
+          let _imgKept = 0;
+          const historyStripped = [...historyCapped].reverse().map(({ voiceData: _v, imageData, ...rest }) => {
+            if (imageData && _imgKept < IMAGE_HISTORY_CAP) {
+              _imgKept++;
+              return { ...rest, imageData };
+            }
+            return rest;
+          }).reverse();
           socket.emit("chatHistory", historyStripped);
 
           socket.emit("accessControlChanged", {

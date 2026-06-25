@@ -96,6 +96,10 @@ router.post("/rooms/:code/hyperbeam", async (req, res): Promise<void> => {
       body: JSON.stringify({
         start_url: "https://www.google.com",
         offline_timeout: 3600,
+        // FIX: تحديد أقصى مدة للجلسة صراحةً — بدون ده Hyperbeam بيطبق
+        // الـ default بتاعه (3600 ثانية = ساعة) حتى لو الكل متصل.
+        // 86400 = 24 ساعة — عدّل الرقم حسب الـ plan بتاعك في Hyperbeam Dashboard.
+        max_duration: 86400,
       }),
     });
 
