@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { useLocation } from "wouter";
 import { useCreateRoom, useJoinRoom } from "@workspace/api-client-react";
 import { saveSession, getSession } from "@/lib/storage";
@@ -25,7 +25,6 @@ const ANIM_STYLES = `
     0%, 88%, 100% { transform: scaleY(1);    }
     93%           { transform: scaleY(0.06); }
   }
-  /* Hide the browser's built-in password reveal button (Chrome/Edge/IE) */
   input[type="password"]::-ms-reveal,
   input[type="password"]::-ms-clear,
   input[type="password"]::-webkit-password-toggle-button,
@@ -38,44 +37,42 @@ const ANIM_STYLES = `
 `;
 
 // ── CineBuddy character ────────────────────────────────────────────────────────
-function CineBuddy({ pose, field, pwdLength = 0 }: { pose: Pose; field: FocusedField; pwdLength?: number }) {
-  const RT     = "transform 0.5s cubic-bezier(0.34,1.56,0.64,1)";
-  const OT     = "opacity 0.4s ease";
-  const S   = 28;   // short arm  (SVG units)
-  const L_R = 130;  // right arm for pointing (Room Name / Room Code — closer up)
-  const L_L = 215;  // left arm for pointing  (Your Name — further down)
+function CineBuddy({
+  pose,
+  field,
+  pwdLength = 0,
+  yPwd = 356,
+}: {
+  pose: Pose;
+  field: FocusedField;
+  pwdLength?: number;
+  /** SVG-unit Y of the password input centre, measured dynamically */
+  yPwd?: number;
+}) {
+  const RT = "transform 0.5s cubic-bezier(0.34,1.56,0.64,1)";
+  const OT = "opacity 0.4s ease";
+  const S   = 28;
+  const L_R = 130;
+  const L_L = 215;
 
   const isPointing  = pose === "pointing";
   const coveringPwd = pose === "coverPassword";
   const peekingPwd  = pose === "peekPassword";
 
-  // "code" (Room Code in join mode) uses right arm — same level as Room Name
   const longRight = (isPointing && (field === "roomName" || field === "code")) || coveringPwd;
   const longLeft  = (isPointing && (field === "hostName" || field === "name")) || coveringPwd;
   const closed    = pose === "coverEyes";
 
-  // ── Geometric arm covering ──────────────────────────────────────────────
-  // Arm pivot y = 64 (SVG units). Password input center ≈ Y_PWD SVG units from top.
-  // To keep the circle tip at password input level for any angle:
-  //   dY = Y_PWD - 64  (fixed vertical distance)
-  //   dX = pivot_x - tip_x  (positive → tip goes LEFT of pivot)
-  //   armLength = √(dX² + dY²)
-  //   angle (CSS rotate, CW+) = atan2(dX, dY) * 180/π
-  //
-  // LEFT arm (pivot x=22): tip fixed at left edge of input (x≈-135 SVG)
-  // RIGHT arm (pivot x=78): tip tracks cursor — each char moves it ~14 SVG units right
-  const Y_PWD  = 356;                         // SVG y of password input center
-  const dY_cov = Y_PWD - 64;                  // = 292 — vertical distance, constant
+  // ── Arm geometry ── pivot at y=64, tip at password-input centre ────────────
+  const Y_PWD  = yPwd;
+  const dY_cov = Y_PWD - 64;
 
-  // Left arm: tip at left edge of input (x ≈ -135 SVG units)
-  const dX_covL = 22 - (-135);                // = 157
-  const LCovL   = Math.round(Math.sqrt(dX_covL ** 2 + dY_cov ** 2));   // ≈ 333
-  const aCovL   = Math.atan2(dX_covL, dY_cov) * (180 / Math.PI);       // ≈ 28.2°
+  const dX_covL = 22 - (-135);
+  const LCovL   = Math.round(Math.sqrt(dX_covL ** 2 + dY_cov ** 2));
+  const aCovL   = Math.atan2(dX_covL, dY_cov) * (180 / Math.PI);
 
-  // Right arm: cursor starts at left edge (-135 SVG) and moves right ~14 SVG per char
-  // Circle center ON the last typed character; charWidth ≈ 10 SVG units (password dots).
-  const CHAR_W = 10;
-  const X_cur  = pwdLength === 0
+  const CHAR_W  = 10;
+  const X_cur   = pwdLength === 0
     ? -135
     : Math.min(-135 + (pwdLength - 1) * CHAR_W + CHAR_W / 2, 155);
   const dX_covR = 78 - X_cur;
@@ -83,22 +80,22 @@ function CineBuddy({ pose, field, pwdLength = 0 }: { pose: Pose; field: FocusedF
   const aCovR   = Math.atan2(dX_covR, dY_cov) * (180 / Math.PI);
 
   const aL =
-    coveringPwd          ? aCovL :   // left hand at left edge of password input (geometric)
-    peekingPwd           ? -70   :   // springs up-left
-    longLeft             ?  15   :   // long arm pointing down into form
-    isPointing           ? -10   :   // relaxed while other arm is active
+    coveringPwd          ? aCovL :
+    peekingPwd           ? -70   :
+    longLeft             ?  15   :
+    isPointing           ? -10   :
     pose === "coverEyes" ? 163   :
     pose === "peek"      ? 120   :
-    -30;                              // idle
+    -30;
 
   const aR =
-    coveringPwd          ? aCovR :   // right hand tracks cursor (geometric, angle+length both vary)
-    peekingPwd           ?  70   :   // springs up-right
-    longRight            ?  15   :   // long arm pointing down into form
-    isPointing           ? -10   :   // relaxed while other arm is active
+    coveringPwd          ? aCovR :
+    peekingPwd           ?  70   :
+    longRight            ?  15   :
+    isPointing           ? -10   :
     pose === "coverEyes" ? -163  :
     pose === "peek"      ? -120  :
-    30;                               // idle
+    30;
 
   return (
     <svg
@@ -112,21 +109,18 @@ function CineBuddy({ pose, field, pwdLength = 0 }: { pose: Pose; field: FocusedF
         filter: "drop-shadow(0 6px 20px rgba(99,102,241,0.5))",
       }}
     >
-      {/* ── Body ──────────────────────────────────────────────── */}
       <rect x="22" y="58" width="56" height="60" rx="14" fill="#4f46e5" />
       <rect x="32" y="67" width="36" height="16" rx="6" fill="#4338ca" />
       <circle cx="42" cy="75" r="3.5" fill="#818cf8" />
       <circle cx="50" cy="75" r="3.5" fill="#818cf8" />
       <circle cx="58" cy="75" r="3.5" fill="#818cf8" />
 
-      {/* ── Head ──────────────────────────────────────────────── */}
       <circle cx="50" cy="38" r="30" fill="#6366f1" />
       <circle cx="20" cy="37" r="8"   fill="#6366f1" />
       <circle cx="20" cy="37" r="4.5" fill="#818cf8" />
       <circle cx="80" cy="37" r="8"   fill="#6366f1" />
       <circle cx="80" cy="37" r="4.5" fill="#818cf8" />
 
-      {/* ── Eyes ──────────────────────────────────────────────── */}
       {closed ? (
         <>
           <path d="M 33 34 Q 38 41 43 34" stroke="white" strokeWidth="3" fill="none" strokeLinecap="round" />
@@ -137,42 +131,36 @@ function CineBuddy({ pose, field, pwdLength = 0 }: { pose: Pose; field: FocusedF
           <ellipse cx="38" cy="33" rx="8" ry="9" fill="white"
             style={{ animation: "eyeBlink 3.8s ease-in-out infinite", transformOrigin: "38px 33px" }} />
           <ellipse cx="38" cy="34" rx="5" ry="6" fill="#1e1b4b" />
-          <circle  cx="40" cy="31" r="2"          fill="white" />
+          <circle  cx="40" cy="31" r="2" fill="white" />
           <ellipse cx="62" cy="33" rx="8" ry="9" fill="white"
             style={{ animation: "eyeBlink 3.8s ease-in-out 0.25s infinite", transformOrigin: "62px 33px" }} />
           <ellipse cx="62" cy="34" rx="5" ry="6" fill="#1e1b4b" />
-          <circle  cx="64" cy="31" r="2"          fill="white" />
+          <circle  cx="64" cy="31" r="2" fill="white" />
         </>
       )}
 
-      {/* ── Mouth ─────────────────────────────────────────────── */}
       {closed
         ? <path d="M 40 48 Q 50 44 60 48" stroke="white" strokeWidth="2.5" fill="none" strokeLinecap="round" />
         : <path d="M 37 47 Q 50 56 63 47" stroke="white" strokeWidth="2.5" fill="none" strokeLinecap="round" />
       }
 
-      {/* ── Blush ─────────────────────────────────────────────── */}
       <ellipse cx="24" cy="42" rx="6" ry="3.5" fill="#f9a8d4" opacity="0.55" />
       <ellipse cx="76" cy="42" rx="6" ry="3.5" fill="#f9a8d4" opacity="0.55" />
 
-      {/* ── LEFT arm — 3 states: short / long-pointing / long-covering ── */}
+      {/* LEFT arm */}
       <g style={{ transform: `rotate(${aL}deg)`, transformOrigin: "22px 64px", transition: RT }}>
-        {/* 1. Short — idle or peekPassword */}
         <g style={{ opacity: !longLeft && !peekingPwd ? 1 : 0, transition: OT }}>
           <rect x="18" y="64" width="8" height={S} rx="4" fill="#6366f1" />
           <circle cx="22" cy={64 + S} r="7" fill="#818cf8" />
         </g>
-        {/* 2. Short raised — peekPassword (arms spring back short & outward) */}
         <g style={{ opacity: peekingPwd ? 1 : 0, transition: OT }}>
           <rect x="18" y="64" width="8" height={S} rx="4" fill="#6366f1" />
           <circle cx="22" cy={64 + S} r="7" fill="#818cf8" />
         </g>
-        {/* 3. Long pointing — hostName / name (longer to reach Your Name field) */}
         <g style={{ opacity: longLeft && !coveringPwd ? 1 : 0, transition: OT }}>
           <rect x="18" y="64" width="8" height={L_L} rx="4" fill="#6366f1" />
           <circle cx="22" cy={64 + L_L} r="7" fill="#818cf8" />
         </g>
-        {/* 4. Long covering — geometric length keeps tip at password input level */}
         <g style={{ opacity: coveringPwd ? 1 : 0, transition: OT }}>
           <rect x="18" y="64" width="8" rx="4" fill="#6366f1"
             style={{ height: LCovL, transition: "height 0.45s ease" }} />
@@ -181,24 +169,20 @@ function CineBuddy({ pose, field, pwdLength = 0 }: { pose: Pose; field: FocusedF
         </g>
       </g>
 
-      {/* ── RIGHT arm — 3 states: short / long-pointing / long-covering ── */}
+      {/* RIGHT arm */}
       <g style={{ transform: `rotate(${aR}deg)`, transformOrigin: "78px 64px", transition: RT }}>
-        {/* 1. Short — idle or peekPassword */}
         <g style={{ opacity: !longRight && !peekingPwd ? 1 : 0, transition: OT }}>
           <rect x="74" y="64" width="8" height={S} rx="4" fill="#6366f1" />
           <circle cx="78" cy={64 + S} r="7" fill="#818cf8" />
         </g>
-        {/* 2. Short raised — peekPassword */}
         <g style={{ opacity: peekingPwd ? 1 : 0, transition: OT }}>
           <rect x="74" y="64" width="8" height={S} rx="4" fill="#6366f1" />
           <circle cx="78" cy={64 + S} r="7" fill="#818cf8" />
         </g>
-        {/* 3. Long pointing — roomName */}
         <g style={{ opacity: longRight && !coveringPwd ? 1 : 0, transition: OT }}>
           <rect x="74" y="64" width="8" height={L_R} rx="4" fill="#6366f1" />
           <circle cx="78" cy={64 + L_R} r="7" fill="#818cf8" />
         </g>
-        {/* 4. Long covering — geometric: BOTH angle AND length vary so tip stays at password input level */}
         <g style={{ opacity: coveringPwd ? 1 : 0, transition: OT }}>
           <rect x="74" y="64" width="8" rx="4" fill="#6366f1"
             style={{ height: LCovR, transition: "height 0.45s ease" }} />
@@ -226,17 +210,76 @@ export default function Home() {
 
   const existingSession = pendingCode ? getSession(pendingCode) : null;
 
-  const [mode, setMode]               = useState<Mode>(pendingCode ? "join" : "landing");
-  const [createForm, setCreateForm]   = useState({ roomName: "", hostName: "", password: "" });
-  const [joinForm, setJoinForm]       = useState({ code: pendingCode, name: existingSession?.name ?? "", password: "" });
-  const [error, setError]             = useState("");
+  const [mode, setMode]             = useState<Mode>(pendingCode ? "join" : "landing");
+  const [createForm, setCreateForm] = useState({ roomName: "", hostName: "", password: "" });
+  const [joinForm, setJoinForm]     = useState({ code: pendingCode, name: existingSession?.name ?? "", password: "" });
+  const [error, setError]           = useState("");
   const [showPassword, setShowPassword]         = useState(false);
   const [showJoinPassword, setShowJoinPassword] = useState(false);
   const [focusedField, setFocusedField]         = useState<FocusedField>("none");
 
+  // ── Dynamic Y_PWD ──────────────────────────────────────────────────────────
+  //
+  // Key insight: the SVG has a `charBob` CSS animation that moves it up/down by
+  // 7px, making getBoundingClientRect() on the SVG element unreliable for
+  // measuring the arm geometry.
+  //
+  // Instead we measure from the FORM CARD (which has no animation).
+  // The form card always starts at exactly (SVG_height - marginBottom_overlap)
+  // pixels below the SVG's layout top = 106 - 50 = 56px.
+  // In SVG coordinate units: 56 × (120/106) ≈ 63.4
+  //
+  // Then:  Y_PWD = 63.4  +  (password_centre_from_card_top_px) × (120/106)
+  //
+  // Both the form card and the password input are stable (no CSS transforms),
+  // so this measurement is accurate on every screen size.
+
+  // SVG coordinate of the card top relative to SVG y=0
+  const Y_CARD_SVG = 56 * (120 / 106); // ≈ 63.4 — constant, based on layout geometry
+
+  const formCreateCardRef = useRef<HTMLDivElement>(null);
+  const formJoinCardRef   = useRef<HTMLDivElement>(null);
+  const pwdCreateRef      = useRef<HTMLInputElement>(null);
+  const pwdJoinRef        = useRef<HTMLInputElement>(null);
+  const [yPwd, setYPwd]   = useState(356);
+
+  const measureYPwd = useCallback(() => {
+    const card = mode === "create" ? formCreateCardRef.current : formJoinCardRef.current;
+    const pwd  = mode === "create" ? pwdCreateRef.current      : pwdJoinRef.current;
+    if (!card || !pwd) return;
+
+    const cardBox = card.getBoundingClientRect();
+    const pwdBox  = pwd.getBoundingClientRect();
+
+    // Pixels from card top to password input vertical centre
+    const distPx = (pwdBox.top + pwdBox.height / 2) - cardBox.top;
+
+    setYPwd(Math.round(Y_CARD_SVG + distPx * (120 / 106)));
+  }, [mode, Y_CARD_SVG]);
+
+  // Measure once after the form is shown (wait for charSlideIn to finish)
+  // and on every window/viewport resize (e.g. virtual keyboard opening)
+  useEffect(() => {
+    if (mode === "landing") return;
+
+    // charSlideIn lasts 550ms; wait 600ms to let it settle before measuring
+    const t = setTimeout(measureYPwd, 600);
+
+    const onResize = () => measureYPwd();
+    window.addEventListener("resize", onResize);
+    window.visualViewport?.addEventListener("resize", onResize);
+
+    return () => {
+      clearTimeout(t);
+      window.removeEventListener("resize", onResize);
+      window.visualViewport?.removeEventListener("resize", onResize);
+    };
+  }, [mode, measureYPwd]);
+
   // ── Derive character pose ───────────────────────────────────────────────────
   const currentShowPassword = mode === "create" ? showPassword : showJoinPassword;
   const currentPwdLength    = mode === "create" ? createForm.password.length : joinForm.password.length;
+
   const pose: Pose =
     focusedField === "password"
       ? currentShowPassword ? "peekPassword" : "coverPassword"
@@ -306,11 +349,9 @@ export default function Home() {
     });
   };
 
-  // ── Shared input className ──────────────────────────────────────────────────
   const inputCls =
     "w-full px-4 py-2.5 rounded-lg bg-input border border-border text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 text-sm";
 
-  // ── Eye-toggle button className (matches "Join a Room" card style) ──────────
   const eyeBtnCls =
     "absolute right-2 top-1/2 -translate-y-1/2 bg-card border border-border rounded-md p-1 text-muted-foreground hover:text-foreground hover:border-primary/40 transition-all";
 
@@ -325,17 +366,15 @@ export default function Home() {
         overflowY: mode === "landing" ? "hidden" : "auto",
       }}
     >
-      {/* Inject keyframes */}
       <style>{ANIM_STYLES}</style>
 
-      {/* Decorative blobs */}
       <div className="absolute inset-0 overflow-hidden pointer-events-none">
         <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-primary/5 rounded-full blur-3xl" />
         <div className="absolute bottom-1/4 right-1/4 w-64 h-64 bg-accent/5 rounded-full blur-3xl" />
       </div>
 
       <div className="relative z-10 w-full max-w-md" style={{ paddingTop: mode !== "landing" ? "16px" : 0, paddingBottom: mode !== "landing" ? "24px" : 0 }}>
-        {/* ── Logo header: full on landing, compact on create/join ── */}
+
         {mode === "landing" ? (
           <div className="text-center mb-8">
             <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-primary/10 border border-primary/20 mb-4">
@@ -358,35 +397,19 @@ export default function Home() {
         ══════════════════════════════════════════════════════════ */}
         {mode === "landing" && (
           <div className="space-y-3">
-            {/* ── Create Room button with spinning LED border ── */}
-            <div
-              style={{
-                position: "relative",
-                padding: "2px",
-                borderRadius: "0.75rem",
-                overflow: "hidden",
-              }}
-            >
-              {/* Spinning gradient that creates the LED effect */}
-              <div
-                style={{
-                  position: "absolute",
-                  inset: "-100%",
-                  background:
-                    "conic-gradient(from 0deg, #6366f1, #a78bfa, #ec4899, #f97316, #22d3ee, #10b981, #6366f1)",
-                  animation: "ledSpin 2s linear infinite",
-                }}
-              />
+            <div style={{ position: "relative", padding: "2px", borderRadius: "0.75rem", overflow: "hidden" }}>
+              <div style={{
+                position: "absolute", inset: "-100%",
+                background: "conic-gradient(from 0deg, #6366f1, #a78bfa, #ec4899, #f97316, #22d3ee, #10b981, #6366f1)",
+                animation: "ledSpin 2s linear infinite",
+              }} />
               <button
                 data-testid="button-create-room"
                 onClick={() => { setMode("create"); setError(""); setFocusedField("none"); setShowPassword(false); }}
                 style={{ position: "relative", borderRadius: "calc(0.75rem - 2px)" }}
                 className="w-full flex items-center justify-between px-5 py-4 bg-primary text-primary-foreground font-semibold hover:bg-primary/90 transition-all group"
               >
-                <span className="flex items-center gap-3">
-                  <Film className="w-5 h-5" />
-                  Create a Room
-                </span>
+                <span className="flex items-center gap-3"><Film className="w-5 h-5" /> Create a Room</span>
                 <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
               </button>
             </div>
@@ -403,10 +426,7 @@ export default function Home() {
                 style={{ position: "relative", borderRadius: "calc(0.75rem - 2px)" }}
                 className="w-full flex items-center justify-between px-5 py-4 bg-primary text-primary-foreground font-semibold hover:bg-primary/90 transition-all group"
               >
-                <span className="flex items-center gap-3">
-                  <Users className="w-5 h-5" />
-                  Join a Room
-                </span>
+                <span className="flex items-center gap-3"><Users className="w-5 h-5" /> Join a Room</span>
                 <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
               </button>
             </div>
@@ -414,11 +434,10 @@ export default function Home() {
         )}
 
         {/* ══════════════════════════════════════════════════════════
-            CREATE MODE  —  character + form
+            CREATE MODE
         ══════════════════════════════════════════════════════════ */}
         {mode === "create" && (
           <>
-            {/* Back button + heading ABOVE the character */}
             <div className="flex items-center justify-between mb-3">
               <button
                 onClick={() => { setMode("landing"); setError(""); setFocusedField("none"); }}
@@ -429,7 +448,6 @@ export default function Home() {
               <h2 className="text-lg font-bold">Create a Room</h2>
             </div>
 
-            {/* Character — overlaps form card below by 50px so the long arm reaches inputs */}
             <div
               className="flex justify-center"
               style={{
@@ -440,17 +458,14 @@ export default function Home() {
                 zIndex: 10,
               }}
             >
-              <CineBuddy pose={pose} field={focusedField} pwdLength={currentPwdLength} />
+              <CineBuddy pose={pose} field={focusedField} pwdLength={currentPwdLength} yPwd={yPwd} />
             </div>
 
-            {/* Form card — extra top padding so character arm lands on first input */}
-            <div className="bg-card border border-border rounded-2xl px-5 pb-5" style={{ paddingTop: "64px" }}>
+            {/* ref on the card — used as stable anchor for Y_PWD measurement */}
+            <div ref={formCreateCardRef} className="bg-card border border-border rounded-2xl px-5 pb-5" style={{ paddingTop: "64px" }}>
               <form onSubmit={handleCreate} className="space-y-3">
-                {/* Room Name */}
                 <div>
-                  <label className="block text-sm font-medium text-muted-foreground mb-1.5">
-                    Room Name
-                  </label>
+                  <label className="block text-sm font-medium text-muted-foreground mb-1.5">Room Name</label>
                   <input
                     data-testid="input-room-name"
                     type="text"
@@ -464,11 +479,8 @@ export default function Home() {
                   />
                 </div>
 
-                {/* Host Name */}
                 <div>
-                  <label className="block text-sm font-medium text-muted-foreground mb-1.5">
-                    Your Name
-                  </label>
+                  <label className="block text-sm font-medium text-muted-foreground mb-1.5">Your Name</label>
                   <input
                     data-testid="input-host-name"
                     type="text"
@@ -482,21 +494,19 @@ export default function Home() {
                   />
                 </div>
 
-                {/* Password */}
                 <div>
                   <label className="block text-sm font-medium text-muted-foreground mb-1.5">
-                    <span className="flex items-center gap-1.5">
-                      <Lock className="w-3 h-3" /> Password (optional)
-                    </span>
+                    <span className="flex items-center gap-1.5"><Lock className="w-3 h-3" /> Password (optional)</span>
                   </label>
                   <div className="relative">
                     <input
+                      ref={pwdCreateRef}
                       data-testid="input-create-password"
                       type={showPassword ? "text" : "password"}
                       autoComplete="new-password"
                       value={createForm.password}
                       onChange={(e) => setCreateForm((f) => ({ ...f, password: e.target.value }))}
-                      onFocus={() => setFocusedField("password")}
+                      onFocus={() => { measureYPwd(); setFocusedField("password"); }}
                       onBlur={() => setFocusedField("none")}
                       placeholder="Leave empty for public room"
                       className={inputCls + " pr-11"}
@@ -531,11 +541,10 @@ export default function Home() {
         )}
 
         {/* ══════════════════════════════════════════════════════════
-            JOIN MODE  —  character + form
+            JOIN MODE
         ══════════════════════════════════════════════════════════ */}
         {mode === "join" && (
           <>
-            {/* Back button + heading ABOVE the character */}
             <div className="flex items-center justify-between mb-3">
               <button
                 onClick={() => { setMode("landing"); setError(""); setFocusedField("none"); }}
@@ -546,7 +555,6 @@ export default function Home() {
               <h2 className="text-lg font-bold">Join a Room</h2>
             </div>
 
-            {/* Character — overlaps form card below by 50px */}
             <div
               className="flex justify-center"
               style={{
@@ -557,17 +565,14 @@ export default function Home() {
                 zIndex: 10,
               }}
             >
-              <CineBuddy pose={pose} field={focusedField} pwdLength={currentPwdLength} />
+              <CineBuddy pose={pose} field={focusedField} pwdLength={currentPwdLength} yPwd={yPwd} />
             </div>
 
-            {/* Form card */}
-            <div className="bg-card border border-border rounded-2xl px-5 pb-5" style={{ paddingTop: "64px" }}>
+            {/* ref on the card — used as stable anchor for Y_PWD measurement */}
+            <div ref={formJoinCardRef} className="bg-card border border-border rounded-2xl px-5 pb-5" style={{ paddingTop: "64px" }}>
               <form onSubmit={handleJoin} className="space-y-3">
-                {/* Room Code */}
                 <div>
-                  <label className="block text-sm font-medium text-muted-foreground mb-1.5">
-                    Room Code
-                  </label>
+                  <label className="block text-sm font-medium text-muted-foreground mb-1.5">Room Code</label>
                   <input
                     data-testid="input-room-code"
                     type="text"
@@ -585,7 +590,6 @@ export default function Home() {
                   />
                 </div>
 
-                {/* Your Name */}
                 {(() => {
                   const lockedSession = getSession(joinForm.code.trim().toUpperCase());
                   return (
@@ -619,21 +623,19 @@ export default function Home() {
                   );
                 })()}
 
-                {/* Password */}
                 <div>
                   <label className="block text-sm font-medium text-muted-foreground mb-1.5">
-                    <span className="flex items-center gap-1.5">
-                      <Lock className="w-3 h-3" /> Password (if required)
-                    </span>
+                    <span className="flex items-center gap-1.5"><Lock className="w-3 h-3" /> Password (if required)</span>
                   </label>
                   <div className="relative">
                     <input
+                      ref={pwdJoinRef}
                       data-testid="input-join-password"
                       type={showJoinPassword ? "text" : "password"}
                       autoComplete="current-password"
                       value={joinForm.password}
                       onChange={(e) => setJoinForm((f) => ({ ...f, password: e.target.value }))}
-                      onFocus={() => setFocusedField("password")}
+                      onFocus={() => { measureYPwd(); setFocusedField("password"); }}
                       onBlur={() => setFocusedField("none")}
                       placeholder="Enter room password"
                       className={inputCls + " pr-11"}
