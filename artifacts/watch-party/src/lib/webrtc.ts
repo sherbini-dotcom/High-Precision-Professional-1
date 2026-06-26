@@ -315,12 +315,23 @@ export class WebRTCManager {
     this.screenStream = null;
     for (const [, entry] of this.peers) {
       if (entry.screenSender) {
-        try { entry.pc.removeTrack(entry.screenSender); } catch { /* ignore */ }
-        entry.screenSender = null;
+        // [FIX-MLINE-ORDER] Use replaceTrack(null) instead of removeTrack().
+        // removeTrack() keeps the m-line slot "recycled/inactive" in the SDP, then
+        // the next addTrack() call appends a BRAND-NEW m-line at the end — changing
+        // the m-line order that Chrome/Firefox strictly validate on every subsequent
+        // offer. This causes "order of m-lines in subsequent offer doesn't match"
+        // InvalidAccessError on desktop browsers (Chrome/Firefox) while mobile is
+        // more lenient about it.
+        // replaceTrack(null) nulls the track in-place without touching the m-line
+        // index, so startScreenShare() can later call replaceTrack(liveTrack) on
+        // the same sender and the m-line order stays stable across all renegotiations.
+        entry.screenSender.replaceTrack(null).catch(() => {});
+        // Do NOT null out screenSender — keep the reference so startScreenShare()
+        // can replaceTrack() without creating a new m-line.
       }
       if (entry.screenAudioSender) {
-        try { entry.pc.removeTrack(entry.screenAudioSender); } catch { /* ignore */ }
-        entry.screenAudioSender = null;
+        entry.screenAudioSender.replaceTrack(null).catch(() => {});
+        // Same — keep the reference to preserve the m-line index.
       }
     }
   }

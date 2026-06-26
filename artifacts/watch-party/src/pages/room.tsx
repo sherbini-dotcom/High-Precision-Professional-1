@@ -1008,6 +1008,28 @@ export default function Room() {
       if ("Notification" in window && Notification.permission === "default") {
         Notification.requestPermission().catch(() => {});
       }
+
+      // [FIX-DESKTOP-AEC-GLITCH] Chrome Desktop (Windows/Mac) يغير الـ audio output
+      // pipeline إلى "communications mode" لما getUserMedia مع echoCancellation:true
+      // يتشتغل لأول مرة — ده بيسبب قطع ~300ms في كل الأصوات عند الكل.
+      // الحل: نعمل "pre-warm" صامت على أول interaction (قبل ما المستخدم يضغط المايك)
+      // عشان التحويل يحصل قبل ما في صوت شغال، ومحدش يحس بالقطعة.
+      // بنتحقق إن الصلاحية موجودة مسبقاً عشان ما يطلعش prompt مفاجئ.
+      const isDesktop = !(/Mobi|Android|iPhone|iPad/i.test(navigator.userAgent));
+      if (isDesktop && navigator.permissions) {
+        navigator.permissions
+          .query({ name: "microphone" as PermissionName })
+          .then(perm => {
+            if (perm.state === "granted") {
+              navigator.mediaDevices
+                .getUserMedia({ audio: { echoCancellation: true } })
+                .then(s => s.getTracks().forEach(t => t.stop()))
+                .catch(() => {});
+            }
+          })
+          .catch(() => {});
+      }
+
       document.removeEventListener("touchstart", onFirstInteraction);
       document.removeEventListener("click", onFirstInteraction);
     };
@@ -1766,6 +1788,7 @@ export default function Room() {
       const ctx = audioPlayerRef.current;
       if (!ctx) return;
       if (fromMemberId === myMemberId) return;
+      if (webrtcManagerRef.current?.hasConnectedPeer(fromMemberId)) return;
       if (ctx.state === "suspended") ctx.resume().catch(() => {});
       try {
         const int16 = new Int16Array(buf);
@@ -3198,12 +3221,12 @@ export default function Room() {
       socketRef.current?.emit("micEnabled");
 
       const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      // [FIX-SAMPLERATE] بعض Android WebViews بترفض sampleRate: 48000 وتعمل
-      // exception — يخلي toggleMic يفشل بصمت. نجرب 48000 الأول، لو فشل
-      // نخلي البراوزر يختار الـ native rate بتاعه (عادةً 44100 أو 48000).
-      const ctx = (() => {
-        try { return new AudioCtx({ sampleRate: 48000 }); } catch { return new AudioCtx(); }
-      })();
+      // [FIX-DESKTOP-AUDIO-CUT] لا نحدد sampleRate هنا — نخلي البراوزر يستخدم الـ
+      // native rate بتاع النظام (44100 أو 48000 حسب الهاردوير).
+      // تحديد 48000 على Windows اللي native rate بتاعه 44100 كان بيخلي Chrome يعيد
+      // تهيئة الـ audio pipeline وبيقطع الصوت على الكل لفترة قصيرة.
+      // الـ sr المرسل مع كل audioChunk بيضمن الاستقبال الصحيح بغض النظر عن الـ rate.
+      const ctx = new AudioCtx();
       if (ctx.state === "suspended") { try { await ctx.resume(); } catch { /* ignore */ } }
       audioContextRef.current = ctx;
       const source = ctx.createMediaStreamSource(stream);
@@ -3313,12 +3336,16 @@ export default function Room() {
       try { localStorage.setItem(`wp_mic_${code}`, "1"); } catch { /* ignore */ }
 
       // [FIX-STREAM-RETRY] لو replaceTrack اشتغل بس الـ ICE مكنش جاهز بعد،
-      // إعادة setStream بعد 1.5 ثانية تضمن وصول الصوت بدون refresh
+      // إعادة setStream بعد 3 ثواني — بس بشرط ما تحصلش لو الـ stream اتغيّر
+      // (يعني المستخدم أغلق المايك ورجع فتحه بـ stream جديد بينهم).
+      // الـ retry القديم على 1.5 ثانية كان بيسبب replaceTrack ثاني بيقطع الصوت
+      // عند الكل — نحّيناه للـ 3 ثواني ومع حماية بـ Object.is لضمان نفس الـ stream.
+      const retryStream = stream;
       setTimeout(() => {
-        if (micEnabledRef.current && micStreamRef.current) {
-          void webrtcManagerRef.current?.setStream(micStreamRef.current);
+        if (micEnabledRef.current && Object.is(micStreamRef.current, retryStream)) {
+          void webrtcManagerRef.current?.setStream(retryStream);
         }
-      }, 1500);
+      }, 3000);
 
       // [FIX-SPEAKING-LOAD] نبعت speaking event بس لما فيه تغيير حقيقي:
       //   • دخل صوت (vol > 8) أو خرج من صمت
