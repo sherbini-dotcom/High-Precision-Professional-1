@@ -322,7 +322,7 @@ export default function Room() {
   // refs للـ lightbox — بنعدّل DOM مباشرة عشان 60fps على موبايل بدون re-render
   const lbImgRef  = useRef<HTMLImageElement>(null);
   const lbOverRef = useRef<HTMLDivElement>(null);
-  const lbSt      = useRef({ scale: 1, x: 0, y: 0, lastDist: 0, startY: 0, startTY: 0, dragging: false });
+  const lbSt      = useRef({ scale: 1, x: 0, y: 0, lastDist: 0, startX: 0, startY: 0, startTX: 0, startTY: 0, dragging: false });
   // مؤشر جودة الشبكة: good=أخضر / fair=أصفر / poor=أحمر / none=مافيش peers
   const [networkQuality, setNetworkQuality] = useState<NetworkQuality>("none");
   const [videoHlsPath, setVideoHlsPath] = useState<string | null>(null);
@@ -431,6 +431,9 @@ export default function Room() {
   const [swipeOffset, setSwipeOffset] = useState(0);
   const touchStartXRef = useRef(0);
   const touchStartYRef = useRef(0);
+  // [FIX-SCROLL-LOCK] نقفل الـ native scroll على الـ chat container فقط لما long-press يشتغل
+  // بنستخدم React state عشان القيمة تفضل "none" خلال الـ re-renders (مش بتترجع "pan-y" زي الـ DOM imperative)
+  const [chatScrollLocked, setChatScrollLocked] = useState(false);
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressTriggeredRef = useRef(false);
   // [FIX-INSTA-REACTION] refs لتتبّع موضع الإصبع أثناء gesture الـ long-press + swipe-up
@@ -440,6 +443,9 @@ export default function Room() {
   // [FIX-PICKER-FIXED] موضع الـ picker على الشاشة (position:fixed) — بيمنع القطع بالـ overflow ويحسّب الإيموجي صح
   const [pickerFixedPos, setPickerFixedPos] = useState<{ x: number; y: number } | null>(null);
   const pickerFixedPosRef = useRef<{ x: number; y: number } | null>(null);
+  // [FIX-PHANTOM-CLICK] بعد ما long-press يغلق الـ picker، المتصفح بيبعت synthetic click بعد 300ms
+  // هنتجاهل أي click على زرار الـ reaction خلال 500ms من إغلاق الـ picker
+  const suppressPickerUntilRef = useRef(0);
   const prevMsgCountRef = useRef(0);
   // Toast swipe-to-dismiss
   const [toastSwipe, setToastSwipe] = useState({ x: 0, y: 0 });
@@ -3584,14 +3590,15 @@ export default function Room() {
   };
 
   const sendImageMessage = (file: File) => {
-    const MAX_DIM = 600;
-    const MAX_BYTES = 750000; // ~600KB base64 budget
+    const MAX_DIM = 1920; // أقصى بُعد — يحافظ على الجودة الأصلية لأي صورة موبايل
+    const MAX_BYTES = 3500000; // ~3.5MB base64 budget
     const img = new Image();
     const url = URL.createObjectURL(file);
     img.onload = () => {
       URL.revokeObjectURL(url);
       const canvas = document.createElement("canvas");
       let { width, height } = img;
+      // نصغّر بس لو أكبر من الحد الأقصى، وإلا نسيب الأبعاد الأصلية
       if (width > MAX_DIM || height > MAX_DIM) {
         const ratio = Math.min(MAX_DIM / width, MAX_DIM / height);
         width = Math.round(width * ratio);
@@ -3600,11 +3607,11 @@ export default function Room() {
       canvas.width = width;
       canvas.height = height;
       canvas.getContext("2d")!.drawImage(img, 0, 0, width, height);
-      // Try progressively lower quality until under budget
-      let quality = 0.85;
+      // نبدأ بأعلى جودة ممكنة وننزل بخطوات صغيرة بس لو الحجم كبر جداً
+      let quality = 0.97;
       let dataUrl = canvas.toDataURL("image/jpeg", quality);
-      while (dataUrl.length > MAX_BYTES && quality > 0.3) {
-        quality -= 0.1;
+      while (dataUrl.length > MAX_BYTES && quality > 0.5) {
+        quality -= 0.05;
         dataUrl = canvas.toDataURL("image/jpeg", quality);
       }
       if (dataUrl.length > MAX_BYTES) return; // still too large — abort
@@ -4221,30 +4228,30 @@ export default function Room() {
           </div>
           {/* Right: mode switcher — hidden on mobile, shown inline from sm: up */}
           {isPrivileged ? (
-            <div className="hidden sm:flex items-center gap-1 bg-muted/70 rounded-lg p-1 shadow-inner flex-shrink-0">
+            <div className="hidden sm:flex items-center gap-1.5 bg-muted/70 rounded-xl p-1.5 shadow-inner flex-shrink-0">
               <button
                 onClick={() => changeMode("video")}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-semibold transition-all duration-200 ${mode === "video" ? "bg-violet-500 text-white shadow-sm shadow-violet-500/30" : "text-muted-foreground hover:text-foreground"}`}
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all duration-200 ${mode === "video" ? "bg-violet-500 text-white shadow shadow-violet-500/30" : "text-muted-foreground hover:text-foreground hover:bg-muted"}`}
               >
-                <Film className="w-3.5 h-3.5" />Video
+                <Film className="w-4.5 h-4.5" />Video
               </button>
               <button
                 onClick={() => changeMode("browser")}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-semibold transition-all duration-200 ${mode === "browser" ? "bg-sky-500 text-white shadow-sm shadow-sky-500/30" : "text-muted-foreground hover:text-foreground"}`}
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all duration-200 ${mode === "browser" ? "bg-sky-500 text-white shadow shadow-sky-500/30" : "text-muted-foreground hover:text-foreground hover:bg-muted"}`}
               >
-                <Globe className="w-3.5 h-3.5" />Browser
+                <Globe className="w-4.5 h-4.5" />Browser
               </button>
               <button
                 onClick={() => changeMode("screenshare")}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-semibold transition-all duration-200 ${mode === "screenshare" ? "bg-emerald-500 text-white shadow-sm shadow-emerald-500/30" : "text-muted-foreground hover:text-foreground"}`}
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all duration-200 ${mode === "screenshare" ? "bg-emerald-500 text-white shadow shadow-emerald-500/30" : "text-muted-foreground hover:text-foreground hover:bg-muted"}`}
               >
-                <Monitor className="w-3.5 h-3.5" />Share
+                <Monitor className="w-4.5 h-4.5" />Share
               </button>
               <button
                 onClick={() => changeMode("movies")}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-semibold transition-all duration-200 ${mode === "movies" ? "bg-orange-500 text-white shadow-sm shadow-orange-500/30" : "text-muted-foreground hover:text-foreground"}`}
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-all duration-200 ${mode === "movies" ? "bg-orange-500 text-white shadow shadow-orange-500/30" : "text-muted-foreground hover:text-foreground hover:bg-muted"}`}
               >
-                <svg xmlns="http://www.w3.org/2000/svg" className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="17" y1="7" x2="22" y2="7"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="2" y1="17" x2="7" y2="17"/></svg>
+                <svg xmlns="http://www.w3.org/2000/svg" className="w-4.5 h-4.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="17" y1="7" x2="22" y2="7"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="2" y1="17" x2="7" y2="17"/></svg>
                 Movies
               </button>
             </div>
@@ -5137,7 +5144,7 @@ export default function Room() {
             {/* Chat tab */}
             {activeTab === "chat" && (
               <div className="flex-1 flex flex-col overflow-hidden">
-                <div ref={chatScrollRef} className="flex-1 overflow-y-auto px-3 py-2 space-y-2" style={{ touchAction: "pan-y", overscrollBehavior: "none" }}>
+                <div ref={chatScrollRef} className="flex-1 overflow-y-auto px-3 py-2 space-y-2" style={{ touchAction: chatScrollLocked ? "none" : "pan-y", overscrollBehavior: "none" }}>
                   {chatMessages.length === 0 && (
                     <div className="flex flex-col items-center justify-center py-8 text-center">
                       <MessageSquare className="w-8 h-8 text-muted-foreground/30 mb-2" />
@@ -5183,6 +5190,9 @@ export default function Room() {
                             setSwipingMsgIdx(null);
                             setSwipeOffset(0);
                             setLpHoveredIdx(-1);
+                            // [FIX-SCROLL-LOCK] نقفل الـ native scroll لما long-press يشتغل
+                            // عشان الإصبع لما يتحرك لفوق يختار الإيموجي ومش يـ scroll الـ chat
+                            setChatScrollLocked(true);
                             // [FIX-PICKER-FIXED] نحسب موضع الـ picker على الشاشة بشكل ثابت
                             // الـ picker عرضه 280px (6 إيموجي × ~46px + padding)
                             // نمركزه على X اللمسة مع clamp للحواف
@@ -5213,8 +5223,8 @@ export default function Room() {
 
                           // [FIX-INSTA-REACTION] بعد ما الـ long press اشتغل:
                           // نتابع حركة الإصبع لتحديد الإيموجي المحدد (زي Instagram)
+                          // الـ touchAction:"none" على الـ bubble بيمنع المتصفح تلقائياً من الـ scroll
                           if (longPressTriggeredRef.current) {
-                            e.preventDefault();
                             // [FIX-PICKER-FIXED] نستخدم الموضع الفعلي للـ picker (position:fixed)
                             // عشان نحسب بدقة إيه الإيموجي اللي تحت الإصبع
                             const pos = pickerFixedPosRef.current;
@@ -5239,18 +5249,21 @@ export default function Room() {
                           }
 
                           if (swipingMsgIdx !== i) return;
-                          // FIX PANEL-SWIPE: لو الحركة أفقية بشكل واضح، وقف الـ bubble
+
+                          // Horizontal swipe → reply gesture (vertical بيتحرك native من الـ container)
                           if (movedX > movedY && movedX > 5) {
                             e.stopPropagation();
-                          }
-                          const dx = isMe
-                            ? touchStartXRef.current - cx
-                            : cx - touchStartXRef.current;
-                          if (dx > 0) {
-                            setSwipeOffset(Math.min(dx, 65));
+                            const dx = isMe
+                              ? touchStartXRef.current - cx
+                              : cx - touchStartXRef.current;
+                            if (dx > 0) {
+                              setSwipeOffset(Math.min(dx, 65));
+                            }
                           }
                         }}
                         onTouchEnd={e => {
+                          // [FIX-SCROLL-LOCK] نفتح الـ scroll دايماً لما الإصبع يترفع
+                          setChatScrollLocked(false);
                           if (longPressTimerRef.current) {
                             clearTimeout(longPressTimerRef.current);
                             longPressTimerRef.current = null;
@@ -5266,6 +5279,9 @@ export default function Room() {
                             setPickerFixedPos(null);
                             pickerFixedPosRef.current = null;
                             setReactionPickerFor(null);
+                            // [FIX-PHANTOM-CLICK] نمنع الـ synthetic click اللي المتصفح بيبعته بعد 300ms
+                            // من اتباع الـ touchend — ممكن يفتح الـ picker تاني لو وقع على زرار الـ reaction
+                            suppressPickerUntilRef.current = Date.now() + 500;
                             return;
                           }
                           if (swipeOffset > 45) setReplyingTo(msg);
@@ -5282,7 +5298,10 @@ export default function Room() {
                         <div className="relative flex items-end gap-1.5">
                           {/* أزرار رسائل الآخرين — قبل الـ bubble */}
                           {!isMe && (
-                            <>
+                            <div className="flex items-center gap-0.5"
+                              onTouchStart={(e) => e.stopPropagation()}
+                              onTouchEnd={(e) => e.stopPropagation()}
+                            >
                               <button
                                 onClick={() => { savedScrollRef.current = chatScrollRef.current?.scrollTop ?? 0; setReplyingTo(msg); }}
                                 className={`p-1 rounded-full transition-all ${triggered ? "text-primary scale-125" : "text-muted-foreground/50 hover:text-foreground"}`}
@@ -5293,6 +5312,8 @@ export default function Room() {
                               {msg.id && (
                                 <button
                                   onClick={(e) => {
+                                    // [FIX-PHANTOM-CLICK] تجاهل الـ synthetic click بعد إغلاق الـ long-press picker
+                                    if (Date.now() < suppressPickerUntilRef.current) return;
                                     if (reactionPickerFor === msg.id) {
                                       setReactionPickerFor(null);
                                       setPickerFixedPos(null);
@@ -5315,7 +5336,7 @@ export default function Room() {
                                   <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" x2="9.01" y1="9" y2="9"/><line x1="15" x2="15.01" y1="9" y2="9"/></svg>
                                 </button>
                               )}
-                            </>
+                            </div>
                           )}
 
                           {/* الـ bubble */}
@@ -5329,10 +5350,15 @@ export default function Room() {
 
                           {/* أزرار رسائلي — بعد الـ bubble */}
                           {isMe && (
-                            <>
+                            <div className="flex items-center gap-0.5"
+                              onTouchStart={(e) => e.stopPropagation()}
+                              onTouchEnd={(e) => e.stopPropagation()}
+                            >
                               {msg.id && (
                                 <button
                                   onClick={(e) => {
+                                    // [FIX-PHANTOM-CLICK] تجاهل الـ synthetic click بعد إغلاق الـ long-press picker
+                                    if (Date.now() < suppressPickerUntilRef.current) return;
                                     if (reactionPickerFor === msg.id) {
                                       setReactionPickerFor(null);
                                       setPickerFixedPos(null);
@@ -5371,7 +5397,7 @@ export default function Room() {
                                   <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
                                 </button>
                               )}
-                            </>
+                            </div>
                           )}
 
                           {/* [FIX-PICKER-FIXED] الـ picker انتقل لـ fixed overlay خارج الـ scroll container — راجع أسفل الـ return */}
@@ -5537,6 +5563,22 @@ export default function Room() {
           padding: "6px 4px",
           gap: 2,
           pointerEvents: "auto",
+          touchAction: "none",
+        }}
+        onTouchEnd={e => {
+          // [FIX-PICKER-STUCK] لو الإصبع اترفع فوق الـ picker container نفسه
+          // (مش فوق إيموجي محدد) — نغلق الـ picker وننفذ الـ hover reaction لو موجودة
+          e.preventDefault();
+          if (lpHoveredIdx >= 0 && reactionPickerFor) {
+            toggleReaction(reactionPickerFor, REACTION_EMOJIS[lpHoveredIdx]);
+          }
+          setLpHoveredIdx(-1);
+          setPickerFixedPos(null);
+          pickerFixedPosRef.current = null;
+          setReactionPickerFor(null);
+          longPressTriggeredRef.current = false;
+          setChatScrollLocked(false);
+          suppressPickerUntilRef.current = Date.now() + 500;
         }}
       >
         {REACTION_EMOJIS.map((em, idx) => {
@@ -5549,6 +5591,11 @@ export default function Room() {
                 setPickerFixedPos(null);
                 pickerFixedPosRef.current = null;
                 setReactionPickerFor(null);
+              }}
+              onTouchEnd={(e) => {
+                // [FIX-EMOJI-CLICK] نمنع الـ bubble للـ picker container عشان الـ onTouchEnd الخاص بيه
+                // مش يعمل e.preventDefault() ويمنع الـ click على الإيموجي
+                e.stopPropagation();
               }}
               style={{
                 width: 46, height: 46,
@@ -5591,7 +5638,9 @@ export default function Room() {
             const dy = e.touches[0].clientY - e.touches[1].clientY;
             st.lastDist = Math.hypot(dx, dy);
           } else if (e.touches.length === 1) {
+            st.startX  = e.touches[0].clientX;
             st.startY  = e.touches[0].clientY;
+            st.startTX = st.x;
             st.startTY = st.y;
             st.dragging = true;
           }
@@ -5604,20 +5653,38 @@ export default function Room() {
           if (!img) return;
 
           if (e.touches.length === 2) {
-            // ── Pinch-to-zoom ──────────────────────────────────────────────
+            // ── Pinch-to-zoom — مع تثبيت نقطة الـ pinch على الشاشة ────────
             const dx = e.touches[0].clientX - e.touches[1].clientX;
             const dy = e.touches[0].clientY - e.touches[1].clientY;
             const dist = Math.hypot(dx, dy);
             const delta = dist / (st.lastDist || dist);
-            st.scale = Math.min(5, Math.max(1, st.scale * delta));
+            const oldScale = st.scale;
+            const newScale = Math.min(5, Math.max(1, oldScale * delta));
             st.lastDist = dist;
-            if (st.scale <= 1) { st.scale = 1; st.x = 0; st.y = 0; }
+            if (newScale <= 1) {
+              st.scale = 1; st.x = 0; st.y = 0;
+            } else {
+              // نحسب منتصف الإصبعين على الشاشة
+              const mx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+              const my = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+              // مركز الصورة الطبيعي في الـ overlay (الـ flexbox بيمركزها)
+              const pivotX = window.innerWidth  / 2;
+              const pivotY = window.innerHeight / 2;
+              // نعدّل الـ translate بحيث نقطة الـ pinch تفضل ثابتة
+              // tx2 = (mx - pivot) * (1 - ratio) + tx1 * ratio
+              const ratio = newScale / oldScale;
+              st.x = (mx - pivotX) * (1 - ratio) + st.x * ratio;
+              st.y = (my - pivotY) * (1 - ratio) + st.y * ratio;
+              st.scale = newScale;
+            }
             img.style.transform = `translate(${st.x}px,${st.y}px) scale(${st.scale})`;
           } else if (e.touches.length === 1 && st.dragging) {
             if (st.scale > 1.05) {
-              // ── Pan when zoomed in ─────────────────────────────────────
-              const moved = e.touches[0].clientY - st.startY;
-              st.y = st.startTY + moved;
+              // ── Pan when zoomed in — X and Y ──────────────────────────
+              const movedX = e.touches[0].clientX - st.startX;
+              const movedY = e.touches[0].clientY - st.startY;
+              st.x = st.startTX + movedX;
+              st.y = st.startTY + movedY;
               img.style.transform = `translate(${st.x}px,${st.y}px) scale(${st.scale})`;
             } else {
               // ── Swipe-down-to-close (scale ≈ 1) ───────────────────────
@@ -5670,38 +5737,57 @@ export default function Room() {
             if (lbImgRef.current) { lbImgRef.current.style.transform = ""; lbImgRef.current.style.opacity = "1"; lbImgRef.current.style.transition = ""; }
           }}
           style={{
-            maxWidth: "92vw", maxHeight: "88vh",
-            objectFit: "contain", borderRadius: 12,
+            maxWidth: "100vw", maxHeight: "82vh",
+            objectFit: "contain", borderRadius: 8,
             boxShadow: "0 8px 60px rgba(0,0,0,0.8)",
             cursor: "grab", willChange: "transform",
             touchAction: "none",
           }}
         />
-        {/* زر الإغلاق — في الأسفل وسط الشاشة عشان يكون في متناول الإبهام على الموبايل */}
+        {/* زر الإغلاق — أعلى يمين (ديسكتوب فقط) */}
         <button
           onClick={() => setLightboxImage(null)}
+          className="hidden sm:flex"
           style={{
-            position: "absolute", bottom: 36, left: "50%", transform: "translateX(-50%)",
-            background: "rgba(255,255,255,0.18)", border: "none",
-            borderRadius: 999, padding: "10px 28px", cursor: "pointer",
-            display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
-            color: "#fff", fontSize: 15, fontWeight: 600,
+            position: "absolute", top: 16, right: 16,
+            background: "rgba(0,0,0,0.55)", border: "none",
+            borderRadius: "50%", width: 44, height: 44, cursor: "pointer",
+            alignItems: "center", justifyContent: "center",
+            color: "#fff", fontSize: 20,
             backdropFilter: "blur(10px)", WebkitBackdropFilter: "blur(10px)",
-            boxShadow: "0 2px 16px rgba(0,0,0,0.4)",
-            zIndex: 1, whiteSpace: "nowrap",
+            boxShadow: "0 2px 12px rgba(0,0,0,0.5)",
+            zIndex: 1,
           }}
           aria-label="إغلاق"
         >
-          <span style={{ fontSize: 18, lineHeight: 1 }}>✕</span>
-          <span>إغلاق</span>
+          ✕
         </button>
-        {/* تلميح صغير فوق الزرار */}
-        <div style={{
-          position: "absolute", bottom: 88, left: "50%", transform: "translateX(-50%)",
-          color: "rgba(255,255,255,0.35)", fontSize: 11, pointerEvents: "none",
-          whiteSpace: "nowrap",
-        }}>
-          اسحب للأسفل للإغلاق • قرّب إصبعين للزوم
+        {/* تلميح + زر الإغلاق — أسفل وسط (موبايل فقط) */}
+        <div
+          className="flex sm:hidden"
+          style={{
+            position: "absolute", bottom: 28, left: "50%", transform: "translateX(-50%)",
+            flexDirection: "column", alignItems: "center", gap: 10, zIndex: 1,
+          }}
+        >
+          <span style={{ color: "rgba(255,255,255,0.4)", fontSize: 11, whiteSpace: "nowrap", pointerEvents: "none" }}>
+            اسحب للأسفل للإغلاق • قرّب إصبعين للزوم
+          </span>
+          <button
+            onClick={() => setLightboxImage(null)}
+            style={{
+              background: "rgba(255,255,255,0.15)", border: "none",
+              borderRadius: 999, padding: "10px 32px", cursor: "pointer",
+              display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+              color: "#fff", fontSize: 15, fontWeight: 600,
+              backdropFilter: "blur(10px)", WebkitBackdropFilter: "blur(10px)",
+              boxShadow: "0 2px 16px rgba(0,0,0,0.4)", whiteSpace: "nowrap",
+            }}
+            aria-label="إغلاق"
+          >
+            <span style={{ fontSize: 17 }}>✕</span>
+            <span>إغلاق</span>
+          </button>
         </div>
       </div>
     )}
