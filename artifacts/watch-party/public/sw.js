@@ -6,10 +6,19 @@
 let keepAliveTimer = null;
 const KEEPALIVE_INTERVAL = 25000;
 
-self.addEventListener('install', () => self.skipWaiting());
+// [FIX-SW-REFRESH] إزالة skipWaiting() التلقائي — كان بيخلي SW جديد يسيطر فوراً
+// على كل التبويبات ويطلق controllerchange event → الصفحة بترفرش وتقطع الاتصال.
+// دلوقتي SW بيستنى لحد ما كل التبويبات تتغلق طبيعياً قبل ما يتفعّل،
+// إلا لو البرنامج طلب التفعيل الفوري صراحةً عن طريق رسالة SKIP_WAITING.
+self.addEventListener('install', () => { /* do not skipWaiting automatically */ });
 self.addEventListener('activate', event => event.waitUntil(self.clients.claim()));
 
 self.addEventListener('message', event => {
+  // تفعيل فوري بس لما البرنامج يطلبه صراحةً (مثلاً بعد تأكيد المستخدم)
+  if (event.data?.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+  }
+
   if (event.data?.type === 'START_KEEPALIVE') {
     if (keepAliveTimer) clearInterval(keepAliveTimer);
     keepAliveTimer = setInterval(async () => {

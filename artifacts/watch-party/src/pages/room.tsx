@@ -3248,11 +3248,17 @@ export default function Room() {
       // release=0.25 كان بيسبب "pumping": بعد أي صوت عالي، الـ 250ms اللي بعده الصوت
       // الهادي بيتقطع لأن الـ gain لسه بيتعافى. 0.12s أسرع وأطبيعي للكلام.
       // ratio خُفِّض من 5 → 4: أقل ضغط على الصوت الطبيعي مع الحفاظ على الـ leveling.
+      // [FIX-COMPRESSOR-DISTORTION] Desktop كان بيعمل "تثطيع" بسبب:
+      // - attack=5ms سريع جداً → يقطع بداية كل كلمة → صوت مشوّه على laptop
+      // - threshold=-28dB منخفض جداً → الكومبريسور يشتغل طول الوقت حتى على الصوت الهادي
+      // الحل: attack بقى 15ms (أبطأ وأنعم)، threshold بقى -22dB (بيشتغل بس على الصوت العالي).
+      const isDesktopCompressor = !(/Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+        (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
       const compressor = ctx.createDynamicsCompressor();
-      compressor.threshold.value = -28;
-      compressor.knee.value = 10;
+      compressor.threshold.value = isDesktopCompressor ? -22 : -28;
+      compressor.knee.value = isDesktopCompressor ? 15 : 10;
       compressor.ratio.value = 4;
-      compressor.attack.value = 0.005;
+      compressor.attack.value = isDesktopCompressor ? 0.015 : 0.005;
       compressor.release.value = 0.12;
 
       source.connect(micGain);
@@ -3262,54 +3268,10 @@ export default function Room() {
       // أخف من NS: مش بيشيل ضوضاء من الإشارة، بيسكّتها كلها لما مفيش كلام.
       // hold = 20 frame (~400ms @ 48kHz/128) عشان ما يقطعش أواخر الكلام.
       // Mobile: عنده hardware NS ممتاز — مش محتاج gate.
-      const isDesktopGate = !(/Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
-        (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
-      let gateOutputNode: AudioNode = micGain;
-      if (isDesktopGate) {
-        // الـ Gate بيفتح/يتقفل بشكل تدريجي (smooth attack/release) عشان ما يحصلش
-        // قطع مفاجئ (pumping). attack=5ms، release=40ms @ 48kHz.
-        const noiseGateCode = [
-          "class NoiseGateProcessor extends AudioWorkletProcessor {",
-          "  constructor() {",
-          "    super();",
-          "    this._hold = 0; this._max = 15; this._open = false; this._gain = 0;",
-          "    this._atk = 1 / (48000 * 0.005);",   // 5ms attack
-          "    this._rel = 1 / (48000 * 0.040);",   // 40ms release
-          "  }",
-          "  process(inputs, outputs) {",
-          "    var inp = inputs[0] && inputs[0][0];",
-          "    var out = outputs[0] && outputs[0][0];",
-          "    if (!inp || !out) return true;",
-          "    var s = 0; for (var i = 0; i < inp.length; i++) s += inp[i] * inp[i];",
-          "    var rms = Math.sqrt(s / inp.length);",
-          "    if (rms > 0.015) { this._open = true; this._hold = this._max; }",
-          "    else if (this._hold > 0) { this._hold--; }",
-          "    else { this._open = false; }",
-          "    for (var j = 0; j < inp.length; j++) {",
-          "      if (this._open) this._gain = Math.min(1, this._gain + this._atk);",
-          "      else            this._gain = Math.max(0, this._gain - this._rel);",
-          "      out[j] = inp[j] * this._gain;",
-          "    }",
-          "    return true;",
-          "  }",
-          "}",
-          "registerProcessor('noise-gate-processor', NoiseGateProcessor);"
-        ].join("\n");
-        try {
-          const gateBlob = new Blob([noiseGateCode], { type: "application/javascript" });
-          const gateBlobUrl = URL.createObjectURL(gateBlob);
-          await ctx.audioWorklet.addModule(gateBlobUrl);
-          URL.revokeObjectURL(gateBlobUrl);
-          const gateNode = new AudioWorkletNode(ctx, "noise-gate-processor");
-          const gSilent = ctx.createGain();
-          gSilent.gain.value = 0;
-          gateNode.connect(gSilent);
-          gSilent.connect(ctx.destination);
-          micGain.connect(gateNode);
-          gateOutputNode = gateNode;
-        } catch { /* AudioWorklet not supported — no gate, acceptable fallback */ }
-      }
-      gateOutputNode.connect(compressor);
+      // [FIX-GATE-REMOVED] الـ noise gate على Desktop اتشال تماماً.
+      // كان بيعمل double suppression مع browser noiseSuppression → صوت الـ laptop بيقطع عند الكل.
+      // browser noiseSuppression: true (في webrtc.ts) كافي لعزل الضوضاء على كل الأجهزة.
+      micGain.connect(compressor);
 
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 2048;
