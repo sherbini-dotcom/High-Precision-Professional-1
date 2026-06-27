@@ -3232,22 +3232,84 @@ export default function Room() {
       const source = ctx.createMediaStreamSource(stream);
 
       const micGain = ctx.createGain();
-      micGain.gain.value = 1.5; // [FIX-MIC-STABILITY] 3.0 كانت تسبب clipping
+      // [FIX-DESKTOP-GAIN] Desktop: 1.5x كانت بتكبّر الضوضاء الخلفية — خفّضنا لـ 1.0x.
+      // Mobile: hardware NS ممتاز فنفضّل نبقى على 1.5x عشان ما يفقدش وضوح الصوت.
+      const isDesktopForGain = !(/Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+        (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
+      micGain.gain.value = isDesktopForGain ? 1.0 : 1.5;
 
       // [FIX-COMPRESSOR-LEVELING] رفعنا ratio من 3 → 5 وخفضنا threshold من -26 → -30.
       // ratio=3 كان ضعيف جداً كـ leveler: شخص بيتكلم من بعيد مش بيتضخّم بالقدر الكافي
       // مقارنة بشخص قريب من المايك. ratio=5 يضغط الإشارات العالية أقوى → يقرّب
       // مستويات الصوت بين المستخدمين. threshold=-30 يمسك حتى الأصوات الهادية نسبياً.
       // attack=0.003: استجابة أسرع تمنع peaks مفاجئة من تمرير clipping.
+      //
+      // [FIX-COMPRESSOR-PUMPING] release خُفِّض من 0.25s → 0.12s.
+      // release=0.25 كان بيسبب "pumping": بعد أي صوت عالي، الـ 250ms اللي بعده الصوت
+      // الهادي بيتقطع لأن الـ gain لسه بيتعافى. 0.12s أسرع وأطبيعي للكلام.
+      // ratio خُفِّض من 5 → 4: أقل ضغط على الصوت الطبيعي مع الحفاظ على الـ leveling.
       const compressor = ctx.createDynamicsCompressor();
-      compressor.threshold.value = -30;
+      compressor.threshold.value = -28;
       compressor.knee.value = 10;
-      compressor.ratio.value = 5;
-      compressor.attack.value = 0.003;
-      compressor.release.value = 0.25;
+      compressor.ratio.value = 4;
+      compressor.attack.value = 0.005;
+      compressor.release.value = 0.12;
 
       source.connect(micGain);
-      micGain.connect(compressor);
+      // [FIX-NOISE-GATE-DESKTOP] على Desktop عطّلنا noiseSuppression عشان التقطع،
+      // لكن ده خلّى الضوضاء الخلفية (هيس/نار) تاخد طريقها. الحل: Noise Gate —
+      // بيسكّت الصوت لما مفيش كلام (RMS < threshold) ويفتح لما يلتقط صوت.
+      // أخف من NS: مش بيشيل ضوضاء من الإشارة، بيسكّتها كلها لما مفيش كلام.
+      // hold = 20 frame (~400ms @ 48kHz/128) عشان ما يقطعش أواخر الكلام.
+      // Mobile: عنده hardware NS ممتاز — مش محتاج gate.
+      const isDesktopGate = !(/Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+        (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
+      let gateOutputNode: AudioNode = micGain;
+      if (isDesktopGate) {
+        // الـ Gate بيفتح/يتقفل بشكل تدريجي (smooth attack/release) عشان ما يحصلش
+        // قطع مفاجئ (pumping). attack=5ms، release=40ms @ 48kHz.
+        const noiseGateCode = [
+          "class NoiseGateProcessor extends AudioWorkletProcessor {",
+          "  constructor() {",
+          "    super();",
+          "    this._hold = 0; this._max = 15; this._open = false; this._gain = 0;",
+          "    this._atk = 1 / (48000 * 0.005);",   // 5ms attack
+          "    this._rel = 1 / (48000 * 0.040);",   // 40ms release
+          "  }",
+          "  process(inputs, outputs) {",
+          "    var inp = inputs[0] && inputs[0][0];",
+          "    var out = outputs[0] && outputs[0][0];",
+          "    if (!inp || !out) return true;",
+          "    var s = 0; for (var i = 0; i < inp.length; i++) s += inp[i] * inp[i];",
+          "    var rms = Math.sqrt(s / inp.length);",
+          "    if (rms > 0.015) { this._open = true; this._hold = this._max; }",
+          "    else if (this._hold > 0) { this._hold--; }",
+          "    else { this._open = false; }",
+          "    for (var j = 0; j < inp.length; j++) {",
+          "      if (this._open) this._gain = Math.min(1, this._gain + this._atk);",
+          "      else            this._gain = Math.max(0, this._gain - this._rel);",
+          "      out[j] = inp[j] * this._gain;",
+          "    }",
+          "    return true;",
+          "  }",
+          "}",
+          "registerProcessor('noise-gate-processor', NoiseGateProcessor);"
+        ].join("\n");
+        try {
+          const gateBlob = new Blob([noiseGateCode], { type: "application/javascript" });
+          const gateBlobUrl = URL.createObjectURL(gateBlob);
+          await ctx.audioWorklet.addModule(gateBlobUrl);
+          URL.revokeObjectURL(gateBlobUrl);
+          const gateNode = new AudioWorkletNode(ctx, "noise-gate-processor");
+          const gSilent = ctx.createGain();
+          gSilent.gain.value = 0;
+          gateNode.connect(gSilent);
+          gSilent.connect(ctx.destination);
+          micGain.connect(gateNode);
+          gateOutputNode = gateNode;
+        } catch { /* AudioWorklet not supported — no gate, acceptable fallback */ }
+      }
+      gateOutputNode.connect(compressor);
 
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 2048;
@@ -3329,7 +3391,18 @@ export default function Room() {
         scriptProcessorRef.current = processor;
       }
 
-      void webrtcManagerRef.current?.setStream(stream);
+      // [FIX-WEBRTC-PROCESSED] بدل ما نبعت الـ raw stream لـ WebRTC، بنعمل
+      // MediaStreamDestination من الـ AudioContext ونبعت الصوت المعالج بالـ Compressor.
+      // قبل الفيكس ده: Compressor كان بيشتغل على Socket.IO فقط، لكن WebRTC P2P كان
+      // بيستقبل الصوت خام بدون أي ضبط → مايك عالي بيجي صاخب جداً عند الآخرين.
+      // بعد الفيكس: كل الـ peers (WebRTC + Socket.IO) بيستقبلوا نفس الصوت المعالج.
+      // ملاحظة: micStreamRef.current فاضل raw stream عشان stopMic() تقدر تعمل
+      // track.stop() على الـ hardware tracks الحقيقية بشكل صحيح.
+      const processedDest = ctx.createMediaStreamDestination();
+      compressor.connect(processedDest);
+      const processedStream = processedDest.stream;
+
+      void webrtcManagerRef.current?.setStream(processedStream);
 
       setMicEnabled(true);
       setMicError(null);
@@ -3340,10 +3413,9 @@ export default function Room() {
       // (يعني المستخدم أغلق المايك ورجع فتحه بـ stream جديد بينهم).
       // الـ retry القديم على 1.5 ثانية كان بيسبب replaceTrack ثاني بيقطع الصوت
       // عند الكل — نحّيناه للـ 3 ثواني ومع حماية بـ Object.is لضمان نفس الـ stream.
-      const retryStream = stream;
       setTimeout(() => {
-        if (micEnabledRef.current && Object.is(micStreamRef.current, retryStream)) {
-          void webrtcManagerRef.current?.setStream(retryStream);
+        if (micEnabledRef.current && micStreamRef.current === stream) {
+          void webrtcManagerRef.current?.setStream(processedStream);
         }
       }, 3000);
 
