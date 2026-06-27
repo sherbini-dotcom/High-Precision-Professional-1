@@ -3220,6 +3220,40 @@ export default function Room() {
       micStreamRef.current = stream;
       socketRef.current?.emit("micEnabled");
 
+      // [FIX-IOS-DUCKING-OPEN] iOS بيعمل ducking لكل الأصوات لما getUserMedia يشتغل.
+      // الحل: نضبط الـ audio session على "playback" فوراً بعد فتح المايك،
+      // ثم نعيد تشغيل كل الأصوات اللي اتخفت.
+      try {
+        const navSession = navigator as unknown as { audioSession?: { type: string } };
+        if (navSession.audioSession) navSession.audioSession.type = "play-and-record";
+      } catch { /* ignore — Safari 17+ only */ }
+
+      // بعد 400ms نرجّع كل الأصوات اللي خفّتها iOS
+      setTimeout(() => {
+        // 1. audioPlayer context
+        if (audioPlayerRef.current?.state === "suspended") {
+          audioPlayerRef.current.resume().catch(() => {});
+        }
+        // 2. فيديو الغرفة — volume bounce يفرض un-duck على iOS
+        const v = videoRef.current;
+        if (v && !v.muted) {
+          const saved = v.volume;
+          v.volume = 0;
+          requestAnimationFrame(() => {
+            v.volume = saved;
+            if (!v.paused) v.play().catch(() => {});
+          });
+        }
+        // 3. كل عناصر audio (WebRTC peers)
+        document.querySelectorAll<HTMLAudioElement>("audio").forEach(el => {
+          if (el.paused && (el.src || el.srcObject)) el.play().catch(() => {});
+          // volume bounce لإجبار iOS على رفع الصوت
+          const sv = el.volume;
+          el.volume = 0;
+          requestAnimationFrame(() => { el.volume = sv; });
+        });
+      }, 400);
+
       const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       // [FIX-DESKTOP-AUDIO-CUT] لا نحدد sampleRate هنا — نخلي البراوزر يستخدم الـ
       // native rate بتاع النظام (44100 أو 48000 حسب الهاردوير).
@@ -3236,7 +3270,7 @@ export default function Room() {
       // Mobile: hardware NS ممتاز فنفضّل نبقى على 1.5x عشان ما يفقدش وضوح الصوت.
       const isDesktopForGain = !(/Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
         (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
-      micGain.gain.value = isDesktopForGain ? 1.0 : 1.5;
+      micGain.gain.value = isDesktopForGain ? 2.2 : 1.5;
 
       // [FIX-COMPRESSOR-LEVELING] رفعنا ratio من 3 → 5 وخفضنا threshold من -26 → -30.
       // ratio=3 كان ضعيف جداً كـ leveler: شخص بيتكلم من بعيد مش بيتضخّم بالقدر الكافي
@@ -3249,10 +3283,10 @@ export default function Room() {
       // الهادي بيتقطع لأن الـ gain لسه بيتعافى. 0.12s أسرع وأطبيعي للكلام.
       // ratio خُفِّض من 5 → 4: أقل ضغط على الصوت الطبيعي مع الحفاظ على الـ leveling.
       const compressor = ctx.createDynamicsCompressor();
-      compressor.threshold.value = -28;
+      compressor.threshold.value = -45;
       compressor.knee.value = 10;
-      compressor.ratio.value = 4;
-      compressor.attack.value = 0.005;
+      compressor.ratio.value = 6;
+      compressor.attack.value = 0.003;
       compressor.release.value = 0.12;
 
       source.connect(micGain);
@@ -3272,9 +3306,11 @@ export default function Room() {
           "class NoiseGateProcessor extends AudioWorkletProcessor {",
           "  constructor() {",
           "    super();",
-          "    this._hold = 0; this._max = 15; this._open = false; this._gain = 0;",
-          "    this._atk = 1 / (48000 * 0.005);",   // 5ms attack
-          "    this._rel = 1 / (48000 * 0.040);",   // 40ms release
+          "    this._hold = 0; this._max = 40; this._open = false; this._gain = 0;",
+          "    this._atk = 1 / (48000 * 0.008);",
+          "    this._rel = 1 / (48000 * 0.120);",
+          "    this._noiseFloor = 0.003;",
+          "    this._smoothRms  = 0;",
           "  }",
           "  process(inputs, outputs) {",
           "    var inp = inputs[0] && inputs[0][0];",
@@ -3282,7 +3318,12 @@ export default function Room() {
           "    if (!inp || !out) return true;",
           "    var s = 0; for (var i = 0; i < inp.length; i++) s += inp[i] * inp[i];",
           "    var rms = Math.sqrt(s / inp.length);",
-          "    if (rms > 0.015) { this._open = true; this._hold = this._max; }",
+          "    this._smoothRms = this._smoothRms * 0.92 + rms * 0.08;",
+          "    if (!this._open && this._hold === 0) {",
+          "      this._noiseFloor = this._noiseFloor * 0.9997 + this._smoothRms * 0.0003;",
+          "    }",
+          "    var threshold = Math.max(0.002, this._noiseFloor * 2.0);",
+          "    if (this._smoothRms > threshold) { this._open = true; this._hold = this._max; }",
           "    else if (this._hold > 0) { this._hold--; }",
           "    else { this._open = false; }",
           "    for (var j = 0; j < inp.length; j++) {",
