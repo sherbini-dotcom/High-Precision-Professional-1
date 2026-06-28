@@ -102,22 +102,35 @@ async function getIceServers(): Promise<RTCIceServer[]> {
 // on Android (browser AGC fighting our compressor → unstable volume / distortion).
 // Tier 3 still passes audio: true as a last resort for unsupported browsers.
 export async function getMicStream(): Promise<MediaStream> {
-  // FIX-IOS-DUCKING: على iOS لما getUserMedia بتشتغل، النظام بيغير الـ audio session
-  // ويعمل ducking (يخفّض) صوت الفيديو/المتصفح تلقائياً.
-  // الحل: نحدد audioSession type لـ "play-and-record" قبل getUserMedia
-  // عشان iOS ما يعملش ducking للصوت التاني.
+  // [FIX-IOS-DUCKING] Root cause: iOS hardware echo canceller requires
+  // AVAudioSession category PlayAndRecord with the duckOthers option, which
+  // silences all other audio (video, music) when the mic is active.
+  //
+  // Fix: on iOS, disable echoCancellation + noiseSuppression in getUserMedia
+  // so iOS does NOT activate the hardware EC pipeline. Without hardware EC,
+  // iOS uses mixWithOthers instead of duckOthers — other audio is NOT ducked.
+  // Our Web Audio chain (compressor + gate) handles echo and noise instead,
+  // so audio quality is unaffected.
+  //
+  // Non-iOS: navigator.audioSession.type = "play-and-record" (Chrome 116+)
+  // signals the same intent — keep as a belt-and-suspenders for Chromium.
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
   try {
     const nav = navigator as unknown as { audioSession?: { type: string } };
     if (nav.audioSession) nav.audioSession.type = "play-and-record";
-  } catch { /* ignore — API not supported */ }
+  } catch { /* ignore — API not supported on iOS Safari */ }
 
   // Tier 1: full high-quality constraints
+  // iOS: echoCancellation/noiseSuppression disabled → no ducking (Web Audio chain handles it)
+  // Non-iOS: browser EC enabled, Web Audio still processes on top
   try {
     return await navigator.mediaDevices.getUserMedia({
       audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: false, // we handle gain ourselves
+        echoCancellation: !isIOS,
+        noiseSuppression: !isIOS,
+        autoGainControl: false,
         sampleRate: 48000,
         sampleSize: 16,
         channelCount: 1,
@@ -127,12 +140,11 @@ export async function getMicStream(): Promise<MediaStream> {
   } catch { /* fall through */ }
 
   // Tier 2: relaxed constraints — drop sampleRate/sampleSize (some Android WebViews reject them)
-  // Still keep autoGainControl: false to avoid double-AGC with our compressor chain.
   try {
     return await navigator.mediaDevices.getUserMedia({
       audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
+        echoCancellation: !isIOS,
+        noiseSuppression: !isIOS,
         autoGainControl: false,
         channelCount: 1,
       },
@@ -140,7 +152,7 @@ export async function getMicStream(): Promise<MediaStream> {
     });
   } catch { /* fall through */ }
 
-  // Tier 3: absolute minimum — let the browser decide everything
+  // Tier 3: absolute minimum — last resort for old/unsupported browsers
   return navigator.mediaDevices.getUserMedia({ audio: true, video: false });
 }
 

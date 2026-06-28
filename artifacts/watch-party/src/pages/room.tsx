@@ -695,6 +695,9 @@ export default function Room() {
   // حتى لو عملنا track.stop() و audioContext.close(). الفصل اليدوي قبل إغلاق الـ context
   // بيخلي iOS يطفي النقطة الصفراء فوراً.
   const micSourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  // [FIX-IOS-DUCK-LOOP] interval يشتغل كل 3 ثواني طول ما المايك مفتوح على iOS
+  // عشان يعيد رفع الصوت لو iOS عمل re-duck للمحتوى أو الـ HyperBeam iframe.
+  const duckingRecoveryRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const audioPlayerRef = useRef<AudioContext | null>(null);
   const silentKeepAliveRef = useRef<AudioBufferSourceNode | null>(null);
   const wasPlayingBeforeHiddenRef = useRef(false);
@@ -3166,6 +3169,9 @@ export default function Room() {
     micEnabledRef.current = false;
     if (micIntervalRef.current) { clearInterval(micIntervalRef.current); micIntervalRef.current = null; }
 
+    // [FIX-IOS-DUCK-LOOP] وقف الـ interval المستمر لاستعادة الصوت
+    if (duckingRecoveryRef.current) { clearInterval(duckingRecoveryRef.current); duckingRecoveryRef.current = null; }
+
     // [FIX-IOS-YDot] خطوة 1: نفصل الـ source node يدوياً قبل إيقاف الـ tracks.
     // iOS Safari بيراقب الـ graph — لو الـ source متفصلش، بيظن إن المايك لسه
     // "بيستخدم" ويفضل يعرض النقطة الصفراء حتى بعد track.stop().
@@ -3190,7 +3196,119 @@ export default function Room() {
     socketRef.current?.emit("micDisabled");
     try { localStorage.removeItem(`wp_mic_${code}`); } catch { /* ignore */ }
 
+    // [FIX-IOS-DUCKING-V2] Comprehensive audio session restoration after mic stops.
+    // iOS changes the audio session to "play-and-record" when getUserMedia runs,
+    // which ducks/interrupts all other audio (video, peers, HyperBeam iframe).
+    // After stopping the mic we must: (1) restore the session, then (2) revive
+    // every audio source we manage, because iOS won't un-duck them automatically.
 
+    // [FIX-IOS-DUCKING-FINAL] الحل الصح لـ iOS audio ducking بعد إغلاق المايك:
+    //
+    // المشكلة الجذرية: iOS بيعمل OS-level audio ducking لما getUserMedia يشتغل.
+    // الـ ducking ده مش على el.volume — هو على مستوى النظام، يعني el.volume
+    // بيفضل 1.0 ظاهرياً لكن الصوت الفعلي واطي. volume bounce لوحده مش كافي.
+    //
+    // الحل المضمون: silent AudioBuffer يشتغل في AudioContext جديد — ده بيجبر
+    // iOS يعيد تهيئة الـ audio session لـ "playback" ويرفع الـ ducking فوراً.
+    // بعدها بنعمل pause→play على الفيديو عشان iOS يعيد ربط الصوت بالـ session الجديدة.
+
+    // Step 1: audioSession API (Safari 17+) — إخبار iOS إننا رجعنا لـ playback فقط
+    try {
+      const nav = navigator as unknown as { audioSession?: { type: string } };
+      if (nav.audioSession) nav.audioSession.type = "playback";
+    } catch { /* ignore — Safari 17+ only */ }
+
+    // Step 2: silent audio trick — يجبر iOS يرفع الـ session ducking فوراً
+    const forceIOSAudioSessionRestore = () => {
+      try {
+        const AudioCtxClass = window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        const silentCtx = new AudioCtxClass();
+        const buf = silentCtx.createBuffer(1, 1, 22050);
+        const src = silentCtx.createBufferSource();
+        src.buffer = buf;
+        src.connect(silentCtx.destination);
+        src.start(0);
+        // أغلق الـ context بعد ما يشتغل — مش محتاجينه بعد كده
+        src.onended = () => silentCtx.close().catch(() => {});
+      } catch { /* ignore */ }
+    };
+
+    // Step 3: بعد ما iOS يرفع الـ ducking، نعمل pause→play على الفيديو
+    // عشان يعيد ربط الصوت بالـ audio session الجديدة (playback بدل play-and-record)
+    const restoreVideoAudio = () => {
+      const v = videoRef.current;
+      if (v && !v.paused && !v.muted) {
+        const savedTime = v.currentTime;
+        const savedVol = v.volume || 1;
+        v.pause();
+        requestAnimationFrame(() => {
+          v.volume = savedVol;
+          v.currentTime = savedTime;
+          v.play().catch(() => {});
+        });
+      } else if (v && !v.muted) {
+        // لو الفيديو واقف أصلاً — volume bounce كافي
+        const savedVol = v.volume || 1;
+        v.volume = 0.001;
+        requestAnimationFrame(() => { v.volume = savedVol; });
+      }
+    };
+
+    // Step 4: WebRTC peer audio elements
+    const restorePeerAudio = () => {
+      document.querySelectorAll<HTMLAudioElement>("audio").forEach(el => {
+        if (!el.muted) {
+          const sv = el.volume || 1;
+          el.volume = 0.001;
+          requestAnimationFrame(() => {
+            el.volume = sv;
+            if (el.srcObject) el.play().catch(() => {});
+          });
+        }
+      });
+    };
+
+    // Step 5: AudioContext للـ peers
+    const restoreAudioContext = () => {
+      if (audioPlayerRef.current?.state === "suspended") {
+        audioPlayerRef.current.resume().catch(() => {});
+      }
+    };
+
+    // Step 6: HyperBeam — postMessage فقط (cross-origin، مش نقدر نلمس الـ DOM بتاعه)
+    const restoreHyperbeam = () => {
+      try {
+        const hbEl = hbContainerRef.current;
+        const iframe = hbEl?.querySelector<HTMLIFrameElement>("iframe");
+        if (iframe?.contentWindow) {
+          iframe.contentWindow.postMessage({ type: "audioResume" }, "*");
+        }
+      } catch { /* cross-origin — ignore */ }
+    };
+
+    // التسلسل: silent trick أول (يرفع الـ session) → بعدين نرجّع كل مصادر الصوت
+    forceIOSAudioSessionRestore();                          // فوري
+    setTimeout(() => {
+      restoreAudioContext();
+      restorePeerAudio();
+      restoreHyperbeam();
+    }, 100);
+    setTimeout(() => {
+      restoreVideoAudio();   // pause→play بعد 300ms: iOS بيحتاج وقت يطبق الـ session switch
+      restoreHyperbeam();
+    }, 300);
+    setTimeout(() => {
+      forceIOSAudioSessionRestore(); // موجة تانية من الـ silent trick للأجهزة الأبطأ
+      restoreAudioContext();
+      restorePeerAudio();
+      restoreHyperbeam();
+    }, 700);
+    setTimeout(() => {
+      restoreVideoAudio();
+      restoreAudioContext();
+      restoreHyperbeam();
+    }, 1500);
   }, [myMemberId]);
 
 
@@ -3199,9 +3317,121 @@ export default function Room() {
     const myMember = membersRef.current.find(m => m.id === myMemberId);
     if (myMember?.isMuted) return;
     try {
+      // [FIX-IOS-DUCKING-EARLY] نضبط audioSession قبل getUserMedia مش بعدها.
+      // لو حددناها بعد ما iOS غير الـ category لـ "recording" — الـ ducking بيحصل خلال الـ getUserMedia
+      // نفسها. بالتحديد المبكر هنا، iOS بيعرف إننا محتاجين audio+mic مع بعض ومش بيحتاج يغير الـ session.
+      try {
+        const navSessionEarly = navigator as unknown as { audioSession?: { type: string } };
+        if (navSessionEarly.audioSession) navSessionEarly.audioSession.type = "play-and-record";
+      } catch { /* Safari 17+ only — ignore on older */ }
+
       const stream = await getMicStream();
       micStreamRef.current = stream;
       socketRef.current?.emit("micEnabled");
+
+      // [FIX-IOS-DUCKING-OPEN] تأكيد ثاني بعد getUserMedia — بعض نسخ iOS بتعيد الـ category
+      // خلال الـ permission dialog ثم بنحتاج نعيد التعيين بعد ما تنتهي العملية.
+      try {
+        const navSession = navigator as unknown as { audioSession?: { type: string } };
+        if (navSession.audioSession) navSession.audioSession.type = "play-and-record";
+      } catch { /* ignore — Safari 17+ only */ }
+
+      // [FIX-IOS-VOLUME-RESTORE] نرجّع الأصوات في 3 موجات:
+      // - فوراً (0ms): بعض النسخ من iOS بترجع الصوت من أول play()
+      // - 400ms: الوقت العادي اللي iOS بيخلّص فيه الـ ducking
+      // - 1000ms: fallback لو الأولانين ما اشتغلوش (أجهزة قديمة / iOS 15)
+      const restoreAllAudio = () => {
+        // 1. audioPlayer WebAudio context
+        if (audioPlayerRef.current?.state === "suspended") {
+          audioPlayerRef.current.resume().catch(() => {});
+        }
+        // 2. فيديو الغرفة
+        const v = videoRef.current;
+        if (v) {
+          // لو مكتوم forcefully من iOS — فك الكتم
+          if (v.muted) v.muted = false;
+          // volume bounce: iOS بيحتاج تغيير حقيقي في الـ volume يشغّل الـ un-duck
+          const saved = v.volume || 1;
+          v.volume = 0.001;
+          requestAnimationFrame(() => {
+            v.volume = saved;
+            if (!v.paused) v.play().catch(() => {});
+          });
+        }
+        // 3. كل عناصر audio (WebRTC peers)
+        document.querySelectorAll<HTMLAudioElement>("audio").forEach(el => {
+          if (el.muted) el.muted = false;
+          const sv = el.volume || 1;
+          el.volume = 0.001;
+          requestAnimationFrame(() => {
+            el.volume = sv;
+            if (el.paused && (el.src || el.srcObject)) el.play().catch(() => {});
+          });
+        });
+        // 4. HyperBeam — postMessage + Shadow DOM audio restore
+        // [FIX-IOS-HB-AUDIO-OPEN] لازم نعمل restore للـ HyperBeam لما المايك بيفتح كمان
+        // مش بس لما بيقفل — لأن iOS بيعمل ducking من أول getUserMedia.
+        try {
+          const hbEl = hbContainerRef.current;
+          if (hbEl) {
+            const hbIframe = hbEl.querySelector<HTMLIFrameElement>("iframe");
+            if (hbIframe?.contentWindow) {
+              hbIframe.contentWindow.postMessage({ type: "audioResume" }, "*");
+            }
+            const hbShadow = hbEl.shadowRoot ?? (hbEl.firstElementChild as HTMLElement | null)?.shadowRoot;
+            if (hbShadow) {
+              hbShadow.querySelectorAll<HTMLMediaElement>("audio, video").forEach(el => {
+                if (!el.muted) {
+                  const sv = el.volume || 1;
+                  el.volume = 0;
+                  requestAnimationFrame(() => { el.volume = sv; el.play().catch(() => {}); });
+                }
+              });
+            }
+          }
+        } catch { /* cross-origin — best effort */ }
+      };
+      // موجة أولى: فورية
+      restoreAllAudio();
+      // موجة تانية: بعد 400ms (الوقت العادي للـ ducking)
+      setTimeout(restoreAllAudio, 400);
+      // موجة تالتة: fallback للأجهزة البطيئة
+      setTimeout(restoreAllAudio, 1000);
+      // موجة رابعة: [FIX-IOS-HB-AUDIO-OPEN] HyperBeam بياخد وقت أطول
+      setTimeout(restoreAllAudio, 2500);
+
+      // [FIX-IOS-DUCK-LOOP] iOS ممكن يعمل re-duck بعد فترة — interval مستمر كل 3 ثواني
+      // طول ما المايك شغال يضمن إن الصوت مش بيفضل واطي.
+      // بنوقفه في stopMic عشان ما يفضلش شغال بعد إغلاق المايك.
+      if (duckingRecoveryRef.current) clearInterval(duckingRecoveryRef.current);
+      duckingRecoveryRef.current = setInterval(() => {
+        if (!micEnabledRef.current) {
+          if (duckingRecoveryRef.current) { clearInterval(duckingRecoveryRef.current); duckingRecoveryRef.current = null; }
+          return;
+        }
+        // [FIX-IOS-STUTTER] الـ interval ده بس بيعمل حاجتين آمنتين:
+        // 1. resume الـ AudioContext لو iOS suspend اهو
+        // 2. تأكيد audioSession type
+        // ❌ مش بنعمل v.play() أو volume bounce هنا — استدعاء play() على فيديو
+        //    شغال على iOS كل 3 ثواني بيعمل micro-interrupt للـ audio decoder
+        //    → stuttering + تكرار الصوت. الـ restore ده بييجي بس في stopMic.
+        if (audioPlayerRef.current?.state === "suspended") {
+          audioPlayerRef.current.resume().catch(() => {});
+        }
+        try {
+          const ns = navigator as unknown as { audioSession?: { type: string } };
+          if (ns.audioSession) ns.audioSession.type = "play-and-record";
+        } catch { /* ignore */ }
+        // [FIX-IOS-HB-AUDIO-LOOP] postMessage للـ HyperBeam كل دورة — آمن ومش بيعمل stutter
+        // لأنه مش بيلمس الـ video element مباشرة.
+        try {
+          const hbEl = hbContainerRef.current;
+          const hbIframe = hbEl?.querySelector<HTMLIFrameElement>("iframe");
+          if (hbIframe?.contentWindow) {
+            hbIframe.contentWindow.postMessage({ type: "audioResume" }, "*");
+          }
+        } catch { /* cross-origin — ignore */ }
+      }, 5000);
 
       const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       // [FIX-DESKTOP-AUDIO-CUT] لا نحدد sampleRate هنا — نخلي البراوزر يستخدم الـ
