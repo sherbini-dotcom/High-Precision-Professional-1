@@ -690,6 +690,14 @@ export default function Room() {
   // preventing "play() interrupted by pause()" AbortErrors in the console.
   const playPromiseRef = useRef<Promise<void> | null>(null);
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  // [FIX-IOS-YDot] نحتفظ بـ source node عشان نقدر نفصلها يدوياً في stopMic.
+  // iOS Safari بيفضل يحسب إن المايك شغال طالما فيه MediaStreamSourceNode في الـ graph،
+  // حتى لو عملنا track.stop() و audioContext.close(). الفصل اليدوي قبل إغلاق الـ context
+  // بيخلي iOS يطفي النقطة الصفراء فوراً.
+  const micSourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  // [FIX-IOS-DUCK-LOOP] interval يشتغل كل 3 ثواني طول ما المايك مفتوح على iOS
+  // عشان يعيد رفع الصوت لو iOS عمل re-duck للمحتوى أو الـ HyperBeam iframe.
+  const duckingRecoveryRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const audioPlayerRef = useRef<AudioContext | null>(null);
   const silentKeepAliveRef = useRef<AudioBufferSourceNode | null>(null);
   const wasPlayingBeforeHiddenRef = useRef(false);
@@ -2214,7 +2222,24 @@ export default function Room() {
       : hbContainerRef.current;
     if (!container) return;
     let cancelled = false;
-    Hyperbeam(container, hyperbeamEmbed).then((hb: { destroy?: () => void }) => {
+    Hyperbeam(container, hyperbeamEmbed, {
+      // FIX-BLACK-SCREEN: لما الـ VM يتوقف من الخارج (quota limit, concurrent session, إلخ)
+      // الـ SDK بيطلق onClose — بنمسح الـ UI فوراً بدل ما تظهر شاشة سودة.
+      // الـ host بيبعت hyperbeamEnded للـ socket عشان يخبر باقي الأعضاء،
+      // والـ guests بياخدوا الـ event ده عبر socket.
+      onClose: () => {
+        if (cancelled) return;
+        if (isPrivilegedRef.current) {
+          socketRef.current?.emit("hyperbeamEnded");
+          fetch(`/api/rooms/${code}/hyperbeam`, {
+            method: "DELETE",
+            headers: { "x-session-token": sessionToken },
+          }).catch(() => {});
+        }
+        setHyperbeamEmbed(null);
+        setHyperbeamAdminToken(null);
+      },
+    } as Record<string, unknown>).then((hb: { destroy?: () => void }) => {
       if (!cancelled) hbInstanceRef.current = hb;
     });
     return () => {
@@ -3143,10 +3168,25 @@ export default function Room() {
   const stopMic = useCallback(() => {
     micEnabledRef.current = false;
     if (micIntervalRef.current) { clearInterval(micIntervalRef.current); micIntervalRef.current = null; }
+
+    // [FIX-IOS-DUCK-LOOP] وقف الـ interval المستمر لاستعادة الصوت
+    if (duckingRecoveryRef.current) { clearInterval(duckingRecoveryRef.current); duckingRecoveryRef.current = null; }
+
+    // [FIX-IOS-YDot] خطوة 1: نفصل الـ source node يدوياً قبل إيقاف الـ tracks.
+    // iOS Safari بيراقب الـ graph — لو الـ source متفصلش، بيظن إن المايك لسه
+    // "بيستخدم" ويفضل يعرض النقطة الصفراء حتى بعد track.stop().
+    try { micSourceNodeRef.current?.disconnect(); } catch { /* ignore */ }
+    micSourceNodeRef.current = null;
+
+    // خطوة 2: وقف الـ hardware tracks (إشارة لنظام iOS إن الـ capture انتهى)
     micStreamRef.current?.getTracks().forEach(t => t.stop());
     micStreamRef.current = null;
+
+    // خطوة 3: نفصل باقي الـ nodes
     try { scriptProcessorRef.current?.disconnect(); } catch { /* AudioWorkletNode disconnect is safe */ }
     scriptProcessorRef.current = null;
+
+    // خطوة 4: إغلاق الـ AudioContext (يحرر باقي موارد الـ OS)
     if (audioContextRef.current?.state !== "closed") audioContextRef.current?.close().catch(() => {});
     audioContextRef.current = null;
     analyserRef.current = null;
@@ -3168,46 +3208,50 @@ export default function Room() {
       if (nav.audioSession) nav.audioSession.type = "playback";
     } catch { /* ignore */ }
 
-    // Step 2 — wait 300ms for iOS to finish releasing the audio session,
-    // then revive every audio source we own.
-    setTimeout(() => {
-      // 2a. Peer audio WebAudio context (receives remote participants' audio).
-      //     getUserMedia can suspend it as a side-effect on some iOS versions.
+    // Step 2 — revive every audio source in 4 waves.
+    // iOS بيعمل الـ ducking على مستوى النظام (OS-level) — مش على el.volume property.
+    // يعني el.volume بيفضل 1.0 حتى لو الصوت فعلاً واطي، فأي شرط زي el.volume < 0.5
+    // أو el.paused مش بيشتغل. الحل الوحيد: volume bounce دايماً بغض النظر عن الحالة.
+    const doRestore = () => {
+      // AudioContext للـ peers — لو iOS suspend اهو
       if (audioPlayerRef.current?.state === "suspended") {
         audioPlayerRef.current.resume().catch(() => {});
       }
-
-      // 2b. Local video element — volume bounce forces iOS to un-duck,
-      //     then call play() so it resumes if iOS had paused it.
+      // فيديو الغرفة — bounce يجبر iOS على رفع الـ OS ducking
       const v = videoRef.current;
       if (v && !v.muted) {
-        const savedVol = v.volume;
+        const savedVol = v.volume || 1;
         v.volume = 0;
         requestAnimationFrame(() => {
           v.volume = savedVol;
-          if (!v.paused) v.play().catch(() => {});
+          v.play().catch(() => {});
         });
       }
-
-      // 2c. All <audio> elements in the document (WebRTC peer tracks injected
-      //     by webrtc.ts). iOS may have paused them during the mic session.
+      // كل عناصر <audio> (WebRTC peers) — bounce + play على كلهم
       document.querySelectorAll<HTMLAudioElement>("audio").forEach(el => {
-        if (el.paused && (el.src || el.srcObject)) {
-          el.play().catch(() => {});
+        if (!el.muted) {
+          const sv = el.volume || 1;
+          el.volume = 0;
+          requestAnimationFrame(() => {
+            el.volume = sv;
+            if (el.src || el.srcObject) el.play().catch(() => {});
+          });
         }
       });
-
-      // 2d. HyperBeam iframe — we can't reach inside a cross-origin iframe,
-      //     but dispatching a synthetic click on the container restores iOS
-      //     audio focus for that browsing context in some Safari versions.
+      // HyperBeam iframe — synthetic click لإعادة الـ audio focus
       try {
         const hbEl = hbContainerRef.current;
         if (hbEl) {
           const iframe = hbEl.querySelector("iframe") ?? hbEl;
           iframe.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
         }
-      } catch { /* cross-origin — best effort only */ }
-    }, 300);
+      } catch { /* cross-origin — best effort */ }
+    };
+    // 4 موجات: iOS محتاج وقت لإنهاء الـ session switch — موجات متعددة تضمن الرجوع
+    setTimeout(doRestore, 50);    // موجة 1: فورية
+    setTimeout(doRestore, 350);   // موجة 2: بعد انتهاء الـ session release
+    setTimeout(doRestore, 750);   // موجة 3: للأجهزة الأبطأ
+    setTimeout(doRestore, 1500);  // موجة 4: fallback أخير
   }, [myMemberId]);
 
 
@@ -3216,12 +3260,20 @@ export default function Room() {
     const myMember = membersRef.current.find(m => m.id === myMemberId);
     if (myMember?.isMuted) return;
     try {
+      // [FIX-IOS-DUCKING-EARLY] نضبط audioSession قبل getUserMedia مش بعدها.
+      // لو حددناها بعد ما iOS غير الـ category لـ "recording" — الـ ducking بيحصل خلال الـ getUserMedia
+      // نفسها. بالتحديد المبكر هنا، iOS بيعرف إننا محتاجين audio+mic مع بعض ومش بيحتاج يغير الـ session.
+      try {
+        const navSessionEarly = navigator as unknown as { audioSession?: { type: string } };
+        if (navSessionEarly.audioSession) navSessionEarly.audioSession.type = "play-and-record";
+      } catch { /* Safari 17+ only — ignore on older */ }
+
       const stream = await getMicStream();
       micStreamRef.current = stream;
       socketRef.current?.emit("micEnabled");
 
-      // [FIX-IOS-DUCKING-OPEN] iOS بيعمل ducking (يخفّض) كل الأصوات فوراً لما getUserMedia تشتغل.
-      // audioSession.type = "play-and-record" بيخلي iOS يعرف إننا محتاجين الصوتين مع بعض.
+      // [FIX-IOS-DUCKING-OPEN] تأكيد ثاني بعد getUserMedia — بعض نسخ iOS بتعيد الـ category
+      // خلال الـ permission dialog ثم بنحتاج نعيد التعيين بعد ما تنتهي العملية.
       try {
         const navSession = navigator as unknown as { audioSession?: { type: string } };
         if (navSession.audioSession) navSession.audioSession.type = "play-and-record";
@@ -3267,6 +3319,30 @@ export default function Room() {
       // موجة تالتة: fallback للأجهزة البطيئة
       setTimeout(restoreAllAudio, 1000);
 
+      // [FIX-IOS-DUCK-LOOP] iOS ممكن يعمل re-duck بعد فترة — interval مستمر كل 3 ثواني
+      // طول ما المايك شغال يضمن إن الصوت مش بيفضل واطي.
+      // بنوقفه في stopMic عشان ما يفضلش شغال بعد إغلاق المايك.
+      if (duckingRecoveryRef.current) clearInterval(duckingRecoveryRef.current);
+      duckingRecoveryRef.current = setInterval(() => {
+        if (!micEnabledRef.current) {
+          if (duckingRecoveryRef.current) { clearInterval(duckingRecoveryRef.current); duckingRecoveryRef.current = null; }
+          return;
+        }
+        // [FIX-IOS-STUTTER] الـ interval ده بس بيعمل حاجتين آمنتين:
+        // 1. resume الـ AudioContext لو iOS suspend اهو
+        // 2. تأكيد audioSession type
+        // ❌ مش بنعمل v.play() أو volume bounce هنا — استدعاء play() على فيديو
+        //    شغال على iOS كل 3 ثواني بيعمل micro-interrupt للـ audio decoder
+        //    → stuttering + تكرار الصوت. الـ restore ده بييجي بس في stopMic.
+        if (audioPlayerRef.current?.state === "suspended") {
+          audioPlayerRef.current.resume().catch(() => {});
+        }
+        try {
+          const ns = navigator as unknown as { audioSession?: { type: string } };
+          if (ns.audioSession) ns.audioSession.type = "play-and-record";
+        } catch { /* ignore */ }
+      }, 5000);
+
       const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       // [FIX-DESKTOP-AUDIO-CUT] لا نحدد sampleRate هنا — نخلي البراوزر يستخدم الـ
       // native rate بتاع النظام (44100 أو 48000 حسب الهاردوير).
@@ -3277,30 +3353,29 @@ export default function Room() {
       if (ctx.state === "suspended") { try { await ctx.resume(); } catch { /* ignore */ } }
       audioContextRef.current = ctx;
       const source = ctx.createMediaStreamSource(stream);
+      // [FIX-IOS-YDot] نحفظ الـ source node في ref عشان stopMic تقدر تفصلها يدوياً.
+      micSourceNodeRef.current = source;
 
       const micGain = ctx.createGain();
-      // [FIX-DESKTOP-GAIN] Desktop: 1.5x كانت بتكبّر الضوضاء الخلفية — خفّضنا لـ 1.0x.
-      // Mobile: hardware NS ممتاز فنفضّل نبقى على 1.5x عشان ما يفقدش وضوح الصوت.
+      // [PRO-GAIN] رفعنا الـ gain لالتقاط الأصوات البعيدة — الـ limiter في الآخر
+      // بيمنع الـ clipping حتى مع gain عالي، فأمان نرفعه هنا.
+      // Desktop: 3.5x (≈+11dB) | Mobile (hardware NS ممتاز): 2.5x (≈+8dB)
       const isDesktopForGain = !(/Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
         (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
-      micGain.gain.value = isDesktopForGain ? 2.2 : 1.5;
+      micGain.gain.value = isDesktopForGain ? 3.5 : 2.5;
 
-      // [FIX-COMPRESSOR-LEVELING] رفعنا ratio من 3 → 5 وخفضنا threshold من -26 → -30.
-      // ratio=3 كان ضعيف جداً كـ leveler: شخص بيتكلم من بعيد مش بيتضخّم بالقدر الكافي
-      // مقارنة بشخص قريب من المايك. ratio=5 يضغط الإشارات العالية أقوى → يقرّب
-      // مستويات الصوت بين المستخدمين. threshold=-30 يمسك حتى الأصوات الهادية نسبياً.
-      // attack=0.003: استجابة أسرع تمنع peaks مفاجئة من تمرير clipping.
-      //
-      // [FIX-COMPRESSOR-PUMPING] release خُفِّض من 0.25s → 0.12s.
-      // release=0.25 كان بيسبب "pumping": بعد أي صوت عالي، الـ 250ms اللي بعده الصوت
-      // الهادي بيتقطع لأن الـ gain لسه بيتعافى. 0.12s أسرع وأطبيعي للكلام.
-      // ratio خُفِّض من 5 → 4: أقل ضغط على الصوت الطبيعي مع الحفاظ على الـ leveling.
+      // [PRO-COMPRESSOR] Leveler — يساوّي مستويات الصوت بين القريب والبعيد.
+      // threshold=-50: بيمسك حتى الأصوات الهادية جداً (صوت بعيد).
+      // knee=18: ناعم جداً → لا يحس المستمع بالضغط، صوت طبيعي.
+      // ratio=4: 4:1 هو المعيار الاحترافي للـ vocal leveling، مش عدواني.
+      // attack=0.002: يمسك الـ peaks بسرعة قبل ما يوصلوا للـ clipping.
+      // release=0.18: طبيعي للكلام — مش سريع (pumping) ومش بطيء (التخانة).
       const compressor = ctx.createDynamicsCompressor();
-      compressor.threshold.value = -45;
-      compressor.knee.value = 10;
-      compressor.ratio.value = 6;
-      compressor.attack.value = 0.003;
-      compressor.release.value = 0.12;
+      compressor.threshold.value = -50;
+      compressor.knee.value = 18;
+      compressor.ratio.value = 4;
+      compressor.attack.value = 0.002;
+      compressor.release.value = 0.18;
 
       source.connect(micGain);
       // [FIX-NOISE-GATE-DESKTOP] على Desktop عطّلنا noiseSuppression عشان التقطع،
@@ -3319,11 +3394,15 @@ export default function Room() {
           "class NoiseGateProcessor extends AudioWorkletProcessor {",
           "  constructor() {",
           "    super();",
-          "    this._hold = 0; this._max = 40; this._open = false; this._gain = 0;",
-          "    this._atk = 1 / (48000 * 0.008);",
-          "    this._rel = 1 / (48000 * 0.120);",
+          // [PRO-GATE] hold=80 frames (~214ms @ 128smp/frame) — ما يقطعش نهايات الكلام
+          "    this._hold = 0; this._max = 80; this._open = false; this._gain = 0;",
+          // attack=4ms — يفتح سريع عشان ما يأكلش أول حرف في الكلمة
+          "    this._atk = 1 / (48000 * 0.004);",
+          // release=250ms — يقفل ببطء → صوت ناعم بدون قطع مفاجئ
+          "    this._rel = 1 / (48000 * 0.250);",
           "    this._noiseFloor = 0.003;",
-          "    this._smoothRms  = 0;",
+          // smoothing أبطأ (0.96/0.04) → تتبع أكثر استقراراً لمستوى الصوت
+          "    this._smoothRms = 0;",
           "  }",
           "  process(inputs, outputs) {",
           "    var inp = inputs[0] && inputs[0][0];",
@@ -3331,17 +3410,23 @@ export default function Room() {
           "    if (!inp || !out) return true;",
           "    var s = 0; for (var i = 0; i < inp.length; i++) s += inp[i] * inp[i];",
           "    var rms = Math.sqrt(s / inp.length);",
-          "    this._smoothRms = this._smoothRms * 0.92 + rms * 0.08;",
+          // smoothing معادل: 0.96 ثقيل → يتجاهل spikes قصيرة ويتبع الصوت الحقيقي
+          "    this._smoothRms = this._smoothRms * 0.96 + rms * 0.04;",
+          // يتعلم الـ noise floor ببطء شديد (0.9999) عشان ما يرفعش مع الكلام
           "    if (!this._open && this._hold === 0) {",
-          "      this._noiseFloor = this._noiseFloor * 0.9997 + this._smoothRms * 0.0003;",
+          "      this._noiseFloor = this._noiseFloor * 0.9999 + this._smoothRms * 0.0001;",
           "    }",
-          "    var threshold = Math.max(0.002, this._noiseFloor * 2.0);",
+          // [PRO-THRESHOLD] 1.4x بدل 2.0x → حساس أكثر للأصوات البعيدة والهادية
+          "    var threshold = Math.max(0.0015, this._noiseFloor * 1.4);",
           "    if (this._smoothRms > threshold) { this._open = true; this._hold = this._max; }",
           "    else if (this._hold > 0) { this._hold--; }",
           "    else { this._open = false; }",
           "    for (var j = 0; j < inp.length; j++) {",
           "      if (this._open) this._gain = Math.min(1, this._gain + this._atk);",
-          "      else            this._gain = Math.max(0, this._gain - this._rel);",
+          // [PRO-FLOOR] min gain = 0.04 (مش 0) → الـ gate مش بيوصل للصمت التام،
+          // بيخفض الضوضاء بس −28dB وده كافي مع الـ NS الأصلي من المتصفح.
+          // النتيجة: صوت أكثر طبيعية، مفيش "قطع" مفاجئ بين الكلام والصمت.
+          "      else            this._gain = Math.max(0.04, this._gain - this._rel);",
           "      out[j] = inp[j] * this._gain;",
           "    }",
           "    return true;",
@@ -3365,9 +3450,29 @@ export default function Room() {
       }
       gateOutputNode.connect(compressor);
 
+      // [PRO-MAKEUP-GAIN] بعد الـ compressor بنضيف makeup gain لتعويض الخسارة
+      // وده هو السر في إن الصوت يبقى عالي جداً مع الـ leveling.
+      // 2.5x (≈+8dB) — يخلي صوت الشخص البعيد يوصل بنفس مستوى القريب.
+      const makeupGain = ctx.createGain();
+      makeupGain.gain.value = 2.5;
+      compressor.connect(makeupGain);
+
+      // [PRO-LIMITER] Brick-wall limiter — بعد الـ makeup gain العالي لازم نمنع الـ clipping.
+      // threshold=-1dBFS: يمنع أي تشويه قبل الـ output بـ 1dB هامش أمان.
+      // ratio=20: تقريباً hard limit (hard clip بيكون ∞:1).
+      // attack=1ms: يمسك الـ peaks اللحظية قبل ما توصل للـ output.
+      // release=50ms: يتعافى سريع بعد الـ peak عشان ما يسحبش الصوت العادي.
+      const limiter = ctx.createDynamicsCompressor();
+      limiter.threshold.value = -1;
+      limiter.knee.value = 0;
+      limiter.ratio.value = 20;
+      limiter.attack.value = 0.001;
+      limiter.release.value = 0.05;
+      makeupGain.connect(limiter);
+
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 2048;
-      compressor.connect(analyser);
+      limiter.connect(analyser);
       analyserRef.current = analyser;
 
       // ── Keep graph alive so analyser stays active ──────────────────────────
@@ -3416,7 +3521,7 @@ export default function Room() {
         await ctx.audioWorklet.addModule(blobUrl);
         URL.revokeObjectURL(blobUrl);
         const workletNode = new AudioWorkletNode(ctx, "mic-chunk-processor");
-        compressor.connect(workletNode);
+        limiter.connect(workletNode);
         // WorkletNode needs a destination to stay in the active graph
         const wSilent = ctx.createGain();
         wSilent.gain.value = 0;
@@ -3432,7 +3537,7 @@ export default function Room() {
       if (!usedWorklet) {
         // Fallback: ScriptProcessor (deprecated, main-thread — only for very old browsers)
         const processor = ctx.createScriptProcessor(4096, 1, 1);
-        compressor.connect(processor);
+        limiter.connect(processor);
         processor.connect(silentGain);
         processor.onaudioprocess = (e: AudioProcessingEvent) => {
           const input = e.inputBuffer.getChannelData(0);
@@ -3453,7 +3558,7 @@ export default function Room() {
       // ملاحظة: micStreamRef.current فاضل raw stream عشان stopMic() تقدر تعمل
       // track.stop() على الـ hardware tracks الحقيقية بشكل صحيح.
       const processedDest = ctx.createMediaStreamDestination();
-      compressor.connect(processedDest);
+      limiter.connect(processedDest);
       const processedStream = processedDest.stream;
 
       void webrtcManagerRef.current?.setStream(processedStream);
