@@ -71,18 +71,6 @@ router.post("/rooms/:code/hyperbeam", async (req, res): Promise<void> => {
     return;
   }
 
-  // If a session already exists for this room, terminate it first before starting a new one
-  const existingSession = roomSessions.get(code.toUpperCase());
-  if (existingSession) {
-    try {
-      await fetch(`https://engine.hyperbeam.com/v0/vm/${existingSession.sessionId}`, {
-        method: "DELETE",
-        headers: { Authorization: `Bearer ${existingSession.apiKey}` },
-      });
-    } catch { /* ignore */ }
-    roomSessions.delete(code.toUpperCase());
-  }
-
   // Try each key starting from the current index (round-robin across sessions)
   let lastError = "";
   for (let i = 0; i < keys.length; i++) {
@@ -96,10 +84,6 @@ router.post("/rooms/:code/hyperbeam", async (req, res): Promise<void> => {
       body: JSON.stringify({
         start_url: "https://www.google.com",
         offline_timeout: 3600,
-        // FIX: تحديد أقصى مدة للجلسة صراحةً — بدون ده Hyperbeam بيطبق
-        // الـ default بتاعه (3600 ثانية = ساعة) حتى لو الكل متصل.
-        // 86400 = 24 ساعة — عدّل الرقم حسب الـ plan بتاعك في Hyperbeam Dashboard.
-        max_duration: 86400,
       }),
     });
 

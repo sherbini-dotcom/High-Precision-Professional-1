@@ -3220,25 +3220,30 @@ export default function Room() {
       micStreamRef.current = stream;
       socketRef.current?.emit("micEnabled");
 
-      // [FIX-IOS-DUCKING-OPEN] iOS بيعمل ducking لكل الأصوات لما getUserMedia يشتغل.
-      // الحل: نضبط الـ audio session على "playback" فوراً بعد فتح المايك،
-      // ثم نعيد تشغيل كل الأصوات اللي اتخفت.
+      // [FIX-IOS-DUCKING-OPEN] iOS بيعمل ducking (يخفّض) كل الأصوات فوراً لما getUserMedia تشتغل.
+      // audioSession.type = "play-and-record" بيخلي iOS يعرف إننا محتاجين الصوتين مع بعض.
       try {
         const navSession = navigator as unknown as { audioSession?: { type: string } };
         if (navSession.audioSession) navSession.audioSession.type = "play-and-record";
       } catch { /* ignore — Safari 17+ only */ }
 
-      // بعد 400ms نرجّع كل الأصوات اللي خفّتها iOS
-      setTimeout(() => {
-        // 1. audioPlayer context
+      // [FIX-IOS-VOLUME-RESTORE] نرجّع الأصوات في 3 موجات:
+      // - فوراً (0ms): بعض النسخ من iOS بترجع الصوت من أول play()
+      // - 400ms: الوقت العادي اللي iOS بيخلّص فيه الـ ducking
+      // - 1000ms: fallback لو الأولانين ما اشتغلوش (أجهزة قديمة / iOS 15)
+      const restoreAllAudio = () => {
+        // 1. audioPlayer WebAudio context
         if (audioPlayerRef.current?.state === "suspended") {
           audioPlayerRef.current.resume().catch(() => {});
         }
-        // 2. فيديو الغرفة — volume bounce يفرض un-duck على iOS
+        // 2. فيديو الغرفة
         const v = videoRef.current;
-        if (v && !v.muted) {
-          const saved = v.volume;
-          v.volume = 0;
+        if (v) {
+          // لو مكتوم forcefully من iOS — فك الكتم
+          if (v.muted) v.muted = false;
+          // volume bounce: iOS بيحتاج تغيير حقيقي في الـ volume يشغّل الـ un-duck
+          const saved = v.volume || 1;
+          v.volume = 0.001;
           requestAnimationFrame(() => {
             v.volume = saved;
             if (!v.paused) v.play().catch(() => {});
@@ -3246,13 +3251,21 @@ export default function Room() {
         }
         // 3. كل عناصر audio (WebRTC peers)
         document.querySelectorAll<HTMLAudioElement>("audio").forEach(el => {
-          if (el.paused && (el.src || el.srcObject)) el.play().catch(() => {});
-          // volume bounce لإجبار iOS على رفع الصوت
-          const sv = el.volume;
-          el.volume = 0;
-          requestAnimationFrame(() => { el.volume = sv; });
+          if (el.muted) el.muted = false;
+          const sv = el.volume || 1;
+          el.volume = 0.001;
+          requestAnimationFrame(() => {
+            el.volume = sv;
+            if (el.paused && (el.src || el.srcObject)) el.play().catch(() => {});
+          });
         });
-      }, 400);
+      };
+      // موجة أولى: فورية
+      restoreAllAudio();
+      // موجة تانية: بعد 400ms (الوقت العادي للـ ducking)
+      setTimeout(restoreAllAudio, 400);
+      // موجة تالتة: fallback للأجهزة البطيئة
+      setTimeout(restoreAllAudio, 1000);
 
       const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       // [FIX-DESKTOP-AUDIO-CUT] لا نحدد sampleRate هنا — نخلي البراوزر يستخدم الـ
