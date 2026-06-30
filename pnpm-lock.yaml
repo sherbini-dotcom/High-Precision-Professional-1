@@ -197,7 +197,7 @@ importers:
         specifier: ^8.0.0
         version: 8.2.0
       mediasoup:
-        specifier: ^3.14.0
+        specifier: ^3.20.10
         version: 3.20.10
       multer:
         specifier: ^2.1.1
