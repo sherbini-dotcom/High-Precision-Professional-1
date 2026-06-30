@@ -661,9 +661,6 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
           const currentOnlineCount = getCachedOnlineMembers(roomCode).length;
           if (currentOnlineCount <= 50) {
             socket.to(roomCode).emit("memberJoined", sanitizeMember({ ...member, isOnline: true }));
-            // FIX WEBRTC: إضافة socketId في peerJoined حتى يقدر الـ host يوجّه الإشارات
-            // الكليان محتاج الـ socketId عشان يبعت webrtcSignal للشخص الصح
-            socket.to(roomCode).emit("peerJoined", { memberId: member.id, socketId: socket.id });
           }
 
           scheduleRoomMembersUpdateOnJoin(roomCode);
@@ -812,17 +809,6 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
       },
     );
 
-    socket.on("speaking", ({ volume }: { volume: number }) => {
-      if (!currentRoomCode || !currentMemberId) return;
-      // [FIX-SPEAKING] Rate-limit to 5/sec on the server side.
-      // Client now sends 5/sec (200 ms interval, matches this limit exactly) but we
-      // guard here too in case an older client version or a misbehaving client spams
-      // the event. Without this, 10+ users × 10 events/sec = 100+ broadcasts/sec per room.
-      if (isSocketRateLimited(socket.id, "speaking", 5)) return;
-      socket
-        .to(currentRoomCode)
-        .emit("speakingUpdate", [{ memberId: currentMemberId, volume }]);
-    });
 
     socket.on("kickMember", async ({ memberId }: { memberId: number }) => {
       if (
@@ -1197,63 +1183,6 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
       }
     });
 
-    // ─── FIX D03-D05: webrtcSignal يقبل targetMemberId أو targetId (backward compat) ─
-    // الكليان القديم كان بيبعت {targetId} لكن السيرفر كان بيتوقع {targetMemberId}
-    // الحل: نقرأ الاتنين ونستخدم أي واحد فيه قيمة
-    socket.on(
-      "webrtcSignal",
-      async ({
-        targetMemberId,
-        targetId,
-        signal,
-      }: {
-        targetMemberId?: number;
-        targetId?: number;
-        signal: unknown;
-      }) => {
-        if (!currentRoomCode || !currentMemberId) return;
-        const resolvedTargetId = targetMemberId ?? targetId;
-        if (resolvedTargetId === undefined) return;
-        try {
-          const sockets = await io.in(currentRoomCode).fetchSockets();
-          for (const s of sockets) {
-            if (s.data.memberId === resolvedTargetId) {
-              s.emit("webrtcSignal", { fromMemberId: currentMemberId, signal });
-              break;
-            }
-          }
-        } catch (err) {
-          logger.error({ err }, "Error in webrtcSignal");
-        }
-      },
-    );
-
-    socket.on("micEnabled", () => {
-      if (!currentRoomCode || !currentMemberId) return;
-      socket
-        .to(currentRoomCode)
-        .emit("peerMicEnabled", { memberId: currentMemberId });
-    });
-
-    socket.on("micDisabled", () => {
-      if (!currentRoomCode || !currentMemberId) return;
-      socket
-        .to(currentRoomCode)
-        .emit("peerMicDisabled", { memberId: currentMemberId });
-    });
-
-    socket.on("audioChunk", (payload: { sr: number; buf: ArrayBuffer; seq?: number; audioTime?: number }) => {
-      if (!currentRoomCode || !currentMemberId) return;
-      // نظام المايك من النسخة البسيطة: volatile يمنع تراكم الـ chunks في الـ buffer
-      // لو المقبس مشغول، يتجاهل الـ chunk بدل ما يبنيلك delay
-      socket.volatile.to(currentRoomCode).emit("audioChunk", {
-        fromMemberId: currentMemberId,
-        sr: payload.sr,
-        buf: payload.buf,
-        seq: payload.seq,
-        audioTime: payload.audioTime,
-      });
-    });
 
     socket.on(
       "changeMode",
@@ -1359,46 +1288,9 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
       socket.to(currentRoomCode).emit("screenShareStopped");
     });
 
-    socket.on(
-      "webrtcInitiateOffer",
-      async ({ targetMemberId }: { targetMemberId: number }) => {
-        if (!currentRoomCode || !currentMemberId) return;
-        try {
-          const sockets = await io.in(currentRoomCode).fetchSockets();
-          for (const s of sockets) {
-            if (s.data.memberId === targetMemberId) {
-              s.emit("webrtcInitiateOffer", { targetMemberId: currentMemberId });
-              break;
-            }
-          }
-        } catch (err) {
-          logger.error({ err }, "Error in webrtcInitiateOffer relay");
-        }
-      },
-    );
 
-    // FIX AUDIO-06: ICE Restart لإعادة الاتصال تلقائياً عند انقطاع WebRTC
-    // لما النت يضعف ويقطع WebRTC، الكليان يطلب ice restart بدل ما ينتظر reconnect كامل
-    // ده بيجدد الـ ICE candidates بسرعة ويستعيد الصوت في ثوانٍ
-    socket.on(
-      "webrtcIceRestart",
-      async ({ targetMemberId }: { targetMemberId: number }) => {
-        if (!currentRoomCode || !currentMemberId) return;
-        try {
-          const sockets = await io.in(currentRoomCode).fetchSockets();
-          for (const s of sockets) {
-            if (s.data.memberId === targetMemberId) {
-              s.emit("webrtcIceRestart", { fromMemberId: currentMemberId });
-              break;
-            }
-          }
-        } catch (err) {
-          logger.error({ err }, "Error in webrtcIceRestart relay");
-        }
-      },
-    );
 
-    socket.on("hyperbeamReady", ({ embedUrl }: { embedUrl: string }) => {
+        socket.on("hyperbeamReady", ({ embedUrl }: { embedUrl: string }) => {
       if (
         !currentRoomCode ||
         (socket.data.role !== "host" && socket.data.role !== "admin")
