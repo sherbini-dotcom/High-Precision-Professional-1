@@ -9,6 +9,7 @@ import {
 } from "@workspace/db";
 import { eq, and, inArray } from "drizzle-orm";
 import { logger } from "./logger";
+import { setupMsHandlers, closeMsPeer } from "./mediasoupSocketHandlers.js";
 import fs from "fs";
 import path from "path";
 
@@ -512,6 +513,13 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
     let currentMemberId: number | null = null;
     let currentRole: string | null = null;
     let currentMemberName: string | null = null;
+
+    // mediasoup SFU signaling — state object uses getters to always read the live closure vars
+    const msState = {
+      get roomCode() { return currentRoomCode; },
+      get memberId() { return currentMemberId; },
+    };
+    setupMsHandlers(socket, io, msState);
 
     socket.on(
       "joinRoom",
@@ -1599,6 +1607,9 @@ export function setupSocketIO(httpServer: HttpServer): SocketIOServer {
       const snapRoomCode = currentRoomCode ?? (socket.data.roomCode as string | undefined) ?? null;
       const snapMemberId = currentMemberId ?? (socket.data.memberId as number | undefined) ?? null;
       const snapRole = currentRole ?? (socket.data.role as string | undefined) ?? null;
+
+      // Clean up mediasoup state for this peer and notify others
+      closeMsPeer(snapRoomCode, snapMemberId, io);
 
       if (!snapMemberId || !snapRoomCode) return;
 

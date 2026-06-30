@@ -6,6 +6,7 @@ import { getSession, saveSession, clearSession } from "@/lib/storage";
 import { connectSocket, disconnectSocket } from "@/lib/socket";
 import type { Socket } from "socket.io-client";
 import { WebRTCManager, getMicStream, type NetworkQuality } from "@/lib/webrtc";
+import { MediasoupClient } from "@/lib/mediasoupClient";
 import type { WebRTCSignal } from "@/lib/webrtc";
 import {
   Film, Upload, Users, Mic, MicOff, Copy, Check, Shield,
@@ -401,6 +402,7 @@ export default function Room() {
   const screenStreamRef = useRef<MediaStream | null>(null);
   const screenVideoRef = useRef<HTMLVideoElement>(null);
   const webrtcManagerRef = useRef<WebRTCManager | null>(null);
+  const mediasoupClientRef = useRef<MediasoupClient | null>(null);
 
   // MOD #10: access control state
   const [accessControlEnabled, setAccessControlEnabled] = useState(false);
@@ -1239,7 +1241,7 @@ export default function Room() {
         micStreamRef.current = null;
         try { scriptProcessorRef.current?.disconnect(); } catch { /* AudioWorkletNode disconnect is safe */ }
         scriptProcessorRef.current = null;
-        void webrtcManagerRef.current?.setStream(null);
+        mediasoupClientRef.current?.stopMic();
         if (audioContextRef.current?.state !== "closed") audioContextRef.current?.close().catch(() => {});
         audioContextRef.current = null;
         analyserRef.current = null;
@@ -1362,9 +1364,9 @@ export default function Room() {
           //    micStreamRef.current is null at this point anyway (recoverDeadMicIfNeeded
           //    already tore it down), and the pending "wp:restartMic" rebuild will call
           //    setStream() on this same manager once a fresh mic stream exists.
-          if (!micWasDead && micEnabledRef.current && micStreamRef.current) {
-            void newManager.setStream(micStreamRef.current);
-          }
+          // [MEDIASOUP] No need to re-attach mic stream on manager recreation —
+          // mediasoup SFU keeps distributing audio independently of P2P WebRTC state.
+          void micWasDead; // suppress unused-var lint
 
           // 2. Re-initiate offers to existing online peers. webrtcInitiatedRef is
           //    set to true once on the FIRST membersUpdate and never reset, so
@@ -1411,13 +1413,7 @@ export default function Room() {
         // [FIX-NEW-PEER-MIC] لما حد جديد يدخل الروم وأنا فاتح المايك،
         // اعمل setStream تاني عشان الـ track يوصله.
         // [FIX-TS-SCOPE] نقلنا الكود جوا الـ if block عشان newlyJoined في scope هنا بس.
-        if (newlyJoined.length > 0 && micEnabledRef.current && micStreamRef.current) {
-          setTimeout(() => {
-            if (micEnabledRef.current && micStreamRef.current) {
-              void webrtcManagerRef.current?.setStream(micStreamRef.current);
-            }
-          }, 800);
-        }
+        // [MEDIASOUP] No per-peer setStream needed — SFU server auto-distributes to new consumers.
       }
       prevOnlineMembersRef.current = new Set(updated.filter(m => m.isOnline).map(m => m.id));
       setMembers(updated);
@@ -1917,6 +1913,28 @@ export default function Room() {
         setTimeout(() => setWelcomeLeaving(true), 2800);
         setTimeout(() => setShowWelcome(false), 3400);
       }
+
+      // [MEDIASOUP] Init SFU client after successful joinRoom, then consume any
+      // producers that were already active before we joined.
+      const session = getSession(code);
+      const myId = session?.memberId ?? 0;
+      if (myId && !mediasoupClientRef.current) {
+        const msClient = new MediasoupClient(socket, code, myId);
+        mediasoupClientRef.current = msClient;
+        msClient.init().then(() => {
+          return new Promise<void>((resolve) => {
+            socket.emit(
+              "ms:getExistingProducers",
+              { roomCode: code },
+              (producers: Array<{ memberId: number; producerId: string }>) => {
+                void msClient.consumeExistingProducers(producers).finally(resolve);
+              },
+            );
+          });
+        }).catch((err: unknown) => {
+          console.error("[mediasoup] init error:", err);
+        });
+      }
     });
     socket.on("chatMessage", (entry: ChatMessage) => {
       setChatMessages(prev => [...prev, entry]);
@@ -1971,6 +1989,8 @@ export default function Room() {
         for (const id of batch) {
           nextAudioTimeRef.current.delete(id);
           webrtcManagerRef.current?.removePeer(id);
+          // [MEDIASOUP] Also clean up SFU audio element for this peer
+          mediasoupClientRef.current?.removePeer(id);
         }
       }, 100); // 100 ms debounce — batches mass-exit cascade into one update
     });
@@ -2002,6 +2022,8 @@ export default function Room() {
       // auto-restart effect (which reads localStorage on mount) can revive the mic.
       const micWasLiveOnUnmount = micEnabledRef.current;
       stopMic();
+      mediasoupClientRef.current?.close();
+      mediasoupClientRef.current = null;
       if (micWasLiveOnUnmount) {
         try { localStorage.setItem(`wp_mic_${code}`, "1"); } catch { /* ignore */ }
       }
@@ -3190,7 +3212,7 @@ export default function Room() {
     if (audioContextRef.current?.state !== "closed") audioContextRef.current?.close().catch(() => {});
     audioContextRef.current = null;
     analyserRef.current = null;
-    void webrtcManagerRef.current?.setStream(null);
+    mediasoupClientRef.current?.stopMic();
     setMicEnabled(false);
     setSpeakingState(prev => ({ ...prev, [myMemberId]: 0 }));
     socketRef.current?.emit("micDisabled");
@@ -3580,7 +3602,8 @@ export default function Room() {
         // النتيجة: في روم فيها 3+ أشخاص، الأعضاء بدون P2P ما بيسمعوش.
         // الحل: دايماً ابعت عبر Socket.IO. جهة الاستقبال تستخدم hasConnectedPeer(fromMemberId)
         // وتتجاهل الـ chunk لو الصوت واصل بالفعل عبر WebRTC (منع double audio).
-        socketRef.current?.volatile.emit("audioChunk", { sr: ctx.sampleRate, buf: int16buf });
+        // [MEDIASOUP] Audio is sent via mediasoup SFU — no Socket.IO audioChunk needed.
+        void int16buf; // suppress unused-var lint
       };
 
       const workletCode = [
@@ -3651,22 +3674,17 @@ export default function Room() {
       limiter.connect(processedDest);
       const processedStream = processedDest.stream;
 
-      void webrtcManagerRef.current?.setStream(processedStream);
+      // [MEDIASOUP] Send audio via SFU instead of P2P WebRTC
+      void mediasoupClientRef.current?.startMic(processedStream).catch((err: unknown) => {
+        console.error("[mediasoup] startMic error:", err);
+      });
 
       setMicEnabled(true);
       setMicError(null);
       try { localStorage.setItem(`wp_mic_${code}`, "1"); } catch { /* ignore */ }
 
-      // [FIX-STREAM-RETRY] لو replaceTrack اشتغل بس الـ ICE مكنش جاهز بعد،
-      // إعادة setStream بعد 3 ثواني — بس بشرط ما تحصلش لو الـ stream اتغيّر
-      // (يعني المستخدم أغلق المايك ورجع فتحه بـ stream جديد بينهم).
-      // الـ retry القديم على 1.5 ثانية كان بيسبب replaceTrack ثاني بيقطع الصوت
-      // عند الكل — نحّيناه للـ 3 ثواني ومع حماية بـ Object.is لضمان نفس الـ stream.
-      setTimeout(() => {
-        if (micEnabledRef.current && micStreamRef.current === stream) {
-          void webrtcManagerRef.current?.setStream(processedStream);
-        }
-      }, 3000);
+      // [MEDIASOUP] No retry needed — mediasoup handles reconnect internally.
+      // (Previous setStream retry is removed)
 
       // [FIX-SPEAKING-LOAD] نبعت speaking event بس لما فيه تغيير حقيقي:
       //   • دخل صوت (vol > 8) أو خرج من صمت

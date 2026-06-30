@@ -74,7 +74,8 @@
     "vaul": "^1.1.2",
     "vite": "catalog:",
     "wouter": "^3.3.5",
-    "zod": "catalog:"
+    "zod": "catalog:",
+    "mediasoup-client": "^3.7.18"
   },
   "dependencies": {
     "@hyperbeam/web": "^0.0.38"
