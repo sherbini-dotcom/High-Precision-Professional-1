@@ -260,11 +260,32 @@ export class WebRTCManager {
   // before this method returns — eliminating the 200-500ms silence window that
   // occurred on iOS/Android when the old fire-and-forget calls returned while the
   // engine was still mid-switch.
-  // [MEDIASOUP] Mic audio is now handled by mediasoup SFU (see mediasoupClient.ts).
-  // This method is intentionally a no-op to preserve call-sites without breaking them.
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  async setStream(_stream: MediaStream | null): Promise<void> {
-    // no-op: mediasoup handles mic audio distribution
+  async setStream(stream: MediaStream | null): Promise<void> {
+    this.localStream = stream;
+    const audioTrack = stream?.getAudioTracks()[0] ?? null;
+    const promises: Promise<void>[] = [];
+    for (const [, entry] of this.peers) {
+      // [FIX-ABR-SCOPE] Use the tracked micAudioSender reference instead of
+      // `senders.find(s => s.track?.kind === "audio")`. The old lookup could
+      // grab the SCREEN-SHARE audio sender by mistake whenever the mic sender's
+      // track was momentarily null (e.g. between toggles) — replacing the
+      // wrong sender's track entirely.
+      if (entry.micAudioSender) {
+        // [FIX-P2] Collect promise instead of fire-and-forget .catch(() => {})
+        promises.push(
+          (audioTrack
+            ? entry.micAudioSender.replaceTrack(audioTrack)
+            : entry.micAudioSender.replaceTrack(null)
+          ).catch(() => {}),
+        );
+      } else if (audioTrack) {
+        // [FIX-P3] Last-resort: createPeer() pre-creates the sender via
+        // addTransceiver so this branch is now rarely hit (only if the peer
+        // was created by a version of the code that didn't pre-create it).
+        entry.micAudioSender = entry.pc.addTrack(audioTrack, stream as MediaStream);
+      }
+    }
+    await Promise.all(promises);
   }
 
   // ─── Screen Share ───────────────────────────────────────────────────────────
@@ -379,10 +400,18 @@ export class WebRTCManager {
     // live track immediately; if it's off, the sender stays with a null track until
     // the user opens the mic.
     //
-    // [MEDIASOUP] Mic audio is handled by mediasoup SFU — no mic transceiver in P2P.
-    // Screen-share audio uses its own transceiver (added in startScreenShare).
-    // micAudioSender stays null for the lifetime of the connection.
-    void entry.micAudioSender; // keep reference to avoid TS "declared but unused" on PeerEntry
+    // [FIX-ABR-SCOPE] Track the sender explicitly as micAudioSender so later
+    // bitrate adjustments (ABR) only ever target the mic, never screen-share audio.
+    {
+      const micTransceiver = pc.addTransceiver("audio", { direction: "sendrecv" });
+      entry.micAudioSender = micTransceiver.sender;
+      if (this.localStream) {
+        const micTrack = this.localStream.getAudioTracks()[0];
+        if (micTrack) {
+          micTransceiver.sender.replaceTrack(micTrack).catch(() => {});
+        }
+      }
+    }
 
     // If screen sharing is already running when a new peer connects, add the tracks now.
     // onnegotiationneeded will fire and send an offer that includes the video (and audio) track.
