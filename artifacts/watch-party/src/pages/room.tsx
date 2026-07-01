@@ -704,6 +704,9 @@ export default function Room() {
   const silentKeepAliveRef = useRef<AudioBufferSourceNode | null>(null);
   const wasPlayingBeforeHiddenRef = useRef(false);
   const nextAudioTimeRef = useRef<Map<number, number>>(new Map());
+  // ref دايماً محدّث بآخر قيم memberVolumes عشان الـ audioChunk handler يقدر يقراه
+  // بدون ما يحتاج يتسجّل من جديد عند كل تغيير في الـ state.
+  const memberVolumesRef = useRef<Record<number, number>>({});
   const micEnabledRef = useRef(false);
   // [FIX-ONLINE-DEBOUNCE] True while a handleOnline-triggered WebRTCManager
   // destroy+rebuild is in progress. Flaky connections (weak Wi-Fi, cellular
@@ -775,6 +778,9 @@ export default function Room() {
       if (raw) setMemberVolumes(JSON.parse(raw) as Record<number, number>);
     } catch { /* ignore */ }
   }, [code]);
+
+  // نخزّن دايماً آخر قيم في الـ ref عشان الـ audioChunk handler يقدر يقراها
+  useEffect(() => { memberVolumesRef.current = memberVolumes; }, [memberVolumes]);
 
   // تطبيق الـ volumes على WebRTC كل ما يتغير memberVolumes أو members
   // (members يتغير لما يتصل peer جديد — فبنضمن الـ volume يتطبق فوراً)
@@ -1829,7 +1835,10 @@ export default function Room() {
         const src = ctx.createBufferSource();
         src.buffer = audioBuf;
         const playGain = ctx.createGain();
-        playGain.gain.value = 1.0; // [FIX-RECV-GAIN] 2.0 كانت تسبب clipping عند الاستقبال
+        // [FIX-MEMBER-VOL] نطبّق الـ volume المحدد من الـ slider على كل chunk.
+        // memberVolumesRef دايماً محدّث حتى لو الـ handler اتسجّل من قبل.
+        const memberVol = (memberVolumesRef.current[fromMemberId] ?? 100) / 100;
+        playGain.gain.value = memberVol;
         src.connect(playGain);
         playGain.connect(ctx.destination);
         const now = ctx.currentTime;
