@@ -317,6 +317,8 @@ export default function Room() {
 
   const [members, setMembers] = useState<Member[]>([]);
   const [speakingState, setSpeakingState] = useState<Record<number, number>>({});
+  // حجم صوت كل member بشكل منفصل (0-100). كل شخص في الروم يتحكم في صوت البقية لنفسه فقط.
+  const [memberVolumes, setMemberVolumes] = useState<Record<number, number>>({});
   // [FIX-LIGHTBOX] بدل window.open() اللي بيتبلوك من المتصفحات مع data: URLs
   const [lightboxImage, setLightboxImage] = useState<string | null>(null);
   // refs للـ lightbox — بنعدّل DOM مباشرة عشان 60fps على موبايل بدون re-render
@@ -763,6 +765,26 @@ export default function Room() {
 
   useEffect(() => { micEnabledRef.current = micEnabled; }, [micEnabled]);
   useEffect(() => { membersRef.current = members; }, [members]);
+
+  // ── Per-member volume ────────────────────────────────────────────────────────
+  // تحميل الـ volumes المحفوظة من localStorage لما الـ code يتحدد
+  useEffect(() => {
+    if (!code) return;
+    try {
+      const raw = localStorage.getItem(`wp_vols_${code}`);
+      if (raw) setMemberVolumes(JSON.parse(raw) as Record<number, number>);
+    } catch { /* ignore */ }
+  }, [code]);
+
+  // تطبيق الـ volumes على WebRTC كل ما يتغير memberVolumes أو members
+  // (members يتغير لما يتصل peer جديد — فبنضمن الـ volume يتطبق فوراً)
+  useEffect(() => {
+    const mgr = webrtcManagerRef.current;
+    if (!mgr) return;
+    for (const [id, vol] of Object.entries(memberVolumes)) {
+      mgr.setRemoteVolume(Number(id), vol / 100);
+    }
+  }, [memberVolumes, members]);
   // Ref so socket handlers always read the latest isPrivileged without re-registering
   const isPrivilegedRef = useRef(isPrivileged);
   useEffect(() => { isPrivilegedRef.current = isPrivileged; }, [isPrivileged]);
@@ -3906,6 +3928,16 @@ export default function Room() {
   const kickMember = (memberId: number) => socketRef.current?.emit("kickMember", { memberId });
   const banMember = (memberId: number) => socketRef.current?.emit("banMember", { memberId });
   const muteMember = (memberId: number, isMuted: boolean) => socketRef.current?.emit("muteMember", { memberId, isMuted });
+
+  // التحكم في صوت member معين محلياً — مش بيأثر على الطرف الآخر، بس على السامع
+  const handleMemberVolume = (memberId: number, vol: number) => {
+    setMemberVolumes(prev => {
+      const next = { ...prev, [memberId]: vol };
+      try { localStorage.setItem(`wp_vols_${code}`, JSON.stringify(next)); } catch { /* ignore */ }
+      return next;
+    });
+    webrtcManagerRef.current?.setRemoteVolume(memberId, vol / 100);
+  };
   const promoteMember = (memberId: number, role: string) => socketRef.current?.emit("promoteMember", { memberId, role });
   const approveJoin = (memberId: number) => {
     socketRef.current?.emit("approveJoin", { memberId });
@@ -5400,7 +5432,8 @@ export default function Room() {
                             animation: "spin 3s linear infinite",
                           }}
                         />
-                      <div className={`relative flex items-center gap-2.5 p-2.5 rounded-[6px] z-10 m-[1.5px] transition-all ${isMe ? "bg-muted" : "bg-card hover:bg-muted/60"}`}>
+                      <div className={`relative flex flex-col rounded-[6px] z-10 m-[1.5px] transition-all ${isMe ? "bg-muted" : "bg-card hover:bg-muted/60"}`}>
+                        <div className="flex items-center gap-2.5 p-2.5">
                         <div className={`relative w-10 h-10 rounded-full bg-muted flex items-center justify-center flex-shrink-0 transition-all ${getRoleRing(member.role)} ${isSpeaking ? "shadow-[0_0_0_3px_rgba(139,92,246,0.5)]" : ""}`}>
                           {member.role === "host"
                             ? <Crown className="w-5 h-5 text-yellow-500" />
@@ -5412,7 +5445,6 @@ export default function Room() {
                           <div className="flex items-center gap-1.5 min-w-0">
                             <span className="text-sm font-semibold truncate">{member.name}{isMe ? " (you)" : ""}</span>
                             {member.isMuted && <MicOff className="w-3 h-3 text-destructive flex-shrink-0" />}
-                            {/* مؤشر جودة الشبكة — يظهر فقط لصاحب الجهاز لما المايك شغّال */}
                             {isMe && micEnabled && networkQuality !== "none" && (
                               <span
                                 className={`w-2 h-2 rounded-full flex-shrink-0 ${getNetworkQualityDotClass(networkQuality)} ${networkQuality === "poor" ? "animate-pulse" : ""}`}
@@ -5458,6 +5490,26 @@ export default function Room() {
                                 </button>
                               </>
                             )}
+                          </div>
+                        )}
+                        </div>
+                        {/* Volume slider — لكل member غير أنا */}
+                        {!isMe && (
+                          <div className="flex items-center gap-2 px-2.5 pb-2">
+                            <Volume2 className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />
+                            <input
+                              type="range"
+                              min={0}
+                              max={100}
+                              step={1}
+                              value={memberVolumes[member.id] ?? 100}
+                              onChange={e => handleMemberVolume(member.id, Number(e.target.value))}
+                              className="flex-1 h-1 rounded-full appearance-none cursor-pointer accent-primary bg-muted"
+                              title={`${memberVolumes[member.id] ?? 100}%`}
+                            />
+                            <span className="text-xs text-muted-foreground w-7 text-right tabular-nums">
+                              {memberVolumes[member.id] ?? 100}%
+                            </span>
                           </div>
                         )}
                       </div>
