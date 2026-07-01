@@ -3463,20 +3463,21 @@ export default function Room() {
       // Desktop: 3.5x (≈+11dB) | Mobile (hardware NS ممتاز): 2.5x (≈+8dB)
       const isDesktopForGain = !(/Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
         (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
-      micGain.gain.value = isDesktopForGain ? 3.5 : 2.5;
+      micGain.gain.value = isDesktopForGain ? 4.5 : 3.5;
 
-      // [PRO-COMPRESSOR] Leveler — يساوّي مستويات الصوت بين القريب والبعيد.
-      // threshold=-50: بيمسك حتى الأصوات الهادية جداً (صوت بعيد).
-      // knee=18: ناعم جداً → لا يحس المستمع بالضغط، صوت طبيعي.
-      // ratio=4: 4:1 هو المعيار الاحترافي للـ vocal leveling، مش عدواني.
-      // attack=0.002: يمسك الـ peaks بسرعة قبل ما يوصلوا للـ clipping.
-      // release=0.18: طبيعي للكلام — مش سريع (pumping) ومش بطيء (التخانة).
+      // [PRO-COMPRESSOR] Peak compressor للـ voice clarity.
+      // threshold=-30: بيضغط الأصوات العالية فقط — الصوت العادي والهادئ بيعدي طبيعي.
+      //   (-50 القديم كان عدواني جداً: بيضغط حتى الهمس ويخلي الصوت "مضغوط" وأقل وضوح)
+      // knee=8: أقل نعومة من 18 → ضغط أكثر وضوح وأقل pump.
+      // ratio=3: 3:1 أكثر طبيعية من 4:1 — يحافظ على dynamics الصوت ويخليه أوضح.
+      // attack=0.003: سريع بما يكفي لمسك الـ peaks بدون أكل أول حرف في الكلمة.
+      // release=0.20: طبيعي للكلام — مش سريع (pumping) ومش بطيء.
       const compressor = ctx.createDynamicsCompressor();
-      compressor.threshold.value = -50;
-      compressor.knee.value = 18;
-      compressor.ratio.value = 4;
-      compressor.attack.value = 0.002;
-      compressor.release.value = 0.18;
+      compressor.threshold.value = -30;
+      compressor.knee.value = 8;
+      compressor.ratio.value = 3;
+      compressor.attack.value = 0.003;
+      compressor.release.value = 0.20;
 
       source.connect(micGain);
       // [FIX-NOISE-GATE-DESKTOP] على Desktop عطّلنا noiseSuppression عشان التقطع،
@@ -3551,11 +3552,10 @@ export default function Room() {
       }
       gateOutputNode.connect(compressor);
 
-      // [PRO-MAKEUP-GAIN] بعد الـ compressor بنضيف makeup gain لتعويض الخسارة
-      // وده هو السر في إن الصوت يبقى عالي جداً مع الـ leveling.
-      // 2.5x (≈+8dB) — يخلي صوت الشخص البعيد يوصل بنفس مستوى القريب.
+      // [PRO-MAKEUP-GAIN] بعد الـ compressor بنضيف makeup gain لتعويض الخسارة.
+      // 3.5x (≈+11dB) — أقوى من القديم (2.5x) عشان يعوض الـ compressor الأقل عدوانية.
       const makeupGain = ctx.createGain();
-      makeupGain.gain.value = 2.5;
+      makeupGain.gain.value = 3.5;
       compressor.connect(makeupGain);
 
       // [PRO-LIMITER] Brick-wall limiter — بعد الـ makeup gain العالي لازم نمنع الـ clipping.

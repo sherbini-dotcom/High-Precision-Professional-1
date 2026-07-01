@@ -185,15 +185,13 @@ function applyOpusParamsToSection(section: string): string {
   if (!match) return section;
   const pt = match[1];
   let out = section.replace(new RegExp(`a=fmtp:${pt}[^\r\n]*\r\n`, "g"), "");
-  // maxaveragebitrate=64000: transparent mono voice; browsers cap higher values anyway
+  // maxaveragebitrate=128000: أقصى جودة صوت على Opus للـ mono — 128kbps هو الحد الأعلى
+  //   الحقيقي للـ mono speech وبيفرق واضح في وضوح الحروف والحضور الصوتي.
   // useinbandfec=1: packet-loss concealment built into the bitstream
-  // usedtx=0: DTX disabled — worklet VAD already handles silence detection;
-  //           Opus DTX can worsen recovery from packet loss (first frame after
-  //           silence has no redundancy protection). Worklet VAD is the sole
-  //           silence gate so we avoid the double-DTX problem.
-  // cbr=0: variable bitrate — fewer bits for silence/simple audio
+  // usedtx=0: DTX disabled — worklet VAD already handles silence detection
+  // cbr=0: variable bitrate — Opus يستخدم البتات الإضافية للجودة مش للصمت
   // minptime=10,ptime=20: 20 ms packetisation — more loss-resilient on weak networks
-  const fmtp = `a=fmtp:${pt} maxaveragebitrate=64000;useinbandfec=1;usedtx=0;cbr=0;minptime=10;ptime=20\r\n`;
+  const fmtp = `a=fmtp:${pt} maxaveragebitrate=128000;useinbandfec=1;usedtx=0;cbr=0;minptime=10;ptime=20\r\n`;
   out = out.replace(
     new RegExp(`(a=rtpmap:${pt} opus/48000[^\r\n]*\r\n)`, "i"),
     `$1${fmtp}`,
@@ -593,7 +591,7 @@ export class WebRTCManager {
   // with kind === "audio", which also caught screenAudioSender — meaning mic
   // packet loss silently throttled screen-share system audio (movie/game sound)
   // down to 24 kbps even when that track's own delivery was perfectly fine.
-  private applyAudioEncodingParams(entry: PeerEntry, maxBitrate = 64_000) {
+  private applyAudioEncodingParams(entry: PeerEntry, maxBitrate = 128_000) {
     const sender = entry.micAudioSender;
     if (!sender) return;
     const params = sender.getParameters();
@@ -716,8 +714,8 @@ export class WebRTCManager {
         if (this.manualBitrate !== null) {
           this.applyAudioEncodingParams(entry, this.manualBitrate);
         } else {
-          // Tiered bitrate: >10% loss → 24kbps (minimum viable), >5% → 32kbps, else 64kbps
-          const targetBitrate = packetLoss > 0.10 ? 24_000 : packetLoss > 0.05 ? 32_000 : 64_000;
+          // Tiered bitrate: >10% loss → 40kbps, >5% → 80kbps, else 128kbps (أقصى جودة)
+          const targetBitrate = packetLoss > 0.10 ? 40_000 : packetLoss > 0.05 ? 80_000 : 128_000;
           this.applyAudioEncodingParams(entry, targetBitrate);
         }
 
@@ -835,7 +833,7 @@ export class WebRTCManager {
       this.manualBitrate = null;
       return;
     }
-    const map = { low: 24_000, mid: 48_000, high: 64_000 } as const;
+    const map = { low: 40_000, mid: 80_000, high: 128_000 } as const;
     this.manualBitrate = map[preset];
     // Apply immediately to all connected peers
     for (const [, entry] of this.peers) {
