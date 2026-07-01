@@ -40,6 +40,15 @@ interface ChatMessage {
   reactions?: Record<string, number[]>;
 }
 
+// تحويل قيمة الـ slider (0-100) لـ gain حقيقي بـ power curve (logarithmic-feel).
+// الأذن بتسمع بشكل لوغاريتمي — بدون الـ curve، 50% بتبان زي "بالكاد صوت".
+// مع x² : 50% → 0.25 gain (~-12dB) ← يحس طبيعي كنص الصوت.
+function volumeToGain(vol: number): number {
+  if (vol <= 0) return 0;
+  if (vol >= 100) return 1;
+  return Math.pow(vol / 100, 2);
+}
+
 function formatTime(sec: number): string {
   if (!isFinite(sec) || isNaN(sec) || sec < 0) return "0:00";
   const h = Math.floor(sec / 3600);
@@ -788,7 +797,7 @@ export default function Room() {
     const mgr = webrtcManagerRef.current;
     if (!mgr) return;
     for (const [id, vol] of Object.entries(memberVolumes)) {
-      mgr.setRemoteVolume(Number(id), vol / 100);
+      mgr.setRemoteVolume(Number(id), volumeToGain(vol));
     }
   }, [memberVolumes, members]);
   // Ref so socket handlers always read the latest isPrivileged without re-registering
@@ -1835,9 +1844,8 @@ export default function Room() {
         const src = ctx.createBufferSource();
         src.buffer = audioBuf;
         const playGain = ctx.createGain();
-        // [FIX-MEMBER-VOL] نطبّق الـ volume المحدد من الـ slider على كل chunk.
-        // memberVolumesRef دايماً محدّث حتى لو الـ handler اتسجّل من قبل.
-        const memberVol = (memberVolumesRef.current[fromMemberId] ?? 100) / 100;
+        // [FIX-MEMBER-VOL] نطبّق الـ volume بـ power curve للحصول على تدرج طبيعي.
+        const memberVol = volumeToGain(memberVolumesRef.current[fromMemberId] ?? 100);
         playGain.gain.value = memberVol;
         src.connect(playGain);
         playGain.connect(ctx.destination);
@@ -3945,7 +3953,7 @@ export default function Room() {
       try { localStorage.setItem(`wp_vols_${code}`, JSON.stringify(next)); } catch { /* ignore */ }
       return next;
     });
-    webrtcManagerRef.current?.setRemoteVolume(memberId, vol / 100);
+    webrtcManagerRef.current?.setRemoteVolume(memberId, volumeToGain(vol));
   };
   const promoteMember = (memberId: number, role: string) => socketRef.current?.emit("promoteMember", { memberId, role });
   const approveJoin = (memberId: number) => {
