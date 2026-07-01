@@ -336,6 +336,8 @@ export default function Room() {
   const lbSt      = useRef({ scale: 1, x: 0, y: 0, lastDist: 0, startX: 0, startY: 0, startTX: 0, startTY: 0, dragging: false });
   // مؤشر جودة الشبكة: good=أخضر / fair=أصفر / poor=أحمر / none=مافيش peers
   const [networkQuality, setNetworkQuality] = useState<NetworkQuality>("none");
+  // جودة الشبكة لكل peer بشكل مستقل — يُستخدم لإظهار badge على كل عضو في اللائحة
+  const [peerNetworkQuality, setPeerNetworkQuality] = useState<Record<number, NetworkQuality>>({});
   const [videoHlsPath, setVideoHlsPath] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [uploadSpeed, setUploadSpeed] = useState<number | null>(null);
@@ -1381,6 +1383,9 @@ export default function Room() {
             },
             (quality) => {
               setNetworkQuality(quality);
+            },
+            (memberId, quality) => {
+              setPeerNetworkQuality(prev => ({ ...prev, [memberId]: quality }));
             },
           );
           webrtcManagerRef.current = newManager;
@@ -3625,6 +3630,14 @@ export default function Room() {
       // Falls back to ScriptProcessor on old browsers.
       const sendChunk = (int16buf: ArrayBuffer) => {
         if (!micEnabledRef.current) return;
+        // [VAD-SOCKET] حساب RMS للـ chunk — لو تحت عتبة الصمت ما نبعتش عبر Socket.IO.
+        // بيوفر ~50-70% من الـ bandwidth في المحادثات العادية (بدون صوت أو توقفات).
+        // الـ WebRTC DTX بيعمل نفس الشيء على مستوى الـ RTP — الاثنين يكملوا بعض.
+        const int16 = new Int16Array(int16buf);
+        let rmsSum = 0;
+        for (let i = 0; i < int16.length; i++) rmsSum += (int16[i] / 32767) ** 2;
+        const rms = Math.sqrt(rmsSum / int16.length);
+        if (rms < 0.008) return; // صامت — تجاهل (0.008 ≈ -42dBFS)
         // [FIX-MULTIROOM-SEND] hasConnectedPeers() كانت بتوقف Socket.IO بمجرد ما
         // أي peer واحد يكون متصل P2P — حتى لو باقي الأعضاء مش عندهم WebRTC.
         // النتيجة: في روم فيها 3+ أشخاص، الأعضاء بدون P2P ما بيسمعوش.
@@ -4047,6 +4060,12 @@ export default function Room() {
           setRemoteScreenStream(null);
           setMode("video");
         }
+      },
+      (quality) => {
+        setNetworkQuality(quality);
+      },
+      (memberId, quality) => {
+        setPeerNetworkQuality(prev => ({ ...prev, [memberId]: quality }));
       },
     );
     webrtcManagerRef.current = manager;
@@ -5466,6 +5485,12 @@ export default function Room() {
                               <span
                                 className={`w-2 h-2 rounded-full flex-shrink-0 ${getNetworkQualityDotClass(networkQuality)} ${networkQuality === "poor" ? "animate-pulse" : ""}`}
                                 title={getNetworkQualityLabel(networkQuality)}
+                              />
+                            )}
+                            {!isMe && peerNetworkQuality[member.id] && peerNetworkQuality[member.id] !== "good" && (
+                              <span
+                                className={`w-2 h-2 rounded-full flex-shrink-0 ${getNetworkQualityDotClass(peerNetworkQuality[member.id])} ${peerNetworkQuality[member.id] === "poor" ? "animate-pulse" : ""}`}
+                                title={`${member.name}: ${getNetworkQualityLabel(peerNetworkQuality[member.id])}`}
                               />
                             )}
                           </div>

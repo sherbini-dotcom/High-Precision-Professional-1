@@ -188,10 +188,14 @@ function applyOpusParamsToSection(section: string): string {
   // maxaveragebitrate=128000: أقصى جودة صوت على Opus للـ mono — 128kbps هو الحد الأعلى
   //   الحقيقي للـ mono speech وبيفرق واضح في وضوح الحروف والحضور الصوتي.
   // useinbandfec=1: packet-loss concealment built into the bitstream
-  // usedtx=0: DTX disabled — worklet VAD already handles silence detection
+  // usedtx=1: DTX enabled — Opus يوقف الـ RTP packets أثناء الصمت/التوقفات بين الكلام،
+  //   بيقلل الـ packet rate بنسبة ~50% في المحادثات العادية. بيخفف ضغط الشبكة بشكل كبير
+  //   على الاتصالات الضعيفة ويديها مجال لنقل الـ speech packets بشكل أفضل.
+  //   الـ worklet VAD بيوقف الـ Socket.IO chunks — DTX بيوقف الـ WebRTC RTP packets.
+  //   الاثنين يكملوا بعض.
   // cbr=0: variable bitrate — Opus يستخدم البتات الإضافية للجودة مش للصمت
   // minptime=10,ptime=20: 20 ms packetisation — more loss-resilient on weak networks
-  const fmtp = `a=fmtp:${pt} maxaveragebitrate=128000;useinbandfec=1;usedtx=0;cbr=0;minptime=10;ptime=20\r\n`;
+  const fmtp = `a=fmtp:${pt} maxaveragebitrate=128000;useinbandfec=1;usedtx=1;cbr=0;minptime=10;ptime=20\r\n`;
   out = out.replace(
     new RegExp(`(a=rtpmap:${pt} opus/48000[^\r\n]*\r\n)`, "i"),
     `$1${fmtp}`,
@@ -219,6 +223,8 @@ function applyOpusParams(sdp: string): string {
 export type NetworkQuality = "good" | "fair" | "poor" | "none";
 
 type NetworkQualityCallback = (quality: NetworkQuality) => void;
+// callback بيطلع جودة الشبكة لكل peer بشكل مستقل — يُستخدم لإظهار badge على كل عضو.
+type PeerNetworkQualityCallback = (memberId: number, quality: NetworkQuality) => void;
 
 export class WebRTCManager {
   private peers = new Map<number, PeerEntry>();
@@ -227,6 +233,7 @@ export class WebRTCManager {
   private sendSignal: SignalSender;
   private onRemoteScreenStream: ScreenStreamCallback | null;
   private onNetworkQuality: NetworkQualityCallback | null;
+  private onPeerNetworkQuality: PeerNetworkQualityCallback | null;
   // Cache remote video streams so stop→restart reuse the same stream object
   private remoteVideoStreams = new Map<number, MediaStream>();
   // [FIX-ABR-WORST-QUALITY] Last computed NetworkQuality per peer, kept up to
@@ -246,10 +253,12 @@ export class WebRTCManager {
     sendSignal: SignalSender,
     onRemoteScreenStream?: ScreenStreamCallback,
     onNetworkQuality?: NetworkQualityCallback,
+    onPeerNetworkQuality?: PeerNetworkQualityCallback,
   ) {
     this.sendSignal = sendSignal;
     this.onRemoteScreenStream = onRemoteScreenStream ?? null;
     this.onNetworkQuality = onNetworkQuality ?? null;
+    this.onPeerNetworkQuality = onPeerNetworkQuality ?? null;
   }
 
   // [FIX-P2] async so callers can await the full track-switch before proceeding.
@@ -722,9 +731,11 @@ export class WebRTCManager {
         // ── Network Quality Indicator ────────────────────────────────────────
         // نطلق الـ callback مع جودة الشبكة بناءً على packet loss.
         // نستخدم worst-case لو فيه أكثر من peer: لو أي اتصال ضعيف يظهر أحمر.
-        if (this.onNetworkQuality) {
+        if (this.onNetworkQuality || this.onPeerNetworkQuality) {
           const quality: NetworkQuality =
             packetLoss > 0.10 ? "poor" : packetLoss > 0.05 ? "fair" : "good";
+          // per-peer callback: يُستخدم لإظهار badge جودة الشبكة على كل عضو في اللائحة
+          if (this.onPeerNetworkQuality) this.onPeerNetworkQuality(memberId, quality);
           // [FIX-ABR-WORST-QUALITY] خزّن جودة هذا الـ peer ثم احسب الـ worst-case
           // الحقيقي من بين كل الـ peers المتصلين باستخدام آخر قيمة مخزّنة لكل
           // واحد منهم. الكود القديم كان يعيد قراءة نفس المتغير (worstQuality)
@@ -742,7 +753,7 @@ export class WebRTCManager {
             if (RANK[q] > RANK[worstQuality]) worstQuality = q;
           }
           if (!sawConnectedPeer) worstQuality = "none";
-          this.onNetworkQuality(worstQuality);
+          if (this.onNetworkQuality) this.onNetworkQuality(worstQuality);
         }
       } catch { /* ignore — peer may be closing */ }
     // [FIX-ABR-INTERVAL] Reduced from 5s → 3s: faster detection of network
