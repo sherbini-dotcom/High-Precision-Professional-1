@@ -3312,9 +3312,28 @@ export default function Room() {
     const myMember = membersRef.current.find(m => m.id === myMemberId);
     if (myMember?.isMuted) return;
     try {
-      // [FIX-IOS-DUCKING-EARLY] نضبط audioSession قبل getUserMedia مش بعدها.
-      // لو حددناها بعد ما iOS غير الـ category لـ "recording" — الـ ducking بيحصل خلال الـ getUserMedia
-      // نفسها. بالتحديد المبكر هنا، iOS بيعرف إننا محتاجين audio+mic مع بعض ومش بيحتاج يغير الـ session.
+      // [FIX-IOS-PRIME-SESSION] الحل الأساسي لـ audio ducking على iOS:
+      // نشغّل audio عبر الـ AudioContext الموجود قبل getMicStream() — ده بيعمل
+      // iOS audio session نشطة كـ "playback" BEFORE ما المايك يتفتح.
+      // لما getUserMedia تشتغل بعدين، iOS يلاقي session موجودة ويضيف المايك عليها
+      // بـ MixWithOthers بدل ما يعمل session جديدة بـ DuckOthers.
+      // بدون الـ priming ده، مافيش session → iOS يعمل واحدة جديدة → ducking.
+      try {
+        const AudioCtxClass = window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        const primerCtx = audioPlayerRef.current ?? new AudioCtxClass();
+        if (primerCtx.state === "suspended") await primerCtx.resume().catch(() => {});
+        // نشغّل 1 ثانية silence عشان iOS يسجّل الـ session كـ "playback" نشطة
+        const primerBuf = primerCtx.createBuffer(1, primerCtx.sampleRate, primerCtx.sampleRate);
+        const primerSrc = primerCtx.createBufferSource();
+        primerSrc.buffer = primerBuf;
+        primerSrc.connect(primerCtx.destination);
+        primerSrc.start(0);
+        // خزّن الـ context لو مش موجود
+        if (!audioPlayerRef.current) audioPlayerRef.current = primerCtx;
+      } catch { /* ignore — non-critical */ }
+
+      // [FIX-IOS-DUCKING-EARLY] audioSession API كـ belt-and-suspenders (Safari 17+)
       try {
         const navSessionEarly = navigator as unknown as { audioSession?: { type: string } };
         if (navSessionEarly.audioSession) navSessionEarly.audioSession.type = "play-and-record";
@@ -3343,15 +3362,12 @@ export default function Room() {
         // 2. فيديو الغرفة
         const v = videoRef.current;
         if (v) {
-          // لو مكتوم forcefully من iOS — فك الكتم
           if (v.muted) v.muted = false;
-          // volume bounce: iOS بيحتاج تغيير حقيقي في الـ volume يشغّل الـ un-duck
+          // [FIX-IOS-NO-PLAY-ON-PLAYING] v.play() على فيديو شغّال بيعمل micro-interrupt
+          // على iOS → تقطع في الصوت. volume bounce كافي لـ un-duck.
           const saved = v.volume || 1;
           v.volume = 0.001;
-          requestAnimationFrame(() => {
-            v.volume = saved;
-            if (!v.paused) v.play().catch(() => {});
-          });
+          requestAnimationFrame(() => { v.volume = saved; });
         }
         // 3. كل عناصر audio (WebRTC peers)
         document.querySelectorAll<HTMLAudioElement>("audio").forEach(el => {
