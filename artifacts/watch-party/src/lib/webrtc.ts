@@ -152,8 +152,13 @@ export async function getMicStream(): Promise<MediaStream> {
     });
   } catch { /* fall through */ }
 
-  // Tier 3: absolute minimum — last resort for old/unsupported browsers
-  return navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+  // Tier 3: absolute minimum — last resort for old/unsupported browsers.
+  // [FIX-IOS-DUCK-T3] يجب تعطيل echoCancellation/noiseSuppression حتى هنا على iOS!
+  // بدون القيود iOS بيفعّل hardware EC → DuckOthers → ducking مضمون.
+  return navigator.mediaDevices.getUserMedia({
+    audio: isIOS ? { echoCancellation: false, noiseSuppression: false } : true,
+    video: false,
+  });
 }
 
 

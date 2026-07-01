@@ -3356,25 +3356,33 @@ export default function Room() {
     const myMember = membersRef.current.find(m => m.id === myMemberId);
     if (myMember?.isMuted) return;
     try {
-      // [FIX-IOS-PRIME-SESSION] الحل الأساسي لـ audio ducking على iOS:
-      // نشغّل audio عبر الـ AudioContext الموجود قبل getMicStream() — ده بيعمل
-      // iOS audio session نشطة كـ "playback" BEFORE ما المايك يتفتح.
-      // لما getUserMedia تشتغل بعدين، iOS يلاقي session موجودة ويضيف المايك عليها
-      // بـ MixWithOthers بدل ما يعمل session جديدة بـ DuckOthers.
-      // بدون الـ priming ده، مافيش session → iOS يعمل واحدة جديدة → ducking.
+      // [FIX-IOS-PRIME-SESSION-V2] الإصلاح المحسّن لـ audio ducking على iOS:
+      // المشكلة في الإصلاح السابق:
+      //   1. الـ primer كان non-looping (1 ثانية) → ممكن يخلص قبل ما getUserMedia تنتهي
+      //      (خاصة لما بيطلع permission dialog → 1-3 ثوان إضافية)
+      //   2. لا يوجد delay — getMicStream بيشتغل قبل ما iOS يسجّل الـ session
+      //
+      // الحل الصحيح:
+      //   1. loop = true: الـ primer يفضل شغّال طول ما getUserMedia تشتغل
+      //   2. await 80ms: نديه iOS وقت يسجّل الـ playback session قبل ما نطلب المايك
+      //   3. بعد ما نجيب الـ stream، نوقف الـ primer
+      let iosPrimerSrc: AudioBufferSourceNode | null = null;
       try {
         const AudioCtxClass = window.AudioContext ||
           (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
         const primerCtx = audioPlayerRef.current ?? new AudioCtxClass();
         if (primerCtx.state === "suspended") await primerCtx.resume().catch(() => {});
-        // نشغّل 1 ثانية silence عشان iOS يسجّل الـ session كـ "playback" نشطة
-        const primerBuf = primerCtx.createBuffer(1, primerCtx.sampleRate, primerCtx.sampleRate);
+        // buffer بـ 2 ثانية + loop=true: يضمن بقاء الـ session نشطة طول getUserMedia
+        const primerBuf = primerCtx.createBuffer(1, primerCtx.sampleRate * 2, primerCtx.sampleRate);
         const primerSrc = primerCtx.createBufferSource();
         primerSrc.buffer = primerBuf;
+        primerSrc.loop = true; // [KEY-FIX] ما يقفش حتى بعد getUserMedia تنتهي
         primerSrc.connect(primerCtx.destination);
         primerSrc.start(0);
-        // خزّن الـ context لو مش موجود
+        iosPrimerSrc = primerSrc;
         if (!audioPlayerRef.current) audioPlayerRef.current = primerCtx;
+        // [KEY-FIX] 80ms delay: نديه iOS وقت يسجّل الـ playback session
+        await new Promise<void>(r => setTimeout(r, 80));
       } catch { /* ignore — non-critical */ }
 
       // [FIX-IOS-DUCKING-EARLY] audioSession API كـ belt-and-suspenders (Safari 17+)
@@ -3384,6 +3392,8 @@ export default function Room() {
       } catch { /* Safari 17+ only — ignore on older */ }
 
       const stream = await getMicStream();
+      // [KEY-FIX] وقّف الـ looping primer بعد ما عندنا الـ stream — مهمته خلصت
+      try { iosPrimerSrc?.stop(0); } catch { /* ignore */ }
       micStreamRef.current = stream;
       socketRef.current?.emit("micEnabled");
 
