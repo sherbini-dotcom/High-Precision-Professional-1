@@ -3218,41 +3218,34 @@ export default function Room() {
       if (nav.audioSession) nav.audioSession.type = "playback";
     } catch { /* ignore — Safari 17+ only */ }
 
-    // Step 2: silent audio trick — يجبر iOS يرفع الـ session ducking فوراً
+    // Step 2: silent audio trick — يجبر iOS يرفع الـ session ducking فوراً.
+    // [FIX-IOS-SILENT-DURATION] Buffer كان 1 sample (0.045ms) — iOS مش بيلاحظه.
+    // رفعناه لـ 0.5 ثانية عشان iOS يتعرف على الـ session ويعمل switch فعلي.
     const forceIOSAudioSessionRestore = () => {
       try {
         const AudioCtxClass = window.AudioContext ||
           (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
         const silentCtx = new AudioCtxClass();
-        const buf = silentCtx.createBuffer(1, 1, 22050);
+        const duration = Math.ceil(silentCtx.sampleRate * 0.5); // 0.5 ثانية
+        const buf = silentCtx.createBuffer(1, duration, silentCtx.sampleRate);
         const src = silentCtx.createBufferSource();
         src.buffer = buf;
         src.connect(silentCtx.destination);
         src.start(0);
-        // أغلق الـ context بعد ما يشتغل — مش محتاجينه بعد كده
         src.onended = () => silentCtx.close().catch(() => {});
       } catch { /* ignore */ }
     };
 
-    // Step 3: بعد ما iOS يرفع الـ ducking، نعمل pause→play على الفيديو
-    // عشان يعيد ربط الصوت بالـ audio session الجديدة (playback بدل play-and-record)
+    // Step 3: restore صوت الفيديو بـ volume bounce فقط — بدون pause→play.
+    // [FIX-IOS-NO-PAUSE] الكود القديم كان بيعمل v.pause() ثم v.play() جوه setTimeout.
+    // على iOS، v.play() جوه setTimeout مش user gesture → iOS بيرفضها بـ NotAllowedError
+    // والفيديو بيفضل واقف تماماً والصوت بيضيع. الحل: volume bounce فقط بدون pause.
     const restoreVideoAudio = () => {
       const v = videoRef.current;
-      if (v && !v.paused && !v.muted) {
-        const savedTime = v.currentTime;
-        const savedVol = v.volume || 1;
-        v.pause();
-        requestAnimationFrame(() => {
-          v.volume = savedVol;
-          v.currentTime = savedTime;
-          v.play().catch(() => {});
-        });
-      } else if (v && !v.muted) {
-        // لو الفيديو واقف أصلاً — volume bounce كافي
-        const savedVol = v.volume || 1;
-        v.volume = 0.001;
-        requestAnimationFrame(() => { v.volume = savedVol; });
-      }
+      if (!v || v.muted) return;
+      const savedVol = v.volume || 1;
+      v.volume = 0.001;
+      requestAnimationFrame(() => { v.volume = savedVol; });
     };
 
     // Step 4: WebRTC peer audio elements
@@ -3287,28 +3280,30 @@ export default function Room() {
       } catch { /* cross-origin — ignore */ }
     };
 
-    // التسلسل: silent trick أول (يرفع الـ session) → بعدين نرجّع كل مصادر الصوت
-    forceIOSAudioSessionRestore();                          // فوري
-    setTimeout(() => {
+    // [FIX-IOS-RESTORE-SEQUENCE] تسلسل الـ restore:
+    // 1. silent trick فوراً (يبدأ إخبار iOS بالـ session switch)
+    // 2. موجات متكررة كل 200-500ms لمدة 3 ثواني تضمن الـ restore حتى على الأجهزة الأبطأ
+    // 3. volume bounce على الفيديو بدون pause — آمن في كل بيئة
+
+    const restoreAll = () => {
       restoreAudioContext();
-      restorePeerAudio();
-      restoreHyperbeam();
-    }, 100);
-    setTimeout(() => {
-      restoreVideoAudio();   // pause→play بعد 300ms: iOS بيحتاج وقت يطبق الـ session switch
-      restoreHyperbeam();
-    }, 300);
-    setTimeout(() => {
-      forceIOSAudioSessionRestore(); // موجة تانية من الـ silent trick للأجهزة الأبطأ
-      restoreAudioContext();
-      restorePeerAudio();
-      restoreHyperbeam();
-    }, 700);
-    setTimeout(() => {
       restoreVideoAudio();
-      restoreAudioContext();
+      restorePeerAudio();
       restoreHyperbeam();
-    }, 1500);
+    };
+
+    // موجة أولى: فورية
+    forceIOSAudioSessionRestore();
+    restoreAll();
+
+    // موجات متتالية: iOS بيحتاج من 200ms لـ 1.5 ثانية حسب الجهاز والـ iOS version
+    const delays = [200, 500, 900, 1500, 2500];
+    for (const delay of delays) {
+      setTimeout(() => {
+        if (delay === 500 || delay === 1500) forceIOSAudioSessionRestore();
+        restoreAll();
+      }, delay);
+    }
   }, [myMemberId]);
 
 
