@@ -733,6 +733,16 @@ export default function Room() {
   // fires on return. This flag lets handleForeground force a recovery even when
   // the track LOOKS healthy, since we know it was interrupted.
   const micWasOnBeforeHiddenRef = useRef(false);
+  // Timestamp (ms) when the document last went hidden. Used to measure how long
+  // the tab was backgrounded so brief iOS audio-session interruptions (<5 s) don't
+  // trigger a full mic rebuild — iOS fires visibilitychange rapidly when the mic is
+  // active (AVAudioSession category changes), which was causing repeated offline/online cycles.
+  const hiddenAtRef = useRef<number>(0);
+  // Debounce guard for handleForeground. iOS fires visibilitychange in rapid bursts
+  // when the mic's audio session interrupts the app. Without this, each burst triggers
+  // a socket zombie probe + possible mic teardown, producing the "offline/online loop"
+  // the user sees on iPhone whenever the mic is open.
+  const lastForegroundRef = useRef<number>(0);
   const membersRef = useRef<Member[]>([]);
   // NTP-style clock offset: server_clock - local_clock (ms)
   const serverClockOffsetRef = useRef<number>(0);
@@ -1148,6 +1158,15 @@ export default function Room() {
     // and the network online event. Recovers audio, video, socket, and mic after the
     // app returns from the background or after a network interruption.
     const handleForeground = () => {
+      // [FIX-IOS-MIC-LOOP] Debounce: iOS fires visibilitychange in rapid bursts while
+      // the mic's AVAudioSession is active (e.g. audio route changes, Siri, brief locks).
+      // Each burst previously triggered a socket zombie probe + potential mic teardown,
+      // producing an endless offline/online loop on iPhone when the mic was open.
+      // Allow at most one handleForeground run every 2 seconds.
+      const now = Date.now();
+      if (now - lastForegroundRef.current < 2000) return;
+      lastForegroundRef.current = now;
+
       // 0. [FIX-IOS-RECONNECT] ICE restart فوري لما المستخدم يرجع من الـ background.
       //    الكود القديم كان ينتظر 5 ثواني قبل ICE restart (في onconnectionstatechange)
       //    + 500ms للـ WebRTCManager destroy/recreate = أكثر من 10 ثواني تأخير على iOS.
@@ -1270,9 +1289,19 @@ export default function Room() {
       // read "live" and muted may be false again — making the track LOOK healthy
       // even though audio capture has stopped. If we know the mic was on before
       // the app was backgrounded, force a full rebuild to be safe.
+      //
+      // [FIX-IOS-MIC-LOOP] However, iOS fires visibilitychange rapidly while the mic
+      // AVAudioSession is active (audio route changes, brief interruptions). These
+      // sub-second hides do NOT kill the mic track — forcing a rebuild every time was
+      // the root cause of the "offline/online loop on iPhone with mic open" bug.
+      // Only treat backgrounding as a forced rebuild trigger when the tab was hidden
+      // for more than 5 seconds, which is long enough for iOS to actually terminate
+      // the capture session. For short hides we still rely on trackDead / !stream.active.
       const backgroundedWithMicOn = micWasOnBeforeHiddenRef.current;
       micWasOnBeforeHiddenRef.current = false; // consume the flag
-      if (!stream || !stream.active || trackDead || backgroundedWithMicOn) {
+      const hiddenDurationMs = hiddenAtRef.current > 0 ? Date.now() - hiddenAtRef.current : 0;
+      const longBackground = backgroundedWithMicOn && hiddenDurationMs > 5000;
+      if (!stream || !stream.active || trackDead || longBackground) {
         if (micIntervalRef.current) { clearInterval(micIntervalRef.current); micIntervalRef.current = null; }
         stream?.getTracks().forEach(t => t.stop());
         micStreamRef.current = null;
@@ -1313,6 +1342,11 @@ export default function Room() {
         // even though audio capture has stopped. We need this flag to force a
         // recovery in recoverDeadMicIfNeeded() regardless of apparent track health.
         micWasOnBeforeHiddenRef.current = micEnabledRef.current;
+        // [FIX-IOS-MIC-LOOP] Record when we went hidden so recoverDeadMicIfNeeded
+        // can measure the hide duration. Brief iOS audio-session interruptions
+        // (<5 s) fire visibilitychange but do NOT kill the mic track — we should
+        // NOT force a full rebuild for those (was causing the offline/online loop).
+        hiddenAtRef.current = Date.now();
       } else {
         handleForeground();
       }
