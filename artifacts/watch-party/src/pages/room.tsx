@@ -1375,7 +1375,23 @@ export default function Room() {
     // online: fires when the device regains network connectivity after being
     // offline (airplane mode, lost WiFi, etc.). Force a clean reconnect so the
     // socket doesn't linger in a broken state waiting for the next ping cycle.
+    //
+    // [FIX-ONLINE-LOOP] On flaky WiFi/cellular the browser can fire "online"
+    // repeatedly within milliseconds of itself (well-known browser quirk —
+    // same class of issue documented above for visibilitychange). Without a
+    // debounce, EVERY firing forced an immediate socket.disconnect() +
+    // reconnect 200ms later — while that reconnect was still in flight, the
+    // next "online" event disconnected it again, producing an endless
+    // offline → reconnect → offline cycle at the same moment (the loop
+    // reported after the mic-recovery logic was added to this handler).
+    // handleForeground already guards against this exact pattern with
+    // lastForegroundRef; reuse it here since both paths do the same class of
+    // "network came back" recovery and should never run back-to-back anyway.
     const handleOnline = () => {
+      const now = Date.now();
+      if (now - lastForegroundRef.current < 2000) return;
+      lastForegroundRef.current = now;
+
       const s = socketRef.current;
       if (!s) return;
       if (!s.connected) {
