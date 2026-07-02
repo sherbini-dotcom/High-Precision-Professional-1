@@ -367,6 +367,14 @@ export default function Room() {
   const iosFullscreenTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isIOSDevice = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
     (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  // True when running as a home-screen PWA (standalone display mode).
+  // In PWA mode on iOS, WKWebView does NOT have background audio entitlements —
+  // getUserMedia capture is suspended immediately when the user switches apps,
+  // unlike Mobile Safari which keeps the audio session alive. We use this flag
+  // to always rebuild the mic on foreground (instead of requiring > 5 s hidden).
+  const isPWA =
+    window.matchMedia("(display-mode: standalone)").matches ||
+    (navigator as unknown as { standalone?: boolean }).standalone === true;
   const isMobileDevice = isIOSDevice || /Android/i.test(navigator.userAgent) || navigator.maxTouchPoints > 1;
   // FIX-DESKTOP-FULLSCREEN: على iOS نحتاج تبديل الـ container لما isBrowserFullscreen يتغير،
   // لذلك نمرره كـ dep. على desktop، native fullscreen يكفي بدون إعادة mount للـ SDK،
@@ -1300,8 +1308,13 @@ export default function Room() {
       const backgroundedWithMicOn = micWasOnBeforeHiddenRef.current;
       micWasOnBeforeHiddenRef.current = false; // consume the flag
       const hiddenDurationMs = hiddenAtRef.current > 0 ? Date.now() - hiddenAtRef.current : 0;
-      const longBackground = backgroundedWithMicOn && hiddenDurationMs > 5000;
-      if (!stream || !stream.active || trackDead || longBackground) {
+      // PWA standalone mode: iOS suspends getUserMedia capture immediately when the
+      // user switches apps (WKWebView has no background audio entitlement, unlike Safari).
+      // Always rebuild the mic on return from background in PWA mode.
+      // Non-PWA (Safari / desktop): only rebuild if hidden > 5 s to avoid triggering
+      // a full rebuild on every brief iOS audio-session interruption (the mic-loop bug).
+      const forceRebuild = backgroundedWithMicOn && (hiddenDurationMs > 5000 || isPWA);
+      if (!stream || !stream.active || trackDead || forceRebuild) {
         if (micIntervalRef.current) { clearInterval(micIntervalRef.current); micIntervalRef.current = null; }
         stream?.getTracks().forEach(t => t.stop());
         micStreamRef.current = null;
