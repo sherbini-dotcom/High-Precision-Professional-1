@@ -3559,12 +3559,14 @@ export default function Room() {
       micSourceNodeRef.current = source;
 
       const micGain = ctx.createGain();
-      // [PRO-GAIN] رفعنا الـ gain لالتقاط الأصوات البعيدة — الـ limiter في الآخر
-      // بيمنع الـ clipping حتى مع gain عالي، فأمان نرفعه هنا.
-      // Desktop: 3.5x (≈+11dB) | Mobile (hardware NS ممتاز): 2.5x (≈+8dB)
+      // Desktop gain raised: browser noiseSuppression is now OFF for desktop, so we
+      // receive the raw mic signal without pre-processing. Higher gain compensates and
+      // ensures distant voices cross the noise gate threshold before the gate sees them.
+      // Limiter at the end prevents clipping regardless of gain level.
+      // Desktop: 8.0x (≈+18dB) | Mobile: 3.5x (hardware NS does the heavy lifting)
       const isDesktopForGain = !(/Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
         (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1));
-      micGain.gain.value = isDesktopForGain ? 4.5 : 3.5;
+      micGain.gain.value = isDesktopForGain ? 8.0 : 3.5;
 
       // [PRO-COMPRESSOR] Peak compressor للـ voice clarity.
       // threshold=-30: بيضغط الأصوات العالية فقط — الصوت العادي والهادئ بيعدي طبيعي.
@@ -3597,14 +3599,14 @@ export default function Room() {
           "class NoiseGateProcessor extends AudioWorkletProcessor {",
           "  constructor() {",
           "    super();",
-          // [PRO-GATE] hold=80 frames (~214ms @ 128smp/frame) — ما يقطعش نهايات الكلام
-          "    this._hold = 0; this._max = 80; this._open = false; this._gain = 0;",
-          // attack=4ms — يفتح سريع عشان ما يأكلش أول حرف في الكلمة
-          "    this._atk = 1 / (48000 * 0.004);",
-          // release=250ms — يقفل ببطء → صوت ناعم بدون قطع مفاجئ
-          "    this._rel = 1 / (48000 * 0.250);",
-          "    this._noiseFloor = 0.003;",
-          // smoothing أبطأ (0.96/0.04) → تتبع أكثر استقراراً لمستوى الصوت
+          // hold=120 frames (~320ms) — more tail time so word endings aren't clipped
+          "    this._hold = 0; this._max = 120; this._open = false; this._gain = 0;",
+          // attack=3ms — fast open so first consonant is never eaten
+          "    this._atk = 1 / (48000 * 0.003);",
+          // release=350ms — slow close for natural tail on distant/quiet voices
+          "    this._rel = 1 / (48000 * 0.350);",
+          // Lower initial floor (browser NS is off, so raw signal is cleaner)
+          "    this._noiseFloor = 0.0015;",
           "    this._smoothRms = 0;",
           "  }",
           "  process(inputs, outputs) {",
@@ -3613,23 +3615,22 @@ export default function Room() {
           "    if (!inp || !out) return true;",
           "    var s = 0; for (var i = 0; i < inp.length; i++) s += inp[i] * inp[i];",
           "    var rms = Math.sqrt(s / inp.length);",
-          // smoothing معادل: 0.96 ثقيل → يتجاهل spikes قصيرة ويتبع الصوت الحقيقي
-          "    this._smoothRms = this._smoothRms * 0.96 + rms * 0.04;",
-          // يتعلم الـ noise floor ببطء شديد (0.9999) عشان ما يرفعش مع الكلام
+          // Slightly faster smoothing (0.94/0.06) — reacts a bit quicker to speech onset
+          "    this._smoothRms = this._smoothRms * 0.94 + rms * 0.06;",
+          // Learn noise floor slowly only when gate is closed (same as before)
           "    if (!this._open && this._hold === 0) {",
           "      this._noiseFloor = this._noiseFloor * 0.9999 + this._smoothRms * 0.0001;",
           "    }",
-          // [PRO-THRESHOLD] 1.4x بدل 2.0x → حساس أكثر للأصوات البعيدة والهادية
-          "    var threshold = Math.max(0.0015, this._noiseFloor * 1.4);",
+          // Threshold = 1.15x noise floor, min 0.0008 — very sensitive to distant voices.
+          // (Old: 1.4x / 0.0015 — distant speech often fell below threshold after mic gain)
+          "    var threshold = Math.max(0.0008, this._noiseFloor * 1.15);",
           "    if (this._smoothRms > threshold) { this._open = true; this._hold = this._max; }",
           "    else if (this._hold > 0) { this._hold--; }",
           "    else { this._open = false; }",
           "    for (var j = 0; j < inp.length; j++) {",
           "      if (this._open) this._gain = Math.min(1, this._gain + this._atk);",
-          // [PRO-FLOOR] min gain = 0.04 (مش 0) → الـ gate مش بيوصل للصمت التام،
-          // بيخفض الضوضاء بس −28dB وده كافي مع الـ NS الأصلي من المتصفح.
-          // النتيجة: صوت أكثر طبيعية، مفيش "قطع" مفاجئ بين الكلام والصمت.
-          "      else            this._gain = Math.max(0.04, this._gain - this._rel);",
+          // Floor = 0.02 (−34 dB) — quieter background bleed, still no hard cut
+          "      else            this._gain = Math.max(0.02, this._gain - this._rel);",
           "      out[j] = inp[j] * this._gain;",
           "    }",
           "    return true;",

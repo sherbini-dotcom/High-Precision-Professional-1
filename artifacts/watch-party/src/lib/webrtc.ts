@@ -122,14 +122,21 @@ export async function getMicStream(): Promise<MediaStream> {
     if (nav.audioSession) nav.audioSession.type = "play-and-record";
   } catch { /* ignore — API not supported on iOS Safari */ }
 
+  // Desktop: disable browser noiseSuppression — Chrome/Firefox use RNNoise which
+  // aggressively classifies distant/quiet voices as "noise" and suppresses them
+  // before the signal even reaches our Web Audio gain stage, making the mic feel
+  // deaf to anyone not speaking close-up. Our custom AudioWorklet noise gate is
+  // tuned for voice and handles background noise more precisely.
+  // Keep echoCancellation: true on desktop (prevents echo from speakers).
+  // iOS: both EC and NS disabled to avoid AVAudioSession ducking (see above).
+  const isDesktop = !isIOS && !/Android/i.test(navigator.userAgent);
+
   // Tier 1: full high-quality constraints
-  // iOS: echoCancellation/noiseSuppression disabled → no ducking (Web Audio chain handles it)
-  // Non-iOS: browser EC enabled, Web Audio still processes on top
   try {
     return await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: !isIOS,
-        noiseSuppression: !isIOS,
+        noiseSuppression: isIOS ? false : !isDesktop, // desktop: off (our gate handles it)
         autoGainControl: false,
         sampleRate: 48000,
         sampleSize: 16,
@@ -144,7 +151,7 @@ export async function getMicStream(): Promise<MediaStream> {
     return await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: !isIOS,
-        noiseSuppression: !isIOS,
+        noiseSuppression: isIOS ? false : !isDesktop,
         autoGainControl: false,
         channelCount: 1,
       },
