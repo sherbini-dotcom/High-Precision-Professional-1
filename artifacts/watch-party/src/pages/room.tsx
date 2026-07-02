@@ -351,8 +351,6 @@ export default function Room() {
   const [copiedInvite, setCopiedInvite] = useState(false);
   const [micEnabled, setMicEnabled] = useState(false);
   const [micError, setMicError] = useState<string | null>(null);
-  // True when iOS PWA suspends getUserMedia in background. Shows a tap-to-resume banner.
-  const [micPausedByPWA, setMicPausedByPWA] = useState(false);
   const [kicked, setKicked] = useState(false);
   const [banned, setBanned] = useState(false);
   const [pendingApproval, setPendingApproval] = useState(false);
@@ -1328,22 +1326,16 @@ export default function Room() {
         analyserRef.current = null;
         micEnabledRef.current = false;
         setMicEnabled(false);
-        // [FIX-IOS-PWA-BANNER] In PWA mode, show the "mic paused by iOS" banner so
-        // the user understands why the mic stopped and can tap to restart with a
-        // user gesture (more reliable than the auto-restart on some iOS versions).
-        if (isPWA && forceRebuild) setMicPausedByPWA(true);
         // [FIX-DOUBLE-DISPATCH] Previously two dispatches fired simultaneously:
         // one unconditional and one inside a setMicEnabled() updater — both called
         // toggleMic before React re-rendered, starting two concurrent mic sessions
         // (duplicate audio, resource leaks, state corruption). Fix: single dispatch,
         // guarded by micEnabledRef (the synchronous source-of-truth), not React state.
-        // PWA: reduce delay to 100ms — iOS releases the mic capture session faster
-        // than Android/desktop so the rebind can happen sooner on return from background.
         setTimeout(() => {
           if (socketRef.current && !micEnabledRef.current) {
             document.dispatchEvent(new CustomEvent("wp:restartMic"));
           }
-        }, isPWA ? 100 : 500);
+        }, 500);
         return true;
       }
       return false;
@@ -3267,7 +3259,6 @@ export default function Room() {
   const stopMic = useCallback(() => {
     micEnabledRef.current = false;
     if (micIntervalRef.current) { clearInterval(micIntervalRef.current); micIntervalRef.current = null; }
-    setMicPausedByPWA(false);
 
     // [FIX-IOS-DUCK-LOOP] وقف الـ interval المستمر لاستعادة الصوت
     if (duckingRecoveryRef.current) { clearInterval(duckingRecoveryRef.current); duckingRecoveryRef.current = null; }
@@ -3451,8 +3442,6 @@ export default function Room() {
       // [KEY-FIX] وقّف الـ looping primer بعد ما عندنا الـ stream — مهمته خلصت
       try { iosPrimerSrc?.stop(0); } catch { /* ignore */ }
       micStreamRef.current = stream;
-      // Mic successfully started — clear any PWA "mic paused" banner.
-      setMicPausedByPWA(false);
       socketRef.current?.emit("micEnabled");
 
       // [FIX-IOS-DUCKING-OPEN] تأكيد ثاني بعد getUserMedia — بعض نسخ iOS بتعيد الـ category
@@ -4549,27 +4538,6 @@ export default function Room() {
         >
           <X className="w-4 h-4" />
         </button>
-      </div>
-    )}
-
-    {/* ── PWA iOS mic-paused banner ─────────────────────────────────────────
-         iOS suspends getUserMedia capture when a PWA is backgrounded.
-         Shows when the system killed the mic so the user can tap to restart. */}
-    {micPausedByPWA && (
-      <div
-        className="fixed z-[100001] left-1/2 -translate-x-1/2 flex items-center gap-3 px-4 py-3 rounded-2xl shadow-2xl border border-amber-500/40 bg-amber-950/90 cursor-pointer select-none"
-        style={{ bottom: 96, backdropFilter: "blur(16px)", animation: "toast-slide-in 0.25s cubic-bezier(0.34,1.56,0.64,1)", maxWidth: "calc(100vw - 32px)" }}
-        onClick={() => { setMicPausedByPWA(false); void toggleMic(); }}
-      >
-        <span className="text-2xl">🎙️</span>
-        <div className="flex-1 min-w-0">
-          <p className="text-sm font-bold text-amber-200 leading-tight">توقف المايك</p>
-          <p className="text-xs text-amber-300/80 leading-snug mt-0.5">iOS وقّف المايك لما خرجت — اضغط لإعادة التشغيل</p>
-        </div>
-        <button
-          className="shrink-0 px-3 py-1.5 rounded-xl bg-amber-500/25 border border-amber-400/40 text-amber-200 text-xs font-bold hover:bg-amber-500/40 active:scale-95 transition-all"
-          onClick={e => { e.stopPropagation(); setMicPausedByPWA(false); void toggleMic(); }}
-        >تشغيل</button>
       </div>
     )}
 
